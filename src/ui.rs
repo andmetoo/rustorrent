@@ -4294,7 +4294,9 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str("</section>");
     if state.torrents.is_empty() {
         out.push_str("<div class=\"panel empty-state\">");
-        out.push_str("<svg class=\"material-symbols-rounded\"><use href=\"#i-cloud_download\"></use></svg>");
+        out.push_str(
+            "<svg class=\"material-symbols-rounded\"><use href=\"#i-cloud_download\"></use></svg>",
+        );
         out.push_str("<p>No torrents yet. Add a file, paste a magnet link, or search plugins to start building your library.</p>");
         out.push_str("</div>");
     } else {
@@ -4619,7 +4621,9 @@ fn app_body_html(state: &UiState) -> String {
     // Drop zone for .torrent file
     out.push_str("<div id=\"dropZone\" class=\"drop-zone\" onclick=\"document.getElementById('torrentFile').click()\">");
     out.push_str("<input id=\"torrentFile\" type=\"file\" accept=\".torrent\" onchange=\"handleTorrentInputChange()\" onclick=\"event.stopPropagation()\">");
-    out.push_str("<svg class=\"material-symbols-rounded dz-icon\"><use href=\"#i-upload_file\"></use></svg>");
+    out.push_str(
+        "<svg class=\"material-symbols-rounded dz-icon\"><use href=\"#i-upload_file\"></use></svg>",
+    );
     out.push_str("<span class=\"dz-text\">Drop .torrent file here or click to browse</span>");
     out.push_str("<span class=\"dz-hint\">.torrent files only</span>");
     out.push_str("<div class=\"dz-file-info\"><svg class=\"material-symbols-rounded dz-icon\"><use href=\"#i-description\"></use></svg><span id=\"dzFileName\" class=\"dz-file-name\"></span><button type=\"button\" class=\"dz-file-remove\" onclick=\"event.stopPropagation();clearTorrentFile()\" title=\"Remove file\"><svg class=\"material-symbols-rounded\" style=\"font-size:18px\"><use href=\"#i-close\"></use></svg></button></div>");
