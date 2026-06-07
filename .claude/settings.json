@@ -1,0 +1,8 @@
+{
+  "enabledPlugins": {
+    "ui-design@designer-skills": true,
+    "design-systems@designer-skills": true,
+    "interaction-design@designer-skills": true,
+    "visual-critique@designer-skills": true
+  }
+}
