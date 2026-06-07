@@ -3,6 +3,7 @@ target/
 
 # Runtime data
 .rustorrent/
+.rustorrent.lock
 
 # Logs
 *.log
