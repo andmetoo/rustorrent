@@ -552,13 +552,13 @@ fn apply_saved_file_renames(
         }
         let layout = layouts.get_mut(*index).ok_or(Error::OutOfBounds)?;
         let name = OsStr::new(name);
-        validate_os_file_name(name)?;
         // Persisted rename data is untrusted state. Reserved application names
         // are never valid payload rename targets, regardless of platform path
         // normalization or the file's current nesting depth.
         if is_reserved_app_name(name) {
             return Err(Error::InvalidName);
         }
+        validate_os_file_name(name)?;
         layout.path.set_file_name(name);
     }
     validate_layout_paths(layouts)

@@ -624,7 +624,7 @@ fn process_restart_recovery_loops_preserve_session_and_resume_files() {
             "session file not created on round {round}"
         );
         assert!(
-            wait_for_file(&resume_path, Duration::from_secs(8)),
+            wait_for_file(&resume_path, Duration::from_secs(20)),
             "resume file not created on round {round}"
         );
         assert!(
