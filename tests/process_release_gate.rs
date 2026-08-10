@@ -433,17 +433,36 @@ fn process_survives_malformed_extension_payload() {
 #[test]
 fn process_fails_closed_on_unrecoverable_session_state() {
     let root = temp_dir("corrupt-state");
-    fs::create_dir_all(root.join(".rustorrent")).unwrap();
+    fs::create_dir_all(&root).unwrap();
     let torrent_path = root.join("sample.torrent");
     write_minimal_torrent(&torrent_path);
+    let session_path = root.join(".rustorrent/session.benc");
 
-    fs::write(root.join(".rustorrent/session.benc"), b"not-bencode").unwrap();
-    fs::write(
-        root.join(".rustorrent")
-            .join(format!("{INFO_HASH_HEX}.resume")),
-        b"not-bencode",
-    )
-    .unwrap();
+    // Let the application create the protected Windows state directory and
+    // state file. Replacing their contents afterward preserves the trusted
+    // owner/ACL while still exercising unrecoverable parser corruption.
+    let init_ui_port = free_tcp_port();
+    let init_peer_port = free_tcp_port();
+    let init_args = vec![
+        torrent_path.display().to_string(),
+        "--download-dir".to_string(),
+        root.display().to_string(),
+        "--ui".to_string(),
+        init_ui_port.to_string(),
+        "--port".to_string(),
+        init_peer_port.to_string(),
+        "--retry-interval".to_string(),
+        "1".to_string(),
+    ];
+    let initializer = spawn_rustorrent(&init_args, &root);
+    assert!(
+        wait_for_file(&session_path, Duration::from_secs(10)),
+        "initializer did not create session state"
+    );
+    let _ = stop_child(initializer);
+
+    let _ = fs::remove_file(root.join(".rustorrent/session.benc.bak"));
+    fs::write(&session_path, b"not-bencode").unwrap();
 
     let ui_port = free_tcp_port();
     let peer_port = free_tcp_port();
