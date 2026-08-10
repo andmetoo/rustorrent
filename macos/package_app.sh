@@ -13,6 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 APP_NAME="Rustorrent"
+MACOS_MIN_VERSION="11.0"
+export MACOSX_DEPLOYMENT_TARGET="$MACOS_MIN_VERSION"
 
 VERSION="$(
   sed -n 's/^version = "\(.*\)"/\1/p' "$PROJECT_DIR/Cargo.toml" | head -n 1
@@ -52,6 +54,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "$NOTARY_PROFILE" && -z "$SIGN_IDENTITY" ]]; then
+  echo "APP_NOTARY_PROFILE requires APP_SIGN_IDENTITY" >&2
+  exit 1
+fi
+
 BUILD_DIR="$PROJECT_DIR/target/macos-app/build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 
@@ -64,8 +71,8 @@ cd "$PROJECT_DIR"
 if $UNIVERSAL; then
   echo "==> Building universal binary (arm64 + x86_64)"
   rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null 2>&1 || true
-  cargo build --release --target aarch64-apple-darwin
-  cargo build --release --target x86_64-apple-darwin
+  cargo build --locked --release --target aarch64-apple-darwin
+  cargo build --locked --release --target x86_64-apple-darwin
 
   UNIVERSAL_BIN="$BUILD_DIR/rustorrent-universal"
   lipo -create \
@@ -75,7 +82,7 @@ if $UNIVERSAL; then
   BINARY_PATH="$UNIVERSAL_BIN"
   ARCH_TAG="universal"
 else
-  cargo build --release
+  cargo build --locked --release
   BINARY_PATH="$PROJECT_DIR/target/release/rustorrent"
   ARCH_TAG="$(uname -m)"
 fi
@@ -90,16 +97,18 @@ LAUNCHER_SRC="$SCRIPT_DIR/Launcher.swift"
 if [[ -f "$LAUNCHER_SRC" ]] && command -v xcrun >/dev/null 2>&1; then
   echo "==> Building native macOS launcher"
   if $UNIVERSAL; then
-    xcrun --sdk macosx swiftc -parse-as-library -O -target arm64-apple-macos11.0 \
+    xcrun --sdk macosx swiftc -parse-as-library -O -target "arm64-apple-macos$MACOS_MIN_VERSION" \
       "$LAUNCHER_SRC" -o "$BUILD_DIR/rustorrent-launcher-arm64"
-    xcrun --sdk macosx swiftc -parse-as-library -O -target x86_64-apple-macos10.13 \
+    xcrun --sdk macosx swiftc -parse-as-library -O -target "x86_64-apple-macos$MACOS_MIN_VERSION" \
       "$LAUNCHER_SRC" -o "$BUILD_DIR/rustorrent-launcher-x86_64"
     lipo -create \
       "$BUILD_DIR/rustorrent-launcher-arm64" \
       "$BUILD_DIR/rustorrent-launcher-x86_64" \
       -output "$APP_BUNDLE/Contents/MacOS/rustorrent"
   else
+    SWIFT_ARCH="$(uname -m)"
     xcrun --sdk macosx swiftc -parse-as-library -O \
+      -target "$SWIFT_ARCH-apple-macos$MACOS_MIN_VERSION" \
       "$LAUNCHER_SRC" -o "$APP_BUNDLE/Contents/MacOS/rustorrent"
   fi
 else
@@ -108,11 +117,25 @@ else
 fi
 chmod +x "$APP_BUNDLE/Contents/MacOS/rustorrent"
 cp "$SCRIPT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" \
+  "$APP_BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" \
+  "$APP_BUNDLE/Contents/Info.plist"
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
-if [[ -f "$SCRIPT_DIR/AppIcon.icns" ]]; then
-  cp "$SCRIPT_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+if [[ ! -f "$SCRIPT_DIR/AppIcon.icns" ]]; then
+  echo "missing required application icon: $SCRIPT_DIR/AppIcon.icns" >&2
+  exit 1
 fi
+cp "$SCRIPT_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+
+for notice in LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html; do
+  if [[ ! -f "$PROJECT_DIR/$notice" ]]; then
+    echo "missing required distribution notice: $PROJECT_DIR/$notice" >&2
+    exit 1
+  fi
+  cp "$PROJECT_DIR/$notice" "$APP_BUNDLE/Contents/Resources/$notice"
+done
 
 # Avoid leaking host metadata into shared archives.
 xattr -cr "$APP_BUNDLE" 2>/dev/null || true
@@ -123,13 +146,9 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
     "$APP_BUNDLE/Contents/MacOS/rustorrent-bin"
   codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \
     "$APP_BUNDLE/Contents/MacOS/rustorrent"
-  if [[ -d "$APP_BUNDLE/Contents/Resources" ]]; then
-    find "$APP_BUNDLE/Contents/Resources" -type f -print0 | while IFS= read -r -d '' file; do
-      codesign --force --sign "$SIGN_IDENTITY" --timestamp "$file" || true
-    done
-  fi
   codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \
     "$APP_BUNDLE"
+  codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 fi
 
 ARTIFACT_BASE="${APP_NAME}-${VERSION}-${ARCH_TAG}"
@@ -138,6 +157,19 @@ rm -f "$ZIP_PATH"
 
 echo "==> Creating ZIP artifact"
 ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ZIP_PATH"
+
+if [[ -n "$NOTARY_PROFILE" ]]; then
+  echo "==> Submitting app for notarization using keychain profile '$NOTARY_PROFILE'"
+  xcrun notarytool submit "$ZIP_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+  echo "==> Stapling app bundle"
+  xcrun stapler staple "$APP_BUNDLE"
+  xcrun stapler validate "$APP_BUNDLE"
+
+  # Rebuild the distributable archive so it contains the stapled app rather
+  # than the pre-notarization bundle that was submitted to Apple.
+  rm -f "$ZIP_PATH"
+  ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ZIP_PATH"
+fi
 
 echo ""
 echo "App bundle: $APP_BUNDLE"
@@ -169,19 +201,12 @@ if $CREATE_DMG; then
   fi
 fi
 
-if [[ -n "$NOTARY_PROFILE" ]]; then
-  SUBMIT_TARGET="$ZIP_PATH"
-  if $CREATE_DMG; then
-    SUBMIT_TARGET="$DMG_PATH"
-  fi
-  echo "==> Submitting for notarization using keychain profile '$NOTARY_PROFILE'"
-  xcrun notarytool submit "$SUBMIT_TARGET" --keychain-profile "$NOTARY_PROFILE" --wait
-  echo "==> Stapling app bundle"
-  xcrun stapler staple "$APP_BUNDLE"
-  if $CREATE_DMG; then
-    echo "==> Stapling DMG artifact"
-    xcrun stapler staple "$DMG_PATH"
-  fi
+if [[ -n "$NOTARY_PROFILE" && "$CREATE_DMG" == true ]]; then
+  echo "==> Submitting DMG for notarization using keychain profile '$NOTARY_PROFILE'"
+  xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+  echo "==> Stapling DMG artifact"
+  xcrun stapler staple "$DMG_PATH"
+  xcrun stapler validate "$DMG_PATH"
 fi
 
 echo ""

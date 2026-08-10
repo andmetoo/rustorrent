@@ -3,6 +3,8 @@ use std::time::Duration;
 
 const NATPMP_PORT: u16 = 5351;
 const NATPMP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const MAX_ROUTE_TABLE_BYTES: usize = 1024 * 1024;
 
 pub fn map_port(port: u16, lifetime: u32) -> Result<(), String> {
     let gateway = default_gateway().ok_or_else(|| "no gateway found".to_string())?;
@@ -32,20 +34,34 @@ fn map_port_proto(
     req[8..12].copy_from_slice(&lifetime.to_be_bytes());
     socket.send_to(&req, addr).map_err(|err| err.to_string())?;
     let mut resp = [0u8; 16];
-    let _ = socket.recv_from(&mut resp).map_err(|err| err.to_string())?;
-    if resp[1] != op + 128 {
+    let (n, source) = socket.recv_from(&mut resp).map_err(|err| err.to_string())?;
+    if n != resp.len() || source != std::net::SocketAddr::V4(addr) {
+        return Err("natpmp invalid response".to_string());
+    }
+    if resp[0] != 0 || resp[1] != op + 128 {
         return Err("natpmp invalid response".to_string());
     }
     let result_code = u16::from_be_bytes([resp[2], resp[3]]);
     if result_code != 0 {
         return Err(format!("natpmp error {result_code}"));
     }
+    let response_internal_port = u16::from_be_bytes([resp[8], resp[9]]);
+    let response_external_port = u16::from_be_bytes([resp[10], resp[11]]);
+    if response_internal_port != port || response_external_port != port {
+        return Err("natpmp gateway assigned an unexpected port".to_string());
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn default_gateway() -> Option<Ipv4Addr> {
-    let data = std::fs::read_to_string("/proc/net/route").ok()?;
+    let data = crate::read_file_limited(
+        std::path::Path::new("/proc/net/route"),
+        MAX_ROUTE_TABLE_BYTES,
+        false,
+    )
+    .ok()?;
+    let data = std::str::from_utf8(&data).ok()?;
     for line in data.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() > 2 && parts[1] == "00000000" {
@@ -59,7 +75,7 @@ fn default_gateway() -> Option<Ipv4Addr> {
 
 #[cfg(target_os = "macos")]
 fn default_gateway() -> Option<Ipv4Addr> {
-    let output = std::process::Command::new("route")
+    let output = std::process::Command::new("/sbin/route")
         .arg("-n")
         .arg("get")
         .arg("default")
@@ -104,6 +120,8 @@ mod tests {
 
             let mut resp = [0u8; 16];
             resp[1] = 130; // op + 128 for TCP map
+            resp[8..10].copy_from_slice(&51413u16.to_be_bytes());
+            resp[10..12].copy_from_slice(&51413u16.to_be_bytes());
             server.send_to(&resp, peer).unwrap();
         });
 
@@ -155,6 +173,25 @@ mod tests {
             .unwrap();
         let err = map_port_proto(&client, local_addr(server_addr.port()), 1, 60, 1).unwrap_err();
         assert!(err.contains("natpmp error 2"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn map_port_proto_rejects_truncated_success_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (_, peer) = server.recv_from(&mut buf).unwrap();
+            server.send_to(&[0, 130], peer).unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let err = map_port_proto(&client, local_addr(server_addr.port()), 1, 60, 2).unwrap_err();
+        assert!(err.contains("invalid response"));
         handle.join().unwrap();
     }
 }

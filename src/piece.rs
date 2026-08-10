@@ -1,7 +1,10 @@
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::torrent::TorrentMeta;
+use crate::torrent::{TorrentMeta, MAX_PIECE_LENGTH};
+use crate::{sha1, sha256};
 
 pub const BLOCK_LEN: u32 = 16 * 1024;
 pub const PRIORITY_SKIP: u8 = 0;
@@ -13,7 +16,44 @@ pub const PRIORITY_HIGH: u8 = 3;
 #[derive(Debug, Clone)]
 pub enum PieceHash {
     Sha1([u8; 20]),
-    Sha256([u8; 32]),
+    Sha256 {
+        root: [u8; 32],
+        merkle_length: u32,
+        data_length: u32,
+    },
+    Hybrid {
+        sha1: [u8; 20],
+        sha256: [u8; 32],
+        merkle_length: u32,
+        v2_data_length: u32,
+    },
+}
+
+impl PieceHash {
+    pub fn verify(&self, data: &[u8]) -> bool {
+        match self {
+            PieceHash::Sha1(expected) => sha1::sha1(data) == *expected,
+            PieceHash::Sha256 {
+                root,
+                merkle_length,
+                data_length,
+            } => {
+                data.len() == *data_length as usize
+                    && sha256::merkle_piece_root(data, *merkle_length) == Some(*root)
+            }
+            PieceHash::Hybrid {
+                sha1: expected_sha1,
+                sha256: expected_sha256,
+                merkle_length,
+                v2_data_length,
+            } => {
+                sha1::sha1(data) == *expected_sha1
+                    && data.get(..*v2_data_length as usize).is_some_and(|v2_data| {
+                        sha256::merkle_piece_root(v2_data, *merkle_length) == Some(*expected_sha256)
+                    })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +67,7 @@ pub enum BlockState {
 pub struct Piece {
     pub index: u32,
     pub hash: PieceHash,
+    pub offset: u64,
     pub length: u32,
     blocks: Vec<BlockState>,
     priority: u8,
@@ -57,6 +98,31 @@ pub struct PieceBuffer {
     data: Vec<u8>,
     blocks: Vec<u8>,
     complete: usize,
+    _budget_reservation: Option<PieceBufferReservation>,
+}
+
+#[derive(Debug)]
+pub struct PieceBufferBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PieceBufferBudgets {
+    global: Arc<PieceBufferBudget>,
+    torrent: Arc<PieceBufferBudget>,
+}
+
+#[derive(Debug)]
+struct BudgetCounterPermit {
+    budget: Arc<PieceBufferBudget>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct PieceBufferReservation {
+    _torrent: BudgetCounterPermit,
+    _global: BudgetCounterPermit,
 }
 
 #[derive(Debug)]
@@ -85,64 +151,80 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl PieceBufferBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BudgetCounterPermit> {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= self.limit)
+            })
+            .ok()?;
+        Some(BudgetCounterPermit {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
+impl PieceBufferBudgets {
+    pub fn new(global: Arc<PieceBufferBudget>, torrent: Arc<PieceBufferBudget>) -> Self {
+        Self { global, torrent }
+    }
+
+    /// Reserves logical allocation bytes against both the per-torrent and
+    /// process-wide limits. The returned non-cloneable guard releases both
+    /// reservations when it is dropped.
+    pub fn try_reserve(&self, bytes: usize) -> Option<PieceBufferReservation> {
+        if bytes == 0 {
+            return None;
+        }
+        let torrent = self.torrent.try_acquire(bytes)?;
+        let global = self.global.try_acquire(bytes)?;
+        Some(PieceBufferReservation {
+            _torrent: torrent,
+            _global: global,
+        })
+    }
+}
+
+impl Drop for BudgetCounterPermit {
+    fn drop(&mut self) {
+        let previous = self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes);
+    }
+}
+
 impl PieceManager {
     pub fn new(meta: &TorrentMeta) -> Result<Self, Error> {
-        let use_v2 = meta.meta_version == 2;
-        let piece_hashes: Vec<PieceHash> = if use_v2 {
-            Self::build_v2_piece_hashes(meta)?
-        } else {
-            meta.info
-                .pieces
-                .iter()
-                .map(|h| PieceHash::Sha1(*h))
-                .collect()
-        };
-
-        let piece_count = piece_hashes.len();
-        if piece_count == 0 {
-            return Err(Error::InvalidPieces);
-        }
-
-        let total_length = meta.info.total_length();
-        if total_length == 0 {
-            return Err(Error::InvalidPieces);
-        }
-
         let piece_length = meta.info.piece_length;
-        if piece_length == 0 || piece_length > u32::MAX as u64 {
+        if piece_length == 0 || piece_length > MAX_PIECE_LENGTH {
             return Err(Error::InvalidPieceLength);
         }
         let piece_length = piece_length as u32;
 
-        let min_total = (piece_count as u64 - 1).saturating_mul(piece_length as u64);
-        if total_length < min_total {
+        let pieces = match meta.meta_version {
+            1 => Self::build_v1_pieces(meta, piece_length, None)?,
+            2 => Self::build_v2_pieces(meta, piece_length)?,
+            3 => {
+                let v2_pieces = Self::build_v2_pieces(meta, piece_length)?;
+                Self::build_v1_pieces(meta, piece_length, Some(&v2_pieces))?
+            }
+            _ => return Err(Error::InvalidPieces),
+        };
+        let piece_count = pieces.len();
+        if piece_count == 0 || piece_count > u32::MAX as usize {
             return Err(Error::InvalidPieces);
-        }
-        let mut last_len = total_length - min_total;
-        if last_len == 0 {
-            last_len = piece_length as u64;
-        }
-        if last_len > piece_length as u64 {
-            return Err(Error::InvalidPieces);
-        }
-
-        let mut pieces = Vec::with_capacity(piece_count);
-        for (index, hash) in piece_hashes.into_iter().enumerate() {
-            let length = if index + 1 == piece_count {
-                last_len as u32
-            } else {
-                piece_length
-            };
-            let blocks = block_count(length);
-            pieces.push(Piece {
-                index: index as u32,
-                hash,
-                length,
-                blocks: vec![BlockState::Missing; blocks],
-                priority: PRIORITY_NORMAL,
-                wanted: true,
-                verified: false,
-            });
         }
 
         Ok(Self {
@@ -154,30 +236,160 @@ impl PieceManager {
         })
     }
 
-    fn build_v2_piece_hashes(meta: &TorrentMeta) -> Result<Vec<PieceHash>, Error> {
-        let piece_length = meta.info.piece_length;
-        if piece_length == 0 {
-            return Err(Error::InvalidPieceLength);
+    fn build_v1_pieces(
+        meta: &TorrentMeta,
+        piece_length: u32,
+        v2_pieces: Option<&[Piece]>,
+    ) -> Result<Vec<Piece>, Error> {
+        let piece_count = meta.info.pieces.len();
+        if piece_count == 0 {
+            return Err(Error::InvalidPieces);
         }
-        let mut all_hashes: Vec<PieceHash> = Vec::new();
-        for entry in &meta.info.file_tree {
-            if let Some(root) = &entry.pieces_root {
-                let layer = meta
-                    .piece_layers
-                    .iter()
-                    .find(|(key, _)| key.as_slice() == root.as_slice());
-                if let Some((_, hashes)) = layer {
-                    for h in hashes {
-                        all_hashes.push(PieceHash::Sha256(*h));
-                    }
-                } else if entry.length <= piece_length {
-                    all_hashes.push(PieceHash::Sha256(*root));
-                }
-            } else if entry.length == 0 {
-                continue;
+
+        let total_length = meta
+            .info
+            .checked_total_length()
+            .ok_or(Error::InvalidPieces)?;
+        if total_length == 0 {
+            return Err(Error::InvalidPieces);
+        }
+
+        let min_total = (piece_count as u64 - 1)
+            .checked_mul(piece_length as u64)
+            .ok_or(Error::InvalidPieces)?;
+        if total_length < min_total {
+            return Err(Error::InvalidPieces);
+        }
+        let last_len = total_length - min_total;
+        if last_len == 0 || last_len > piece_length as u64 {
+            return Err(Error::InvalidPieces);
+        }
+
+        if let Some(v2_pieces) = v2_pieces {
+            if v2_pieces.len() != piece_count {
+                return Err(Error::InvalidPieces);
             }
         }
-        Ok(all_hashes)
+
+        let mut pieces = Vec::with_capacity(piece_count);
+        for (index, sha1_hash) in meta.info.pieces.iter().copied().enumerate() {
+            let length = if index + 1 == piece_count {
+                last_len as u32
+            } else {
+                piece_length
+            };
+            let offset = (index as u64)
+                .checked_mul(piece_length as u64)
+                .ok_or(Error::InvalidPieces)?;
+            let hash = if let Some(v2_pieces) = v2_pieces {
+                if v2_pieces[index].offset != offset {
+                    return Err(Error::InvalidPieces);
+                }
+                let (root, merkle_length, v2_data_length) = match &v2_pieces[index].hash {
+                    PieceHash::Sha256 {
+                        root,
+                        merkle_length,
+                        data_length,
+                    } => (*root, *merkle_length, *data_length),
+                    _ => return Err(Error::InvalidPieces),
+                };
+                PieceHash::Hybrid {
+                    sha1: sha1_hash,
+                    sha256: root,
+                    merkle_length,
+                    v2_data_length,
+                }
+            } else {
+                PieceHash::Sha1(sha1_hash)
+            };
+            let blocks = block_count(length);
+            pieces.push(Piece {
+                index: index as u32,
+                hash,
+                offset,
+                length,
+                blocks: vec![BlockState::Missing; blocks],
+                priority: PRIORITY_NORMAL,
+                wanted: true,
+                verified: false,
+            });
+        }
+
+        Ok(pieces)
+    }
+
+    fn build_v2_pieces(meta: &TorrentMeta, piece_length: u32) -> Result<Vec<Piece>, Error> {
+        if piece_length < 16 * 1024 || !piece_length.is_power_of_two() {
+            return Err(Error::InvalidPieceLength);
+        }
+        let piece_length_u64 = piece_length as u64;
+        let mut pieces = Vec::new();
+        let mut file_offset = 0u64;
+        for entry in &meta.info.file_tree {
+            if entry.length == 0 {
+                continue;
+            }
+            let root = entry.pieces_root.ok_or(Error::InvalidPieces)?;
+            let roots: Vec<[u8; 32]> = if entry.length <= piece_length_u64 {
+                vec![root]
+            } else {
+                let (_, hashes) = meta
+                    .piece_layers
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == root.as_slice())
+                    .ok_or(Error::InvalidPieces)?;
+                if u64::try_from(hashes.len()).ok() != Some(entry.length.div_ceil(piece_length_u64))
+                {
+                    return Err(Error::InvalidPieces);
+                }
+                hashes.clone()
+            };
+
+            for (file_piece_index, root) in roots.into_iter().enumerate() {
+                if pieces.len() > u32::MAX as usize {
+                    return Err(Error::InvalidPieces);
+                }
+                let within_file = (file_piece_index as u64)
+                    .checked_mul(piece_length_u64)
+                    .ok_or(Error::InvalidPieces)?;
+                let remaining = entry
+                    .length
+                    .checked_sub(within_file)
+                    .ok_or(Error::InvalidPieces)?;
+                let length = remaining.min(piece_length_u64) as u32;
+                let merkle_length = if entry.length <= piece_length_u64 {
+                    v2_tree_length(length).ok_or(Error::InvalidPieces)?
+                } else {
+                    piece_length
+                };
+                let offset = file_offset
+                    .checked_add(within_file)
+                    .ok_or(Error::InvalidPieces)?;
+                pieces.push(Piece {
+                    index: pieces.len() as u32,
+                    hash: PieceHash::Sha256 {
+                        root,
+                        merkle_length,
+                        data_length: length,
+                    },
+                    offset,
+                    length,
+                    blocks: vec![BlockState::Missing; block_count(length)],
+                    priority: PRIORITY_NORMAL,
+                    wanted: true,
+                    verified: false,
+                });
+            }
+            let file_piece_count = entry.length.div_ceil(piece_length_u64);
+            file_offset = file_offset
+                .checked_add(
+                    file_piece_count
+                        .checked_mul(piece_length_u64)
+                        .ok_or(Error::InvalidPieces)?,
+                )
+                .ok_or(Error::InvalidPieces)?;
+        }
+        Ok(pieces)
     }
 
     pub fn piece_count(&self) -> usize {
@@ -248,6 +460,10 @@ impl PieceManager {
         self.pieces.get(index as usize).map(|piece| piece.length)
     }
 
+    pub fn piece_offset(&self, index: u32) -> Option<u64> {
+        self.pieces.get(index as usize).map(|piece| piece.offset)
+    }
+
     pub fn piece_hash(&self, index: u32) -> Option<&PieceHash> {
         self.pieces.get(index as usize).map(|piece| &piece.hash)
     }
@@ -292,15 +508,18 @@ impl PieceManager {
         if priorities.len() != self.pieces.len() {
             return Err(Error::InvalidPieces);
         }
+        if priorities.iter().any(|priority| *priority > PRIORITY_HIGH) {
+            return Err(Error::InvalidPriority);
+        }
         for (idx, (piece, priority)) in self.pieces.iter_mut().zip(priorities.iter()).enumerate() {
-            if *priority > PRIORITY_HIGH {
-                return Err(Error::InvalidPriority);
-            }
             piece.priority = *priority;
             piece.wanted = *priority != PRIORITY_SKIP;
             if !piece.wanted {
                 if let Some(reserved) = self.reserved_by.get_mut(idx) {
                     *reserved = None;
+                }
+                if let Some(reserved_at) = self.reservation_time.get_mut(idx) {
+                    *reserved_at = None;
                 }
             }
         }
@@ -593,15 +812,15 @@ impl PieceManager {
     }
 
     pub fn mark_piece_complete(&mut self, index: u32) -> Result<bool, Error> {
-        let piece = self
-            .pieces
-            .get_mut(index as usize)
-            .ok_or(Error::InvalidPiece)?;
+        let idx = index as usize;
+        let piece = self.pieces.get_mut(idx).ok_or(Error::InvalidPiece)?;
         let was_new = !piece.verified;
         piece.verified = true;
         for state in &mut piece.blocks {
             *state = BlockState::Complete;
         }
+        self.reserved_by[idx] = None;
+        self.reservation_time[idx] = None;
         Ok(was_new)
     }
 
@@ -624,30 +843,67 @@ impl PieceManager {
     }
 
     pub fn reset_piece(&mut self, index: u32) -> Result<(), Error> {
-        let piece = self
-            .pieces
-            .get_mut(index as usize)
-            .ok_or(Error::InvalidPiece)?;
+        let idx = index as usize;
+        let piece = self.pieces.get_mut(idx).ok_or(Error::InvalidPiece)?;
         piece.verified = false;
         for state in &mut piece.blocks {
             *state = BlockState::Missing;
         }
+        self.reserved_by[idx] = None;
+        self.reservation_time[idx] = None;
         Ok(())
     }
 }
 
 impl PieceBuffer {
-    pub fn new(index: u32, length: u32) -> Result<Self, Error> {
-        if length == 0 {
+    pub fn try_new(
+        index: u32,
+        length: u32,
+        budgets: &PieceBufferBudgets,
+    ) -> Result<Option<Self>, Error> {
+        if length == 0 || length as u64 > MAX_PIECE_LENGTH {
             return Err(Error::InvalidPieceLength);
         }
         let blocks = block_count(length);
+        let allocation_bytes = (length as usize)
+            .checked_add(blocks)
+            .ok_or(Error::InvalidPieceLength)?;
+        let Some(reservation) = budgets.try_reserve(allocation_bytes) else {
+            return Ok(None);
+        };
+        Self::allocate(index, length, Some(reservation)).map(Some)
+    }
+
+    #[cfg(test)]
+    pub fn new(index: u32, length: u32) -> Result<Self, Error> {
+        Self::allocate(index, length, None)
+    }
+
+    fn allocate(
+        index: u32,
+        length: u32,
+        budget_reservation: Option<PieceBufferReservation>,
+    ) -> Result<Self, Error> {
+        if length == 0 || length as u64 > MAX_PIECE_LENGTH {
+            return Err(Error::InvalidPieceLength);
+        }
+        let blocks = block_count(length);
+        let mut data = Vec::new();
+        data.try_reserve_exact(length as usize)
+            .map_err(|_| Error::InvalidPieceLength)?;
+        data.resize(length as usize, 0);
+        let mut block_map = Vec::new();
+        block_map
+            .try_reserve_exact(blocks)
+            .map_err(|_| Error::InvalidPieceLength)?;
+        block_map.resize(blocks, 0);
         Ok(Self {
             index,
             length,
-            data: vec![0u8; length as usize],
-            blocks: vec![0u8; blocks],
+            data,
+            blocks: block_map,
             complete: 0,
+            _budget_reservation: budget_reservation,
         })
     }
 
@@ -701,6 +957,11 @@ impl PieceBuffer {
 
 fn block_count(length: u32) -> usize {
     (length as u64).div_ceil(BLOCK_LEN as u64) as usize
+}
+
+fn v2_tree_length(data_length: u32) -> Option<u32> {
+    let blocks = data_length.div_ceil(BLOCK_LEN);
+    blocks.checked_next_power_of_two()?.checked_mul(BLOCK_LEN)
 }
 
 fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
@@ -796,7 +1057,7 @@ mod priority_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torrent::{InfoDict, TorrentMeta};
+    use crate::torrent::{FileInfo, FileTreeEntry, InfoDict, TorrentMeta};
 
     fn dummy_meta(pieces: usize, piece_length: u64, total_length: u64) -> TorrentMeta {
         let mut hashes = Vec::with_capacity(pieces);
@@ -848,6 +1109,15 @@ mod tests {
         let manager = PieceManager::new(&meta).unwrap();
         assert_eq!(manager.pieces[0].length, 16 * 1024);
         assert_eq!(manager.pieces[1].length, 4 * 1024);
+    }
+
+    #[test]
+    fn rejects_an_extra_zero_length_piece() {
+        let meta = dummy_meta(2, 16 * 1024, 16 * 1024);
+        assert!(matches!(
+            PieceManager::new(&meta),
+            Err(Error::InvalidPieces)
+        ));
     }
 
     #[test]
@@ -938,5 +1208,176 @@ mod tests {
         assert!(buffer.add_block(BLOCK_LEN, &second).unwrap());
         assert!(buffer.is_complete());
         assert_eq!(&buffer.data()[BLOCK_LEN as usize..], second.as_slice());
+    }
+
+    #[test]
+    fn piece_buffer_budgets_backpressure_and_release_with_buffer_lifetime() {
+        let allocation = BLOCK_LEN as usize + 1;
+        let global = Arc::new(PieceBufferBudget::new(allocation));
+        let torrent = Arc::new(PieceBufferBudget::new(allocation * 2));
+        let budgets = PieceBufferBudgets::new(Arc::clone(&global), Arc::clone(&torrent));
+
+        let first = PieceBuffer::try_new(0, BLOCK_LEN, &budgets)
+            .unwrap()
+            .unwrap();
+        assert_eq!(global.used(), allocation);
+        assert_eq!(torrent.used(), allocation);
+        assert!(PieceBuffer::try_new(1, BLOCK_LEN, &budgets)
+            .unwrap()
+            .is_none());
+        assert_eq!(global.used(), allocation);
+        assert_eq!(torrent.used(), allocation);
+
+        drop(first);
+        assert_eq!(global.used(), 0);
+        assert_eq!(torrent.used(), 0);
+        let second = PieceBuffer::try_new(1, BLOCK_LEN, &budgets)
+            .unwrap()
+            .unwrap();
+        drop(second);
+        assert_eq!(global.used(), 0);
+        assert_eq!(torrent.used(), 0);
+    }
+
+    #[test]
+    fn generic_piece_buffer_reservation_releases_both_budgets() {
+        let global = Arc::new(PieceBufferBudget::new(32));
+        let torrent = Arc::new(PieceBufferBudget::new(16));
+        let budgets = PieceBufferBudgets::new(Arc::clone(&global), Arc::clone(&torrent));
+
+        let reservation = budgets.try_reserve(12).unwrap();
+        assert_eq!(global.used(), 12);
+        assert_eq!(torrent.used(), 12);
+        assert!(budgets.try_reserve(5).is_none());
+        assert_eq!(global.used(), 12);
+        assert_eq!(torrent.used(), 12);
+
+        drop(reservation);
+        assert_eq!(global.used(), 0);
+        assert_eq!(torrent.used(), 0);
+        assert!(budgets.try_reserve(0).is_none());
+    }
+
+    #[test]
+    fn priority_updates_are_atomic_on_validation_error() {
+        let meta = dummy_meta(2, 16 * 1024, 32 * 1024);
+        let mut manager = PieceManager::new(&meta).unwrap();
+        assert!(matches!(
+            manager.set_piece_priorities(&[PRIORITY_SKIP, PRIORITY_HIGH + 1]),
+            Err(Error::InvalidPriority)
+        ));
+        assert_eq!(manager.piece_priority(0), Some(PRIORITY_NORMAL));
+        assert!(manager.is_piece_wanted(0));
+    }
+
+    #[test]
+    fn v2_files_have_aligned_offsets_and_merkle_verification() {
+        let first_data = b"abc";
+        let second_data = b"hello";
+        let meta = TorrentMeta {
+            announce: None,
+            announce_list: Vec::new(),
+            url_list: Vec::new(),
+            httpseeds: Vec::new(),
+            info_hash: [0; 20],
+            info_hash_v2: Some([0; 32]),
+            piece_layers: Vec::new(),
+            meta_version: 2,
+            info: InfoDict {
+                name: b"v2".to_vec(),
+                piece_length: 64 * 1024,
+                pieces: Vec::new(),
+                length: None,
+                files: Vec::new(),
+                private: false,
+                file_tree: vec![
+                    FileTreeEntry {
+                        path: vec![b"a".to_vec()],
+                        length: first_data.len() as u64,
+                        pieces_root: Some(sha256::sha256(first_data)),
+                    },
+                    FileTreeEntry {
+                        path: vec![b"b".to_vec()],
+                        length: second_data.len() as u64,
+                        pieces_root: Some(sha256::sha256(second_data)),
+                    },
+                ],
+            },
+        };
+
+        let manager = PieceManager::new(&meta).unwrap();
+        assert_eq!(manager.piece_count(), 2);
+        assert_eq!(manager.piece_offset(0), Some(0));
+        assert_eq!(manager.piece_offset(1), Some(64 * 1024));
+        assert_eq!(manager.piece_length(0), Some(3));
+        assert_eq!(manager.piece_length(1), Some(5));
+        assert!(manager.piece_hash(0).unwrap().verify(first_data));
+        assert!(manager.piece_hash(1).unwrap().verify(second_data));
+        assert!(!manager.piece_hash(1).unwrap().verify(b"HELLO"));
+    }
+
+    #[test]
+    fn hybrid_pieces_require_both_hash_families() {
+        let mut first_piece = b"abc".to_vec();
+        first_piece.resize(16 * 1024, 0);
+        let second_piece = b"hello".to_vec();
+        let meta = TorrentMeta {
+            announce: None,
+            announce_list: Vec::new(),
+            url_list: Vec::new(),
+            httpseeds: Vec::new(),
+            info_hash: [0; 20],
+            info_hash_v2: Some([0; 32]),
+            piece_layers: Vec::new(),
+            meta_version: 3,
+            info: InfoDict {
+                name: b"hybrid".to_vec(),
+                piece_length: 16 * 1024,
+                pieces: vec![sha1::sha1(&first_piece), sha1::sha1(&second_piece)],
+                length: None,
+                files: vec![
+                    FileInfo {
+                        length: 3,
+                        path: vec![b"a".to_vec()],
+                        attr: Vec::new(),
+                    },
+                    FileInfo {
+                        length: 16 * 1024 - 3,
+                        path: vec![b".pad".to_vec(), b"16381".to_vec()],
+                        attr: b"p".to_vec(),
+                    },
+                    FileInfo {
+                        length: 5,
+                        path: vec![b"b".to_vec()],
+                        attr: Vec::new(),
+                    },
+                ],
+                private: false,
+                file_tree: vec![
+                    FileTreeEntry {
+                        path: vec![b"a".to_vec()],
+                        length: 3,
+                        pieces_root: Some(sha256::sha256(b"abc")),
+                    },
+                    FileTreeEntry {
+                        path: vec![b"b".to_vec()],
+                        length: 5,
+                        pieces_root: Some(sha256::sha256(b"hello")),
+                    },
+                ],
+            },
+        };
+
+        let manager = PieceManager::new(&meta).unwrap();
+        assert!(matches!(
+            manager.piece_hash(0),
+            Some(PieceHash::Hybrid { .. })
+        ));
+        assert!(manager.piece_hash(0).unwrap().verify(&first_piece));
+        assert!(manager.piece_hash(1).unwrap().verify(&second_piece));
+
+        let mut nonzero_padding = first_piece;
+        *nonzero_padding.last_mut().unwrap() = 1;
+        assert!(!manager.piece_hash(0).unwrap().verify(&nonzero_padding));
     }
 }

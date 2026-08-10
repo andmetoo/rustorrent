@@ -38,6 +38,12 @@ pub fn start() -> Lpd {
     Lpd { cmd_tx }
 }
 
+pub fn disabled() -> Lpd {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    drop(cmd_rx);
+    Lpd { cmd_tx }
+}
+
 impl Lpd {
     pub fn add_torrent(
         &self,
@@ -72,33 +78,37 @@ fn lpd_thread(cmd_rx: mpsc::Receiver<Command>) {
     let socket6 = UdpSocket::bind("[::]:6771").ok();
     if let Some(ref s6) = socket6 {
         let _ = s6.set_read_timeout(Some(Duration::from_millis(200)));
-        let group: Ipv6Addr = "ff15::efc0:988f".parse().unwrap();
+        let group = Ipv6Addr::new(0xff15, 0, 0, 0, 0, 0, 0xefc0, 0x988f);
         let _ = s6.join_multicast_v6(&group, 0);
     }
 
     let mut entries: HashMap<[u8; 20], Entry> = HashMap::new();
     let mut buf = [0u8; 1500];
     loop {
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                Command::AddTorrent {
-                    info_hash,
-                    port,
-                    peers_tx,
-                } => {
-                    entries.insert(
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => match cmd {
+                    Command::AddTorrent {
                         info_hash,
-                        Entry {
-                            peers_tx,
-                            port,
-                            last_announce: Instant::now() - LPD_INTERVAL,
-                        },
-                    );
-                }
-                Command::RemoveTorrent { info_hash } => {
-                    entries.remove(&info_hash);
-                }
-            }
+                        port,
+                        peers_tx,
+                    } => {
+                        entries.insert(
+                            info_hash,
+                            Entry {
+                                peers_tx,
+                                port,
+                                last_announce: Instant::now() - LPD_INTERVAL,
+                            },
+                        );
+                    }
+                    Command::RemoveTorrent { info_hash } => {
+                        entries.remove(&info_hash);
+                    }
+                },
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            };
         }
 
         let now = Instant::now();
@@ -148,16 +158,27 @@ fn build_search_message(info_hash: &[u8; 20], port: u16) -> Vec<u8> {
 
 fn parse_search_message(data: &[u8]) -> Option<([u8; 20], u16)> {
     let text = std::str::from_utf8(data).ok()?;
+    if text.len() > 1500 || text.contains('\0') {
+        return None;
+    }
+    let mut lines = text.split("\r\n");
+    if lines.next()? != "BT-SEARCH * HTTP/1.1" {
+        return None;
+    }
     let mut info_hash: Option<[u8; 20]> = None;
     let mut port: Option<u16> = None;
-    for line in text.lines() {
+    for line in lines {
         let line = line.trim();
-        if let Some(value) = line.strip_prefix("Infohash:") {
+        let (name, value) = match line.split_once(':') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        if name.eq_ignore_ascii_case("Infohash") {
             let value = value.trim();
             info_hash = decode_hex_20(value);
-        } else if let Some(value) = line.strip_prefix("Port:") {
+        } else if name.eq_ignore_ascii_case("Port") {
             let value = value.trim();
-            port = value.parse::<u16>().ok();
+            port = value.parse::<u16>().ok().filter(|port| *port != 0);
         }
     }
     Some((info_hash?, port?))
@@ -203,6 +224,14 @@ mod tests {
         assert!(parse_search_message(b"Port: 6881\r\n\r\n").is_none());
         assert!(parse_search_message(b"Infohash: 0123\r\n\r\n").is_none());
         assert!(parse_search_message(b"Infohash: nothex\r\nPort: 6881\r\n").is_none());
+        assert!(parse_search_message(
+            b"HTTP/1.1 200 OK\r\nInfohash: 0123456789abcdef0123456789abcdef01234567\r\nPort: 6881\r\n\r\n"
+        )
+        .is_none());
+        assert!(parse_search_message(
+            b"BT-SEARCH * HTTP/1.1\r\nInfohash: 0123456789abcdef0123456789abcdef01234567\r\nPort: 0\r\n\r\n"
+        )
+        .is_none());
     }
 
     #[test]

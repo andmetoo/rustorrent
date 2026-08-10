@@ -1,4 +1,5 @@
 #![no_main]
+#![allow(dead_code)]
 
 use std::io::Cursor;
 

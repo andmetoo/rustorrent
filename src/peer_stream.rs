@@ -99,9 +99,14 @@ impl Read for PeerStream {
             }
         }
 
-        let n = match &mut self.inner {
-            PeerStreamInner::Tcp(stream) => stream.read(&mut buf[copied..])?,
-            PeerStreamInner::Utp(stream) => stream.read(&mut buf[copied..])?,
+        let result = match &mut self.inner {
+            PeerStreamInner::Tcp(stream) => stream.read(&mut buf[copied..]),
+            PeerStreamInner::Utp(stream) => stream.read(&mut buf[copied..]),
+        };
+        let n = match result {
+            Ok(n) => n,
+            Err(_) if copied > 0 => return Ok(copied),
+            Err(err) => return Err(err),
         };
         if let Some(cipher) = self.cipher.as_mut() {
             cipher.decrypt(&mut buf[copied..copied + n]);
@@ -114,11 +119,19 @@ impl Write for PeerStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Some(cipher) = self.cipher.as_mut() {
             let mut tmp = buf.to_vec();
-            cipher.encrypt(&mut tmp);
-            match &mut self.inner {
+            let mut preview = cipher.clone();
+            preview.encrypt(&mut tmp);
+            let written = match &mut self.inner {
                 PeerStreamInner::Tcp(stream) => stream.write(&tmp),
                 PeerStreamInner::Utp(stream) => stream.write(&tmp),
+            }?;
+            if written == tmp.len() {
+                *cipher = preview;
+            } else if written > 0 {
+                let mut advance = vec![0u8; written];
+                cipher.encrypt(&mut advance);
             }
+            Ok(written)
         } else {
             match &mut self.inner {
                 PeerStreamInner::Tcp(stream) => stream.write(buf),
@@ -182,5 +195,18 @@ mod tests {
         let mut buf = [0u8; 9];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"encrypted");
+    }
+
+    #[test]
+    fn buffered_read_returns_progress_before_would_block() {
+        let (client, _server) = tcp_pair();
+        let mut reader = PeerStream::tcp(client);
+        reader.prepend_read_buffer(vec![b'a']);
+        reader.tcp_stream().unwrap().set_nonblocking(true).unwrap();
+
+        let mut buf = [0u8; 2];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], b'a');
     }
 }

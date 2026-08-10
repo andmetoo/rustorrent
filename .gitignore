@@ -24,7 +24,6 @@ target/
 # Bundled app binaries (scripts and plist are tracked)
 macos/rustorrent
 macos/rustorrent-bin
-macos/AppIcon.icns
 
 # Test output
 output/
@@ -37,4 +36,3 @@ Bugonia*/
 fuzz/artifacts/
 fuzz/corpus/
 fuzz/coverage/
-.github/

@@ -9,18 +9,61 @@ APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$APP_DIR/rustorrent-bin"
 UI_PORT=9473
 UI_URL="http://127.0.0.1:$UI_PORT"
-LOG_FILE="$HOME/.rustorrent/launcher.log"
+API_RESPONSE_LIMIT=4096
+LOG_DIR="$HOME/.rustorrent"
+LOG_FILE="$LOG_DIR/launcher.log"
 DOWNLOAD_DIR="$HOME/Downloads"
+
+# Files created by this launcher must never inherit group/other access.
+umask 077
 
 # Ensure PATH includes common locations
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-# Create log directory
-mkdir -p "$HOME/.rustorrent"
+fail_log_setup() {
+    printf '%s\n' "Rustorrent refused an unsafe launcher log path: $LOG_FILE" >&2
+    exit 1
+}
+
+# Pin logging to one validated append descriptor before the first log line.
+# noclobber gives the missing-file creation O_EXCL behavior, so a raced
+# pre-positioned entry fails closed instead of being followed.
+CURRENT_UID="$(/usr/bin/id -u)" || fail_log_setup
+if [[ -L "$LOG_DIR" ]]; then
+    fail_log_setup
+fi
+if [[ ! -e "$LOG_DIR" ]]; then
+    /bin/mkdir "$LOG_DIR" || fail_log_setup
+elif [[ ! -d "$LOG_DIR" ]]; then
+    fail_log_setup
+fi
+[[ "$(/usr/bin/stat -f '%u' "$LOG_DIR")" == "$CURRENT_UID" ]] || fail_log_setup
+/bin/chmod 700 "$LOG_DIR" || fail_log_setup
+
+if [[ -L "$LOG_FILE" ]]; then
+    fail_log_setup
+fi
+if [[ ! -e "$LOG_FILE" ]]; then
+    (set -o noclobber; : > "$LOG_FILE") 2>/dev/null || fail_log_setup
+elif [[ ! -f "$LOG_FILE" ]]; then
+    fail_log_setup
+fi
+exec 9>> "$LOG_FILE" || fail_log_setup
+
+[[ ! -L "$LOG_FILE" && -f "$LOG_FILE" ]] || fail_log_setup
+read -r PATH_OWNER PATH_LINKS PATH_INODE < <(/usr/bin/stat -f '%u %l %i' "$LOG_FILE") || fail_log_setup
+read -r FD_OWNER FD_LINKS FD_INODE < <(/usr/bin/stat -f '%u %l %i' /dev/fd/9) || fail_log_setup
+[[ "$(/usr/bin/stat -f '%HT' /dev/fd/9)" == "Regular File" ]] || fail_log_setup
+[[ "$PATH_OWNER" == "$CURRENT_UID" && "$FD_OWNER" == "$CURRENT_UID" ]] || fail_log_setup
+[[ "$PATH_LINKS" == "1" && "$FD_LINKS" == "1" ]] || fail_log_setup
+[[ "$PATH_INODE" == "$FD_INODE" ]] || fail_log_setup
+/bin/chmod 600 /dev/fd/9 || fail_log_setup
+[[ "$(/usr/bin/stat -f '%Lp' "$LOG_FILE")" == "600" ]] || fail_log_setup
+[[ "$(/usr/bin/stat -f '%i' "$LOG_FILE")" == "$FD_INODE" ]] || fail_log_setup
 
 # Log function
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >&9
 }
 
 log "Launcher started"
@@ -42,19 +85,29 @@ if [[ -n "$TORRENT_FILE" ]]; then
     log "Torrent file: $TORRENT_FILE"
 fi
 
-# Check if rustorrent is already running on this port
-if /usr/bin/curl -s --connect-timeout 1 "$UI_URL" >/dev/null 2>&1; then
-    log "Already running, opening browser"
-    if [[ -n "$TORRENT_FILE" ]]; then
-        /usr/bin/curl -s -X POST -H "Content-Type: application/x-bittorrent" \
-            --data-binary "@$TORRENT_FILE" \
-            "$UI_URL/add-torrent" >/dev/null 2>&1
-    fi
-    /usr/bin/open "$UI_URL"
-    exit 0
+OWNER_SECRET="$(/usr/bin/od -An -N32 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+if [[ ! "$OWNER_SECRET" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    log "Failed to generate launcher ownership secret"
+    exit 1
 fi
 
-# Start rustorrent
+fetch_api_response() {
+    # Read at most one byte beyond the accepted response size. head closes the
+    # pipe at that point, terminating a curl which keeps streaming output.
+    /usr/bin/curl -sS --connect-timeout 1 --max-time 3 "$UI_URL/api-token" 2>/dev/null \
+        | /usr/bin/head -c "$((API_RESPONSE_LIMIT + 1))"
+}
+
+extract_api_token() {
+    /usr/bin/sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F][0-9a-fA-F]*\)".*/\1/p'
+}
+
+extract_owner_secret() {
+    /usr/bin/sed -n 's/.*"owner_secret"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F][0-9a-fA-F]*\)".*/\1/p'
+}
+
+# Always launch a backend carrying this launcher's secret. Never hand a torrent
+# to an arbitrary process that happened to claim the fixed loopback port.
 log "Starting rustorrent..."
 cd "$HOME"
 mkdir -p "$DOWNLOAD_DIR"
@@ -62,10 +115,19 @@ mkdir -p "$DOWNLOAD_DIR"
 # Background task: poll until UI is ready, then open browser
 (
     for i in {1..30}; do
-        if /usr/bin/curl -s --connect-timeout 1 "$UI_URL" >/dev/null 2>&1; then
-            log "UI is ready, opening browser"
-            /usr/bin/open "$UI_URL"
-            break
+        # The sentinel prevents command substitution from stripping response
+        # newlines before the byte-count check.
+        API_CAPTURE="$({ fetch_api_response; /usr/bin/printf '\034'; })"
+        API_RESPONSE="${API_CAPTURE%$'\034'}"
+        API_RESPONSE_BYTES="$(/usr/bin/printf '%s' "$API_RESPONSE" | /usr/bin/wc -c | /usr/bin/tr -d '[:space:]')"
+        if [[ "$API_RESPONSE_BYTES" =~ ^[0-9]+$ ]] && (( API_RESPONSE_BYTES <= API_RESPONSE_LIMIT )); then
+            READY_TOKEN="$(printf '%s' "$API_RESPONSE" | extract_api_token)"
+            READY_OWNER="$(printf '%s' "$API_RESPONSE" | extract_owner_secret)"
+            if [[ "$READY_TOKEN" =~ ^[0-9a-fA-F]{32}$ ]] && [[ "$READY_OWNER" == "$OWNER_SECRET" ]]; then
+                log "UI is ready, opening browser"
+                /usr/bin/open "$UI_URL"
+                break
+            fi
         fi
         sleep 0.2
     done
@@ -74,7 +136,9 @@ mkdir -p "$DOWNLOAD_DIR"
 # exec replaces this shell with the actual binary.
 # macOS tracks this PID as the .app process → stays in the Dock.
 if [[ -n "$TORRENT_FILE" ]]; then
-    exec "$BINARY" "$TORRENT_FILE" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" --log "$LOG_FILE" >> "$LOG_FILE" 2>&1
+    exec /usr/bin/env RUSTORRENT_UI_OWNER_SECRET="$OWNER_SECRET" \
+        "$BINARY" "$TORRENT_FILE" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" --log "$LOG_FILE" >/dev/null 2>&9 9>&-
 else
-    exec "$BINARY" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" --log "$LOG_FILE" >> "$LOG_FILE" 2>&1
+    exec /usr/bin/env RUSTORRENT_UI_OWNER_SECRET="$OWNER_SECRET" \
+        "$BINARY" --ui --ui-addr "127.0.0.1:$UI_PORT" --download-dir "$DOWNLOAD_DIR" --log "$LOG_FILE" >/dev/null 2>&9 9>&-
 fi

@@ -1,8 +1,10 @@
-# rustorrent
+# Rustorrent
 
-A minimal BitTorrent client implemented in Rust. Single binary, ~840KB, three dependencies.
+A compact BitTorrent client implemented in Rust, with console, terminal, and built-in web
+interfaces. The CLI builds as one executable; macOS is also distributed as a native app bundle.
+It is still prerelease software, so keep a backup of important data.
 
-Works on **macOS** and **Linux**. Windows support is partial (builds, but NAT-PMP gateway detection is not implemented).
+Works on **macOS 11 or newer** and **Linux**. Windows support is partial (builds, but NAT-PMP gateway detection is not implemented).
 
 ## Screenshots
 
@@ -16,8 +18,8 @@ Works on **macOS** and **Linux**. Windows support is partial (builds, but NAT-PM
 
 ## Features
 
-- **BitTorrent protocol** — full download and upload with SHA-1 piece verification
-- **Magnet links** — metadata fetching via peers and DHT
+- **BitTorrent protocol** — v1, v2, and hybrid metainfo with SHA-1/SHA-256 verification
+- **Magnet links** — v1 metadata fetching via peers and DHT; verified HTTP sources for v2
 - **Trackers** — HTTP and UDP (BEP 15)
 - **DHT** — Distributed Hash Table (BEP 5) with K-bucket routing and node persistence
 - **PEX** — Peer Exchange
@@ -38,45 +40,60 @@ Works on **macOS** and **Linux**. Windows support is partial (builds, but NAT-PM
 
 ## Dependencies
 
-Only three crates:
+The full build has five direct Rust dependencies:
 
 - `native-tls` — HTTPS tracker support
+- `libc` — safe Unix file-opening flags
+- `getrandom` — operating-system entropy for protocol identifiers, temporary names, and MSE
 - `num-bigint` — MSE Diffie-Hellman (optional, `mse` feature)
 - `num-traits` — bigint helpers (optional, `mse` feature)
 
-Everything else — bencode, SHA-1, HTTP client, peer protocol, DHT, uTP, UPnP, NAT-PMP, web UI — is implemented from scratch.
+Everything else — bencode, SHA-1/SHA-256, HTTP, peer protocol, DHT, uTP, UPnP, NAT-PMP, and the
+web UI — is implemented in the repository. Exact dependency versions are recorded in
+`Cargo.lock`.
 
 ## Build
+
+Rust 1.89 or newer is required.
+
+Linux source builds also need `pkg-config` and the OpenSSL development package provided by the
+distribution (commonly `libssl-dev` on Debian/Ubuntu or `openssl-devel` on Fedora/RHEL).
 
 ```
 cargo build --release
 ```
 
-The release profile is optimized for size (`opt-level = "z"`, LTO, single codegen unit, stripped symbols). The resulting binary is under 1MB.
+The release profile is optimized for size (`opt-level = "z"`, LTO, one codegen unit, and stripped
+symbols) while retaining integer-overflow checks. Binary size varies by platform and toolchain;
+current builds are typically around 1–2 MiB.
 
-To build without encryption support (removes the `num-bigint` dependency):
+To build without peer-stream encryption (omits the MSE bigint dependencies):
 
 ```
-cargo build --release --no-default-features --features udp-tracker,dht,utp,lpd,natpmp,upnp,webseed
+cargo build --release --no-default-features --features udp_tracker,dht,utp,lpd,natpmp,upnp,webseed
 ```
 
 ## Platform support
 
 | Platform | Status |
 |----------|--------|
-| macOS (x86_64, aarch64) | Fully supported |
-| Linux (x86_64, aarch64) | Fully supported |
+| macOS 11+ (x86_64, aarch64) | Fully supported |
+| Linux x86_64 | Fully supported and CI-tested |
+| Linux aarch64 | Source-supported; runtime is not continuously tested in CI |
 | Windows | Builds, but NAT-PMP gateway detection unavailable |
 
-All platform-specific code has proper `#[cfg]` gates with fallbacks. The entropy source uses `/dev/urandom` with a fallback to time/pid/stack address mixing on platforms without it.
+Platform-specific capabilities are compile-time gated. MSE private keys use the operating
+system's cryptographic random-number provider.
 
 ## Usage
 
 ```
-rustorrent [options] [file.torrent ...]
+rustorrent [options] [file.torrent]
 ```
 
-The client prints progress to stdout and runs until the download completes or you press `Ctrl+C`. Session state is saved to `.rustorrent/` in the working directory and automatically resumed on restart.
+The client prints progress to stdout and runs until stopped with `Ctrl+C`. Session state is saved
+under `<download-dir>/.rustorrent/` and is resumed on restart. Only one torrent path and one magnet
+may be supplied at process startup; add further torrents through the web UI or a watch folder.
 
 ### Downloading a torrent file
 
@@ -97,7 +114,13 @@ Output:
 rustorrent --magnet "magnet:?xt=urn:btih:4b07d0071f9ceb21af6b8ba05b3a3c6f507e3fb2&dn=LibreOffice&tr=http://tracker.example.org:6969/announce"
 ```
 
-The client will first fetch metadata from peers/DHT, then begin downloading.
+For v1 magnets the client fetches metadata from explicit peers, trackers, and DHT. A v2-only or
+hybrid magnet currently needs a verified `xs`/`as` HTTP source containing the complete `.torrent`,
+including its piece layers.
+
+For hybrid `.torrent` sessions, peer handshakes support the BEP 52 v2 upgrade, but tracker, DHT,
+and LPD discovery currently announce the v1 swarm identifier rather than discovering the v1 and
+v2 swarms independently.
 
 ### Downloading to a specific directory
 
@@ -105,11 +128,14 @@ The client will first fetch metadata from peers/DHT, then begin downloading.
 rustorrent --download-dir ~/Downloads ubuntu.torrent
 ```
 
-### Multiple torrents at once
+### Multiple torrents
 
 ```sh
-rustorrent file1.torrent file2.torrent --magnet "magnet:?xt=urn:btih:..."
+rustorrent --ui --watch ~/watch --download-dir ~/downloads
 ```
+
+Add torrents through the web UI or copy `.torrent` files into the watch directory. Torrents saved
+in an existing session are also restored automatically.
 
 ### Sequential download (for media streaming)
 
@@ -125,11 +151,12 @@ Pieces are downloaded in order so a media player can start playback before the d
 # Limit download to 5 MB/s, upload to 1 MB/s
 rustorrent --download-rate 5242880 --upload-rate 1048576 ubuntu.torrent
 
-# Per-torrent limits (useful with multiple torrents)
-rustorrent --torrent-download-rate 2621440 file1.torrent file2.torrent
+# Per-torrent limit
+rustorrent --torrent-download-rate 2621440 file1.torrent
 ```
 
-Values are in bytes per second. `0` means unlimited (the default).
+Values are bytes per second. `k`, `m`, and `g` suffixes use powers of 1024; `0` and `unlimited`
+both mean unlimited.
 
 ### Encryption
 
@@ -151,6 +178,7 @@ rustorrent --download-dir ~/incomplete --move-completed ~/complete ubuntu.torren
 ```
 
 When a torrent finishes, its files are moved from `~/incomplete` to `~/complete`.
+The move is recorded transactionally and the torrent resumes seeding from the destination.
 
 ### Watch a folder
 
@@ -203,8 +231,8 @@ rustorrent --peer-profile aggressive ubuntu.torrent
 # Allow more peers globally and per torrent
 rustorrent --max-peers 500 --max-peers-torrent 80 ubuntu.torrent
 
-# Limit concurrent active torrents
-rustorrent --max-active 2 file1.torrent file2.torrent file3.torrent
+# Limit torrents restored or added through the UI/watch folder
+rustorrent --ui --max-active 2
 ```
 
 Profiles adjust `--max-peers`, `--max-peers-torrent`, `--numwant`, and the magnet metadata peer discovery limit:
@@ -235,7 +263,7 @@ rustorrent --create ./my-project \
   --tracker http://tracker.example.com:6969/announce \
   --output my-project.torrent
 
-# Custom piece length (default is auto-calculated)
+# Custom piece length (default: 262144 bytes)
 rustorrent --create ./my-project \
   --tracker http://tracker.example.com:6969/announce \
   --output my-project.torrent \
@@ -252,7 +280,12 @@ Example config:
 
 ```ini
 peer_profile = conservative
+download_rate = 5m
+upload_rate = 1m
 ```
+
+Command-line values override environment variables, which override the config file. Unknown
+config keys are rejected so misspellings do not silently change behavior.
 
 Or set the environment variable:
 
@@ -274,24 +307,33 @@ rustorrent --ui ubuntu.torrent
 # Custom port
 rustorrent --ui 9090 ubuntu.torrent
 
-# Custom bind address
-rustorrent --ui-addr 0.0.0.0:8080 ubuntu.torrent
+# IPv6 loopback
+rustorrent --ui-addr '[::1]:8080' ubuntu.torrent
 ```
 
-Open `http://127.0.0.1:8080` in your browser. The UI lets you add/remove torrents, see progress, manage files, and configure settings. Use `--ui-addr 0.0.0.0:8080` to make it accessible from other machines on your network.
+Open `http://127.0.0.1:8080` in your browser. The UI lets you add/remove torrents, see progress,
+manage files, and configure settings. The built-in server accepts loopback bind addresses only;
+for remote access, use an authenticated SSH tunnel or HTTPS reverse proxy rather than exposing
+the UI directly to a network.
 
-The web UI also includes a qBittorrent-style search panel. It can install raw `*.py` search plugins, run searches through qBittorrent's `nova3` runtime, and add search results back into rustorrent with one click. This requires `python3` to be available on the machine. Community plugins from the [qBittorrent unofficial search plugin wiki](https://github.com/qbittorrent/search-plugins/wiki/Unofficial-search-plugins) can be installed directly from the UI.
+The web UI also includes a qBittorrent-compatible search panel. It can install raw `*.py` search
+plugins, run searches through the bundled Python runtime, and add results with one click. This
+requires Python 3.9 or newer. Community plugins from the
+[qBittorrent unofficial search plugin wiki](https://github.com/qbittorrent/search-plugins/wiki/Unofficial-search-plugins)
+can be installed directly from the UI. Search plugins are executable third-party code: review and
+trust a plugin before installing it.
 
 ## All options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `[file.torrent ...]` | | One or more torrent files to download |
+| `[file.torrent]` | | One torrent file to add at startup |
 | `--magnet <link>` | | Add a magnet link |
 | `--download-dir <dir>` | `.` | Download directory |
 | `--port <port>` | `6881` | Listen port for incoming peers |
 | `--ui [port]` | off | Enable web UI (default port: 8080) |
 | `--ui-addr <addr>` | `127.0.0.1:8080` | Web UI bind address |
+| `--tui` | off | Use the interactive terminal interface |
 | `--sequential` | off | Download pieces in order |
 | `--preallocate` | off | Preallocate disk space |
 | `--encryption <mode>` | `prefer` | `disable`, `prefer`, or `require` |
@@ -303,20 +345,51 @@ The web UI also includes a qBittorrent-style search panel. It can install raw `*
 | `--max-active <n>` | `4` | Max concurrent active torrents |
 | `--numwant <n>` | `200` | Peers to request from tracker |
 | `--retry-interval <secs>` | `60` | Tracker re-announce interval |
-| `--download-rate <bps>` | `0` | Global download limit (0 = unlimited) |
-| `--upload-rate <bps>` | `0` | Global upload limit (0 = unlimited) |
-| `--torrent-download-rate <bps>` | `0` | Per-torrent download limit |
-| `--torrent-upload-rate <bps>` | `0` | Per-torrent upload limit |
-| `--write-cache <bytes>` | `0` | Write cache size (0 = disabled) |
+| `--download-rate <rate>` | `0` | Global download limit; accepts `k`/`m`/`g` suffixes |
+| `--upload-rate <rate>` | `0` | Global upload limit; accepts `k`/`m`/`g` suffixes |
+| `--torrent-download-rate <rate>` | `0` | Per-torrent download limit; accepts suffixes |
+| `--torrent-upload-rate <rate>` | `0` | Per-torrent upload limit; accepts suffixes |
+| `--write-cache <size>` | `0` | Write cache size; accepts suffixes (0 = disabled) |
 | `--move-completed <dir>` | | Move finished downloads to this directory |
 | `--watch <dir>` | | Watch directory for new `.torrent` files |
 | `--blocklist <path>` | | IP blocklist file |
+| `--proxy <url>` | | Proxy peer TCP and HTTP(S) trackers; disables every unsupported direct network path |
+| `--geoip-db <path>` | | Load a CSV IPv4-range/CIDR-to-country database |
+| `--seed-ratio <ratio>` | `0` | Stop seeding at this ratio (0 = disabled) |
+| `--max-seed-time <minutes>` | `0` | Stop seeding after this duration (0 = disabled) |
+| `--on-complete <script>` | | Run a script after a torrent completes |
+| `--super-seed` | off | Enable super-seeding for completed torrents |
+| `--rss <url>` | | Add an RSS/Atom feed; may be repeated |
+| `--rss-rule <feed:pattern>` | | Add an RSS matching rule; may be repeated |
+| `--rss-interval <seconds>` | `900` | RSS polling interval |
+| `--throttle <name:down_kbps:up_kbps>` | | Define a named throttle group |
+| `--ratio-group <name:ratio:action>` | | Define a ratio group (`stop`, `pause`, or `none`) |
+| `--schedule <seconds:command>` | | Run a supported scheduler command periodically |
+| `--log <path>` | | Append logs to a file |
+| `--daemon` | off | Fork into the background on Unix and enable the web UI |
+| `--pid-file <path>` | | Write the running process ID after startup locking |
 | `--create <path>` | | Create a torrent from this file or directory |
-| `--tracker <url>` | | Tracker URL (used with `--create`) |
-| `--output <file>` | | Output torrent file (used with `--create`) |
-| `--piece-length <bytes>` | auto | Piece length (used with `--create`) |
+| `--tracker <url>` | required | HTTP(S) or UDP tracker used with `--create` |
+| `--output <file>` | `<source>.torrent` | Output file used with `--create` |
+| `--piece-length <bytes>` | `262144` | Piece length used with `--create` |
 | `--config <path>` | | Config file path (env: `RUSTORRENT_CONFIG`) |
+
+Scheduler commands are `pause_all`, `resume_all`, `stop_ratio_reached`,
+`throttle_down:<bps>`, and `throttle_up:<bps>`. Completion scripts receive `TORRENT_NAME`,
+`TORRENT_DIR`, `TORRENT_HASH`, and `TORRENT_SIZE` environment variables. A completion script is
+claimed durably before it is launched, so it is attempted at most once and is not replayed when an
+already-complete torrent is stopped or resumed.
+
+Proxy mode is deliberately fail-closed. Peer TCP and HTTP(S) trackers use the configured SOCKS5
+or HTTP proxy. Inbound peers, DHT, LPD, uTP, UDP trackers, port mapping, web seeds, RSS polling,
+search downloads, and magnet HTTP sources are disabled so they cannot silently bypass it. The
+proxy server's own hostname is resolved by the local operating system; use a literal proxy IP if
+even that DNS lookup must not leave the host.
 
 ## License
 
-MIT
+The Rustorrent code is licensed under [MIT](LICENSE). The bundled qBittorrent-compatible search
+runtime retains BSD-3-Clause terms, so the distributed package is subject to both; see
+[Third-Party Notices](THIRD_PARTY_NOTICES.md). Exact Rust dependency versions and license texts
+are included in [Third-Party Licenses](THIRD_PARTY_LICENSES.html); CI regenerates that file from
+`Cargo.lock` and rejects drift.

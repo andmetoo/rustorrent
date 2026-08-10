@@ -1,13 +1,19 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
+const MAX_GEOIP_BYTES: usize = 256 * 1024 * 1024;
+const MAX_GEOIP_ENTRIES: usize = 2_000_000;
+
 pub struct GeoIpDb {
     entries: Vec<(u32, u32, [u8; 2])>,
 }
 
 impl GeoIpDb {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|err| format!("geoip load: {err}"))?;
+        let data = crate::read_file_limited(path, MAX_GEOIP_BYTES, false)
+            .map_err(|err| format!("geoip load: {err}"))?;
+        let text =
+            std::str::from_utf8(&data).map_err(|_| "geoip load: invalid UTF-8".to_string())?;
         let mut entries = Vec::new();
         for (line_no, raw) in text.lines().enumerate() {
             let line = raw.trim();
@@ -20,13 +26,19 @@ impl GeoIpDb {
                 continue;
             }
             match parse_entry(line) {
-                Some(entry) => entries.push(entry),
+                Some(entry) if entries.len() < MAX_GEOIP_ENTRIES => entries.push(entry),
+                Some(_) => return Err("geoip load: too many entries".to_string()),
                 None => {
                     return Err(format!("geoip line {}: invalid entry", line_no + 1));
                 }
             }
         }
         entries.sort_by_key(|(start, _, _)| *start);
+        for pair in entries.windows(2) {
+            if pair[1].0 <= pair[0].1 {
+                return Err("geoip load: overlapping address ranges".to_string());
+            }
+        }
         Ok(GeoIpDb { entries })
     }
 
@@ -72,7 +84,11 @@ fn parse_entry(line: &str) -> Option<(u32, u32, [u8; 2])> {
         return None;
     }
     let cc_str = parts[2].trim();
-    if cc_str.len() != 2 {
+    if cc_str.len() != 2
+        || !cc_str
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
         return None;
     }
     let cc = [cc_str.as_bytes()[0], cc_str.as_bytes()[1]];
@@ -101,7 +117,10 @@ fn parse_entry(line: &str) -> Option<(u32, u32, [u8; 2])> {
         let end_ip: Ipv4Addr = second.parse().ok()?;
         let start = u32::from(start_ip);
         let end = u32::from(end_ip);
-        Some((start.min(end), start.max(end), cc))
+        if end < start {
+            return None;
+        }
+        Some((start, end, cc))
     }
 }
 
@@ -196,5 +215,19 @@ mod tests {
         fs::write(&path, "not,valid\n").unwrap();
         assert!(GeoIpDb::load(&path).is_err());
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_reversed_overlapping_and_invalid_country_ranges() {
+        for (name, data) in [
+            ("reversed", "8.8.8.10,8.8.8.1,US\n"),
+            ("overlap", "8.8.8.0,8.8.8.100,US\n8.8.8.50,8.8.8.200,CA\n"),
+            ("country", "8.8.8.0,8.8.8.255,u$\n"),
+        ] {
+            let path = temp_file(name);
+            fs::write(&path, data).unwrap();
+            assert!(GeoIpDb::load(&path).is_err());
+            let _ = fs::remove_file(path);
+        }
     }
 }

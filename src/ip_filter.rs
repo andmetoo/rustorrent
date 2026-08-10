@@ -1,6 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::{fs, str::FromStr};
+use std::str::FromStr;
+
+const MAX_BLOCKLIST_BYTES: usize = 128 * 1024 * 1024;
+const MAX_BLOCKLIST_RULES: usize = 2_000_000;
 
 #[derive(Default, Clone)]
 pub struct IpFilter {
@@ -10,10 +13,17 @@ pub struct IpFilter {
 
 impl IpFilter {
     pub fn from_file(path: &Path) -> Result<Self, String> {
-        let text =
-            fs::read_to_string(path).map_err(|err| format!("failed to read blocklist: {err}"))?;
+        let data = crate::read_file_limited(path, MAX_BLOCKLIST_BYTES, false)
+            .map_err(|err| format!("failed to read blocklist: {err}"))?;
+        let text = std::str::from_utf8(&data)
+            .map_err(|_| "failed to read blocklist: invalid UTF-8".to_string())?;
         let mut filter = Self::default();
         for (line_no, raw) in text.lines().enumerate() {
+            let raw = if line_no == 0 {
+                raw.strip_prefix('\u{feff}').unwrap_or(raw)
+            } else {
+                raw
+            };
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -26,7 +36,11 @@ impl IpFilter {
             if let Err(err) = filter.add_rule(line) {
                 return Err(format!("blocklist line {}: {}", line_no + 1, err));
             }
+            if filter.v4.len().saturating_add(filter.v6.len()) > MAX_BLOCKLIST_RULES {
+                return Err("blocklist contains too many rules".to_string());
+            }
         }
+        filter.normalize();
         Ok(filter)
     }
 
@@ -34,17 +48,23 @@ impl IpFilter {
         match addr {
             IpAddr::V4(ip) => {
                 let value = u32::from(ip);
-                self.v4
-                    .iter()
-                    .any(|(start, end)| value >= *start && value <= *end)
+                contains_v4(&self.v4, value)
             }
             IpAddr::V6(ip) => {
                 let value = u128::from(ip);
-                self.v6
-                    .iter()
-                    .any(|(start, end)| value >= *start && value <= *end)
+                contains_v6(&self.v6, value)
+                    || ip
+                        .to_ipv4_mapped()
+                        .is_some_and(|mapped| contains_v4(&self.v4, u32::from(mapped)))
             }
         }
+    }
+
+    fn normalize(&mut self) {
+        self.v4.sort_unstable_by_key(|range| range.0);
+        self.v6.sort_unstable_by_key(|range| range.0);
+        merge_v4_ranges(&mut self.v4);
+        merge_v6_ranges(&mut self.v6);
     }
 
     fn add_rule(&mut self, rule: &str) -> Result<(), String> {
@@ -100,6 +120,44 @@ impl IpFilter {
             Ok(())
         }
     }
+}
+
+fn contains_v4(ranges: &[(u32, u32)], value: u32) -> bool {
+    let index = ranges.partition_point(|(start, _)| *start <= value);
+    index > 0 && value <= ranges[index - 1].1
+}
+
+fn contains_v6(ranges: &[(u128, u128)], value: u128) -> bool {
+    let index = ranges.partition_point(|(start, _)| *start <= value);
+    index > 0 && value <= ranges[index - 1].1
+}
+
+fn merge_v4_ranges(ranges: &mut Vec<(u32, u32)>) {
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1.saturating_add(1) {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    *ranges = merged;
+}
+
+fn merge_v6_ranges(ranges: &mut Vec<(u128, u128)>) {
+    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1.saturating_add(1) {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    *ranges = merged;
 }
 
 fn normalize_v4_range(start: Ipv4Addr, end: Ipv4Addr) -> (u32, u32) {
@@ -219,5 +277,21 @@ mod tests {
         };
         let _ = fs::remove_file(&path);
         assert!(err.contains("line 2"));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_cannot_bypass_ipv4_rules() {
+        let mut filter = IpFilter::default();
+        filter.add_rule("192.0.2.0/24").unwrap();
+        assert!(filter.is_blocked(IpAddr::V6("::ffff:192.0.2.42".parse().unwrap())));
+    }
+
+    #[test]
+    fn from_file_accepts_utf8_bom() {
+        let path = temp_file("bom");
+        fs::write(&path, "\u{feff}203.0.113.7\n").unwrap();
+        let filter = IpFilter::from_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(filter.is_blocked("203.0.113.7".parse().unwrap()));
     }
 }

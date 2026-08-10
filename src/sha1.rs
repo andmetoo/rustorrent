@@ -22,7 +22,9 @@ impl Sha1 {
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
-        self.length_bits = self.length_bits.wrapping_add((data.len() as u64) * 8);
+        self.length_bits = self
+            .length_bits
+            .wrapping_add((data.len() as u64).wrapping_mul(8));
 
         if self.buffer_len > 0 {
             let needed = 64 - self.buffer_len;
@@ -122,6 +124,12 @@ impl Sha1 {
     }
 }
 
+impl Default for Sha1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn sha1(data: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
     hasher.update(data);
@@ -164,5 +172,18 @@ mod tests {
         let actual = hasher.finalize();
         assert_eq!(actual, expected);
         assert_eq!(to_hex(&actual), "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12");
+    }
+
+    #[test]
+    fn sha1_long_message() {
+        let mut hasher = Sha1::default();
+        let chunk = [b'a'; 1_000];
+        for _ in 0..1_000 {
+            hasher.update(&chunk);
+        }
+        assert_eq!(
+            to_hex(&hasher.finalize()),
+            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
+        );
     }
 }

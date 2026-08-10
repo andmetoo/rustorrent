@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
@@ -217,11 +218,16 @@ fn lock_state(state: &Arc<Mutex<UiState>>) -> MutexGuard<'_, UiState> {
 }
 
 const API_TOKEN_HEADER: &str = "x-rustorrent-token";
+const UI_OWNER_SECRET_ENV: &str = "RUSTORRENT_UI_OWNER_SECRET";
+const UI_OWNER_SECRET_HEX_LEN: usize = 64;
 static UI_API_TOKEN: OnceLock<String> = OnceLock::new();
+static UI_OWNER_SECRET: OnceLock<String> = OnceLock::new();
 static API_TOKEN_RATE: OnceLock<Mutex<HashMap<IpAddr, (u32, Instant)>>> = OnceLock::new();
+static SSE_ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
-const API_TOKEN_RATE_MAX: u32 = 10;
+const API_TOKEN_RATE_MAX: u32 = 180;
 const API_TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
+const SSE_MAX_ACTIVE_CONNECTIONS: usize = 24;
 
 fn api_token() -> &'static str {
     UI_API_TOKEN.get_or_init(generate_api_token).as_str()
@@ -229,17 +235,107 @@ fn api_token() -> &'static str {
 
 fn generate_api_token() -> String {
     let mut bytes = [0u8; 16];
+    if let Err(err) = fill_secure_random(&mut bytes) {
+        eprintln!("fatal: failed to generate secure API token: {err}");
+        std::process::abort();
+    }
+    hex_bytes(&bytes)
+}
+
+fn valid_ui_owner_secret(value: &str) -> bool {
+    value.len() == UI_OWNER_SECRET_HEX_LEN && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_ui_owner_secret() -> std::io::Result<String> {
+    match std::env::var(UI_OWNER_SECRET_ENV) {
+        Ok(value) if valid_ui_owner_secret(&value) => Ok(value),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{UI_OWNER_SECRET_ENV} must be a {UI_OWNER_SECRET_HEX_LEN}-character hexadecimal secret"
+            ),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(String::new()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{UI_OWNER_SECRET_ENV} must be valid UTF-8"),
+        )),
+    }
+}
+
+fn configure_ui_owner_secret() -> std::io::Result<()> {
+    let secret = read_ui_owner_secret()?;
+    if let Some(existing) = UI_OWNER_SECRET.get() {
+        if existing == &secret {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "UI owner secret was already configured with a different value",
+        ));
+    }
+    let _ = UI_OWNER_SECRET.set(secret);
+    Ok(())
+}
+
+fn ui_owner_secret() -> &'static str {
+    UI_OWNER_SECRET
+        .get_or_init(|| read_ui_owner_secret().unwrap_or_default())
+        .as_str()
+}
+
+#[cfg(unix)]
+fn fill_secure_random(bytes: &mut [u8]) -> std::io::Result<()> {
     if let Ok(mut file) = File::open("/dev/urandom") {
-        if file.read_exact(&mut bytes).is_ok() {
-            return hex_bytes(&bytes);
+        if file.read_exact(bytes).is_ok() {
+            return Ok(());
         }
     }
-    if let Ok(mut file) = File::open("/dev/random") {
-        if file.read_exact(&mut bytes).is_ok() {
-            return hex_bytes(&bytes);
-        }
+    Err(std::io::Error::other(
+        "operating-system random source unavailable",
+    ))
+}
+
+#[cfg(windows)]
+fn fill_secure_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(
+            algorithm: *mut std::ffi::c_void,
+            buffer: *mut u8,
+            length: u32,
+            flags: u32,
+        ) -> i32;
     }
-    panic!("failed to generate secure API token: neither /dev/urandom nor /dev/random available");
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "random request too large")
+    })?;
+    // SAFETY: `bytes` is writable for `length` bytes and a null algorithm handle is
+    // required when requesting the system-preferred RNG.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "BCryptGenRandom failed with status {status:#x}"
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fill_secure_random(_bytes: &mut [u8]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no secure random implementation for this platform",
+    ))
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -252,6 +348,29 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 struct UiConnectionGuard {
     active: Arc<AtomicUsize>,
+}
+
+struct SseConnectionGuard;
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        SSE_ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn try_acquire_sse_connection_slot() -> Option<SseConnectionGuard> {
+    loop {
+        let current = SSE_ACTIVE_CONNECTIONS.load(Ordering::SeqCst);
+        if current >= SSE_MAX_ACTIVE_CONNECTIONS {
+            return None;
+        }
+        if SSE_ACTIVE_CONNECTIONS
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(SseConnectionGuard);
+        }
+    }
 }
 
 impl Drop for UiConnectionGuard {
@@ -282,6 +401,7 @@ pub fn start(
     state: Arc<Mutex<UiState>>,
     cmd_tx: Option<mpsc::Sender<UiCommand>>,
 ) -> std::io::Result<()> {
+    configure_ui_owner_secret()?;
     let listener = TcpListener::bind(&addr)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
@@ -308,13 +428,33 @@ fn handle_connection(
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(UI_READ_TIMEOUT))?;
     stream.set_write_timeout(Some(UI_WRITE_TIMEOUT))?;
-    let request = match read_request(&mut stream) {
+    let mut pending = match read_request_head(&mut stream) {
         Ok(request) => request,
         Err(_) => {
             return send_api_error(stream, "bad request");
         }
     };
-    let (path, query) = split_path_query(&request.path);
+    // The API token is intentionally delivered to the local UI. Restricting
+    // Host to localhost or an IP literal prevents a hostile DNS name that has
+    // rebound to this listener from reading that token and issuing same-origin
+    // mutations through the victim's browser.
+    if !request_has_safe_host(&pending.request) {
+        return send_api_error_with_status(stream, 403, "forbidden host");
+    }
+    let (path, query) = split_path_query(&pending.request.path);
+
+    if pending.request.method == "POST" {
+        if let Err(err) = authorize_mutating_request(&pending.request) {
+            return send_api_error_with_status(stream, 403, &err);
+        }
+        let Some(body_limit) = post_body_limit(&path) else {
+            return send_api_error_with_status(stream, 404, "unknown endpoint");
+        };
+        if finish_request_body(&mut stream, &mut pending, body_limit).is_err() {
+            return send_api_error(stream, "bad request");
+        }
+    }
+    let request = pending.request;
 
     if request.method == "GET" && path == "/api-token" {
         if let Ok(peer) = stream.peer_addr() {
@@ -328,6 +468,10 @@ fn handle_connection(
         return send_head(stream, "application/json");
     }
     if request.method == "GET" && path == "/events" {
+        let Some(sse_guard) = try_acquire_sse_connection_slot() else {
+            return send_api_error_with_status(stream, 503, "too many event streams");
+        };
+        let _sse_guard = sse_guard;
         return handle_sse(stream, state);
     }
     if request.method == "HEAD" && path == "/events" {
@@ -335,9 +479,6 @@ fn handle_connection(
     }
 
     if request.method == "POST" {
-        if let Err(err) = authorize_mutating_request(&request) {
-            return send_api_error_with_status(stream, 403, &err);
-        }
         if path == "/torrent/open-folder" {
             if let Err(err) = handle_open_folder(&query, &state) {
                 return send_api_error(stream, &err);
@@ -515,6 +656,15 @@ fn handle_connection(
         return send_api_error_with_status(stream, 404, "unknown endpoint");
     }
 
+    if request.method == "HEAD" {
+        let content_type = match path.as_str() {
+            "/" | "/index.html" => "text/html; charset=utf-8",
+            "/status" | "/search/status" | "/search/catalog" | "/rss/status" => "application/json",
+            _ => return send_api_error_with_status(stream, 404, "unknown endpoint"),
+        };
+        return send_head(stream, content_type);
+    }
+
     if path == "/search/status" {
         let body = crate::search::status_json();
         return send_json_body(stream, 200, &body);
@@ -523,12 +673,19 @@ fn handle_connection(
         let refresh = query_value(&query, "refresh")
             .map(parse_bool)
             .unwrap_or(false);
+        if refresh && !has_valid_api_token(&request) {
+            return send_api_error_with_status(stream, 403, "missing or invalid api token");
+        }
         let body = crate::search::catalog_json(refresh);
         return send_json_body(stream, 200, &body);
     }
     if path == "/rss/status" {
         let body = rss_status_json();
         return send_json_body(stream, 200, &body);
+    }
+
+    if path != "/status" && path != "/" && path != "/index.html" {
+        return send_api_error_with_status(stream, 404, "unknown endpoint");
     }
 
     let mut guard = lock_state(&state);
@@ -540,7 +697,7 @@ fn handle_connection(
     };
 
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(response.as_bytes())?;
@@ -548,20 +705,82 @@ fn handle_connection(
     Ok(())
 }
 
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = crate::MAX_TORRENT_BYTES;
+const MAX_FORM_BODY_BYTES: usize = 64 * 1024;
+const MAX_PLUGIN_BODY_BYTES: usize = 512 * 1024;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_CHUNK_LINE_BYTES: usize = 1024;
+const MAX_RATE_LIMIT_KBPS: u64 = 102_400;
+const MAX_LABEL_BYTES: usize = 128;
+const MAX_USER_URL_BYTES: usize = 2_048;
+const MAX_RSS_RULE_BYTES: usize = 512;
 const COMMAND_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const UI_MAX_ACTIVE_CONNECTIONS: usize = 64;
 const UI_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const UI_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
+const SECURITY_HEADERS: &str = concat!(
+    "X-Content-Type-Options: nosniff\r\n",
+    "X-Frame-Options: DENY\r\n",
+    "Referrer-Policy: no-referrer\r\n",
+    "Cross-Origin-Resource-Policy: same-origin\r\n",
+    "Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n",
+    "Content-Security-Policy: default-src 'self'; base-uri 'none'; object-src 'none'; ",
+    "frame-ancestors 'none'; img-src 'self' data:; connect-src 'self'; ",
+    "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'\r\n",
+);
+
+fn post_body_limit(path: &str) -> Option<usize> {
+    match path {
+        "/add-torrent" => Some(crate::MAX_TORRENT_BYTES),
+        "/search/install-plugin" => Some(MAX_PLUGIN_BODY_BYTES),
+        "/add-magnet"
+        | "/file-priority"
+        | "/rename-file"
+        | "/rate-limits"
+        | "/settings/seed-ratio"
+        | "/settings/peer-profile"
+        | "/torrent/set-label"
+        | "/torrent/add-tracker"
+        | "/torrent/remove-tracker"
+        | "/rss/add-feed"
+        | "/rss/remove-feed"
+        | "/rss/add-rule"
+        | "/rss/remove-rule"
+        | "/search/install-url"
+        | "/search/remove-plugin"
+        | "/search/run"
+        | "/search/add-result" => Some(MAX_FORM_BODY_BYTES),
+        "/torrent/open-folder"
+        | "/torrent/pause"
+        | "/torrent/resume"
+        | "/torrent/stop"
+        | "/torrent/archive"
+        | "/torrent/delete"
+        | "/select-download-dir"
+        | "/torrent/recheck" => Some(0),
+        _ => None,
+    }
+}
 
 struct HttpRequest {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum RequestBodyFraming {
+    Fixed(usize),
+    Chunked,
+}
+
+struct PendingHttpRequest {
+    request: HttpRequest,
+    buffered_body: Vec<u8>,
+    framing: RequestBodyFraming,
 }
 
 impl HttpRequest {
@@ -574,7 +793,7 @@ impl HttpRequest {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
+fn read_request_head(stream: &mut TcpStream) -> std::io::Result<PendingHttpRequest> {
     let mut buffer = Vec::with_capacity(1024);
     let mut header_end = None;
     let header_deadline = Instant::now() + REQUEST_HEADER_TIMEOUT;
@@ -595,22 +814,33 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
             break;
         }
         buffer.extend_from_slice(&chunk[..n]);
-        if buffer.len() > MAX_HEADER_BYTES + MAX_BODY_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request too large",
-            ));
-        }
         if let Some(pos) = find_header_end(&buffer) {
+            if pos + 4 > MAX_HEADER_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request headers too large",
+                ));
+            }
             header_end = Some(pos);
             break;
+        }
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request headers too large",
+            ));
         }
     }
 
     let header_end = header_end
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid request"))?;
-    let header_str = String::from_utf8_lossy(&buffer[..header_end]);
-    let mut lines = header_str.lines();
+    let header_str = std::str::from_utf8(&buffer[..header_end]).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request headers are not utf-8",
+        )
+    })?;
+    let mut lines = header_str.split("\r\n");
     let request_line = lines
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid request"))?;
@@ -623,6 +853,21 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid path"))?
         .to_string();
+    let version = parts.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid http version")
+    })?;
+    if parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid request line",
+        ));
+    }
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported method",
+        ));
+    }
     if !path.starts_with('/') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -630,87 +875,203 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
         ));
     }
 
-    let mut content_length = 0usize;
-    let mut chunked_body = false;
+    if path.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid path",
+        ));
+    }
+
+    let mut content_length = None;
+    let mut transfer_encoding = None;
+    let mut host_seen = false;
     let mut headers = Vec::new();
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            let header_name = name.trim().to_ascii_lowercase();
-            let header_value = value.trim().to_string();
-            headers.push((header_name.clone(), header_value.clone()));
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = header_value.parse::<usize>().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid content length")
-                })?;
-            }
-            if name.trim().eq_ignore_ascii_case("transfer-encoding")
-                && header_value
-                    .split(',')
-                    .any(|value| value.trim().eq_ignore_ascii_case("chunked"))
-            {
-                chunked_body = true;
-            }
+        let (name, value) = line.split_once(':').ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed request header")
+        })?;
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid request header name",
+            ));
         }
+        let header_name = name.to_ascii_lowercase();
+        let header_value = value.trim_matches([' ', '\t']);
+        if header_value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid request header value",
+            ));
+        }
+        if header_name == "content-length" {
+            if content_length.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "duplicate content length",
+                ));
+            }
+            content_length = Some(header_value.parse::<usize>().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid content length")
+            })?);
+        }
+        if header_name == "transfer-encoding" {
+            if transfer_encoding.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "duplicate transfer encoding",
+                ));
+            }
+            transfer_encoding = Some(header_value.to_string());
+        }
+        if header_name == "host" {
+            if host_seen {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "duplicate host",
+                ));
+            }
+            host_seen = true;
+        }
+        headers.push((header_name, header_value.to_string()));
     }
-    if content_length > MAX_BODY_BYTES {
+    if version == "HTTP/1.1" && !host_seen {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing host",
+        ));
+    }
+    if content_length.is_some() && transfer_encoding.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ambiguous request body framing",
+        ));
+    }
+    let chunked_body = match transfer_encoding.as_deref() {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("chunked") => true,
+        Some(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported transfer encoding",
+            ));
+        }
+    };
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_REQUEST_BODY_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "request body too large",
         ));
     }
 
-    let mut body = buffer[header_end + 4..].to_vec();
-    if chunked_body {
-        body = read_chunked_body(stream, body)?;
-        return Ok(HttpRequest {
+    let mut buffered_body = buffer[header_end + 4..].to_vec();
+    if !chunked_body && buffered_body.len() > content_length {
+        buffered_body.truncate(content_length);
+    }
+    Ok(PendingHttpRequest {
+        request: HttpRequest {
             method,
             path,
             headers,
-            body,
-        });
-    }
-    if body.len() > content_length {
-        body.truncate(content_length);
-    }
-    let body_deadline = Instant::now() + REQUEST_BODY_TIMEOUT;
-    while body.len() < content_length {
-        if Instant::now() >= body_deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "request body timeout",
-            ));
-        }
-        let mut chunk = [0u8; 1024];
-        let n = match stream.read(&mut chunk) {
-            Ok(n) => n,
-            Err(err) if is_retryable_io_error(&err) => continue,
-            Err(err) => return Err(err),
-        };
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-        if body.len() > content_length {
-            body.truncate(content_length);
-            break;
-        }
-    }
-    if body.len() < content_length {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "request body truncated",
-        ));
-    }
-
-    Ok(HttpRequest {
-        method,
-        path,
-        headers,
-        body,
+            body: Vec::new(),
+        },
+        buffered_body,
+        framing: if chunked_body {
+            RequestBodyFraming::Chunked
+        } else {
+            RequestBodyFraming::Fixed(content_length)
+        },
     })
 }
 
-fn read_chunked_body(stream: &mut TcpStream, mut encoded: Vec<u8>) -> std::io::Result<Vec<u8>> {
+fn finish_request_body(
+    stream: &mut TcpStream,
+    pending: &mut PendingHttpRequest,
+    limit: usize,
+) -> std::io::Result<()> {
+    match pending.framing {
+        RequestBodyFraming::Chunked => {
+            pending.request.body =
+                read_chunked_body(stream, std::mem::take(&mut pending.buffered_body), limit)?;
+            Ok(())
+        }
+        RequestBodyFraming::Fixed(content_length) => {
+            if content_length > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request body too large",
+                ));
+            }
+            let mut body = std::mem::take(&mut pending.buffered_body);
+            if body.len() > content_length {
+                body.truncate(content_length);
+            }
+            let body_deadline = Instant::now() + REQUEST_BODY_TIMEOUT;
+            while body.len() < content_length {
+                if Instant::now() >= body_deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "request body timeout",
+                    ));
+                }
+                let mut chunk = [0u8; 1024];
+                let n = match stream.read(&mut chunk) {
+                    Ok(n) => n,
+                    Err(err) if is_retryable_io_error(&err) => continue,
+                    Err(err) => return Err(err),
+                };
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+                if body.len() > content_length {
+                    body.truncate(content_length);
+                    break;
+                }
+            }
+            if body.len() < content_length {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "request body truncated",
+                ));
+            }
+
+            pending.request.body = body;
+            Ok(())
+        }
+    }
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn read_chunked_body(
+    stream: &mut TcpStream,
+    mut encoded: Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut cursor = 0usize;
     let body_deadline = Instant::now() + REQUEST_BODY_TIMEOUT;
@@ -718,9 +1079,21 @@ fn read_chunked_body(stream: &mut TcpStream, mut encoded: Vec<u8>) -> std::io::R
     loop {
         let line_end = loop {
             if let Some(relative) = find_crlf(&encoded[cursor..]) {
+                if relative > MAX_CHUNK_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk header too large",
+                    ));
+                }
                 break cursor + relative;
             }
-            read_more_body(stream, &mut encoded, body_deadline)?;
+            if encoded.len().saturating_sub(cursor) > MAX_CHUNK_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "chunk header too large",
+                ));
+            }
+            read_more_body(stream, &mut encoded, body_deadline, limit)?;
         };
 
         let size = parse_chunk_size(&encoded[cursor..line_end])?;
@@ -734,25 +1107,31 @@ fn read_chunked_body(stream: &mut TcpStream, mut encoded: Vec<u8>) -> std::io::R
                 if find_header_end(&encoded[cursor..]).is_some() {
                     return Ok(decoded);
                 }
-                read_more_body(stream, &mut encoded, body_deadline)?;
+                read_more_body(stream, &mut encoded, body_deadline, limit)?;
             }
         }
 
         let next_len = decoded.len().checked_add(size).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "request body too large")
         })?;
-        if next_len > MAX_BODY_BYTES {
+        if next_len > limit {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "request body too large",
             ));
         }
 
-        while encoded.len() < cursor + size + 2 {
-            read_more_body(stream, &mut encoded, body_deadline)?;
+        let chunk_end = cursor.checked_add(size).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "request body too large")
+        })?;
+        let framed_end = chunk_end.checked_add(2).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "request body too large")
+        })?;
+        while encoded.len() < framed_end {
+            read_more_body(stream, &mut encoded, body_deadline, limit)?;
         }
-        decoded.extend_from_slice(&encoded[cursor..cursor + size]);
-        cursor += size;
+        decoded.extend_from_slice(&encoded[cursor..chunk_end]);
+        cursor = chunk_end;
         if encoded.get(cursor..cursor + 2) != Some(b"\r\n") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -767,6 +1146,7 @@ fn read_more_body(
     stream: &mut TcpStream,
     buffer: &mut Vec<u8>,
     deadline: Instant,
+    limit: usize,
 ) -> std::io::Result<()> {
     if Instant::now() >= deadline {
         return Err(std::io::Error::new(
@@ -787,7 +1167,7 @@ fn read_more_body(
         ));
     }
     buffer.extend_from_slice(&chunk[..n]);
-    if buffer.len() > MAX_HEADER_BYTES + MAX_BODY_BYTES.saturating_mul(2) {
+    if buffer.len() > MAX_HEADER_BYTES + limit.saturating_mul(2) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "request body too large",
@@ -801,21 +1181,26 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
 }
 
 fn parse_chunk_size(line: &[u8]) -> std::io::Result<usize> {
-    let size_part = line
-        .split(|byte| *byte == b';')
-        .next()
-        .unwrap_or(&[])
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect::<Vec<_>>();
+    let mut size_part = line.split(|byte| *byte == b';').next().unwrap_or(&[]);
+    while size_part.first().is_some_and(u8::is_ascii_whitespace) {
+        size_part = &size_part[1..];
+    }
+    while size_part.last().is_some_and(u8::is_ascii_whitespace) {
+        size_part = &size_part[..size_part.len() - 1];
+    }
     if size_part.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid chunk size",
         ));
     }
-    let text = std::str::from_utf8(&size_part)
+    if !size_part.iter().all(u8::is_ascii_hexdigit) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid chunk size",
+        ));
+    }
+    let text = std::str::from_utf8(size_part)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size"))?;
     usize::from_str_radix(text, 16)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size"))
@@ -951,6 +1336,9 @@ fn handle_file_priority(
         .ok_or_else(|| "missing priority".to_string())?
         .parse::<u8>()
         .map_err(|_| "invalid priority".to_string())?;
+    if priority > 3 {
+        return Err("invalid priority (expected 0 through 3)".to_string());
+    }
     let torrent_id = query_value(&form, "id")
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| "missing torrent id".to_string())?;
@@ -995,9 +1383,11 @@ fn handle_rename_file(
         .ok_or_else(|| "missing name".to_string())?
         .to_string();
     if new_name.is_empty()
+        || new_name.len() > 255
         || new_name.contains('/')
         || new_name.contains('\\')
         || new_name.contains('\0')
+        || new_name.chars().any(char::is_control)
         || new_name == "."
         || new_name == ".."
     {
@@ -1052,9 +1442,17 @@ fn handle_rss_add_feed(
     if url.is_empty() {
         return Err("empty url".to_string());
     }
+    if url.len() > MAX_USER_URL_BYTES
+        || !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return Err("invalid feed url (expected http:// or https://)".to_string());
+    }
     let interval = query_value(&form, "interval")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(900);
+    if !(60..=7 * 24 * 60 * 60).contains(&interval) {
+        return Err("invalid feed interval (expected 60 to 604800 seconds)".to_string());
+    }
     dispatch_command_ok(cmd_tx, |reply| UiCommand::AddRssFeed {
         url: url.clone(),
         interval,
@@ -1090,6 +1488,15 @@ fn handle_rss_add_rule(
     let pattern = query_value(&form, "pattern")
         .ok_or_else(|| "missing pattern".to_string())?
         .to_string();
+    if name.trim().is_empty() || name.len() > 128 {
+        return Err("invalid rule name".to_string());
+    }
+    if pattern.trim().is_empty() || pattern.len() > MAX_RSS_RULE_BYTES {
+        return Err("invalid rule pattern".to_string());
+    }
+    if feed_url.len() > MAX_USER_URL_BYTES {
+        return Err("invalid rule feed url".to_string());
+    }
     dispatch_command_ok(cmd_tx, |reply| UiCommand::AddRssRule {
         name: name.clone(),
         feed_url: feed_url.clone(),
@@ -1221,7 +1628,7 @@ fn handle_search_add_result(
     let form = parse_query_pairs(&body_str);
     let index = query_value(&form, "index")
         .ok_or_else(|| "missing index".to_string())?
-        .parse::<usize>()
+        .parse::<u64>()
         .map_err(|_| "invalid index".to_string())?;
     let download_dir = query_value(&form, "dir").unwrap_or("").to_string();
     let preallocate = query_value(&form, "prealloc")
@@ -1276,6 +1683,11 @@ fn handle_rate_limits(
         .ok_or_else(|| "missing upload_kbps".to_string())?
         .parse::<u64>()
         .map_err(|_| "invalid upload_kbps".to_string())?;
+    if download_kbps > MAX_RATE_LIMIT_KBPS || upload_kbps > MAX_RATE_LIMIT_KBPS {
+        return Err(format!(
+            "rate limit exceeds maximum of {MAX_RATE_LIMIT_KBPS} KiB/s"
+        ));
+    }
     let download_limit_bps = download_kbps.saturating_mul(1024);
     let upload_limit_bps = upload_kbps.saturating_mul(1024);
 
@@ -1314,8 +1726,8 @@ fn handle_set_seed_ratio(
         .ok_or_else(|| "missing ratio".to_string())?
         .parse::<f64>()
         .map_err(|_| "invalid ratio".to_string())?;
-    if ratio < 0.0 {
-        return Err("ratio must be >= 0".to_string());
+    if !ratio.is_finite() || !(0.0..=10.0).contains(&ratio) {
+        return Err("ratio must be finite and between 0 and 10".to_string());
     }
     dispatch_command_ok(cmd_tx, |reply| UiCommand::SetSeedRatio { ratio, reply })
 }
@@ -1331,6 +1743,9 @@ fn handle_set_peer_profile(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "missing profile".to_string())?
         .to_string();
+    if !matches!(profile.as_str(), "conservative" | "balanced" | "aggressive") {
+        return Err("invalid peer profile".to_string());
+    }
     dispatch_command_ok(cmd_tx, |reply| UiCommand::SetPeerProfile { profile, reply })
 }
 
@@ -1345,6 +1760,9 @@ fn handle_set_label(
         .and_then(|v| v.parse::<u64>().ok())
         .ok_or_else(|| "missing torrent id".to_string())?;
     let label = query_value(&form, "label").unwrap_or("").to_string();
+    if label.len() > MAX_LABEL_BYTES || label.chars().any(char::is_control) {
+        return Err("invalid label".to_string());
+    }
 
     dispatch_command_ok(cmd_tx, |reply| UiCommand::SetLabel {
         torrent_id,
@@ -1549,7 +1967,7 @@ fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
 
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0;
     while idx < bytes.len() {
         match bytes[idx] {
@@ -1557,22 +1975,22 @@ fn percent_decode(input: &str) -> String {
                 let hi = bytes[idx + 1] as char;
                 let lo = bytes[idx + 2] as char;
                 if let (Some(hi), Some(lo)) = (hi.to_digit(16), lo.to_digit(16)) {
-                    out.push((hi * 16 + lo) as u8 as char);
+                    out.push((hi * 16 + lo) as u8);
                     idx += 3;
                     continue;
                 }
             }
             b'+' => {
-                out.push(' ');
+                out.push(b' ');
                 idx += 1;
                 continue;
             }
             _ => {}
         }
-        out.push(bytes[idx] as char);
+        out.push(bytes[idx]);
         idx += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_bool(value: &str) -> bool {
@@ -1593,6 +2011,50 @@ fn extract_origin_host(origin: &str) -> Option<String> {
     } else {
         Some(host)
     }
+}
+
+fn authority_host(authority: &str) -> Option<&str> {
+    let authority = authority.trim();
+    if authority.is_empty() || authority.contains(['/', '\\', '@', '?', '#']) {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if !tail.is_empty()
+            && (!tail.starts_with(':')
+                || tail[1..].is_empty()
+                || tail[1..]
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .is_none())
+        {
+            return None;
+        }
+        return (!host.is_empty()).then_some(host);
+    }
+    if authority.contains(['[', ']']) || authority.matches(':').count() > 1 {
+        return None;
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => (!host.is_empty()
+            && port.parse::<u16>().ok().filter(|port| *port > 0).is_some())
+        .then_some(host),
+        None => Some(authority),
+    }
+}
+
+fn request_has_safe_host(request: &HttpRequest) -> bool {
+    let Some(host) = request.header_value("host").and_then(authority_host) else {
+        // HTTP/1.0 clients may omit Host, but the browser UI and API require it
+        // so accepting a hostless request provides no useful compatibility.
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| !ip.is_unspecified())
+            .unwrap_or(false)
 }
 
 fn request_origin_matches_host(request: &HttpRequest) -> bool {
@@ -1670,6 +2132,7 @@ fn status_for_error(message: &str) -> u16 {
     } else if lower.contains("invalid api token")
         || lower.contains("missing api token")
         || lower.contains("forbidden origin")
+        || lower.contains("forbidden host")
         || lower.contains("origin header required")
     {
         403
@@ -1697,7 +2160,7 @@ fn status_for_error(message: &str) -> u16 {
 fn send_json_body(mut stream: TcpStream, code: u16, body: &str) -> std::io::Result<()> {
     let reason = reason_phrase(code);
     let response = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n{SECURITY_HEADERS}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(response.as_bytes())?;
@@ -1743,18 +2206,28 @@ fn check_api_token_rate(ip: IpAddr) -> bool {
 
 fn send_head(mut stream: TcpStream, content_type: &str) -> std::io::Result<()> {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n{SECURITY_HEADERS}Connection: close\r\nContent-Length: 0\r\n\r\n"
     );
     stream.write_all(response.as_bytes())
 }
 
 fn send_api_token(stream: TcpStream) -> std::io::Result<()> {
-    let body = format!(r#"{{"token":"{}"}}"#, escape_json(api_token()));
+    let body = api_token_json(api_token(), ui_owner_secret());
     send_json_body(stream, 200, &body)
 }
 
+fn api_token_json(token: &str, owner_secret: &str) -> String {
+    format!(
+        r#"{{"token":"{}","owner_secret":"{}"}}"#,
+        escape_json(token),
+        escape_json(owner_secret)
+    )
+}
+
 fn handle_sse(mut stream: TcpStream, state: Arc<Mutex<UiState>>) -> std::io::Result<()> {
-    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{SECURITY_HEADERS}Connection: keep-alive\r\n\r\n"
+    );
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
 
@@ -2628,7 +3101,10 @@ async function apiPostJson(url,options){
   return {ok:true};
 }
 async function fetchJson(url){
-  const res=await fetch(url,{cache:'no-store',headers:{'Accept':'application/json'}});
+  if(!apiToken){await refreshApiToken();}
+  const headers=new Headers({'Accept':'application/json'});
+  if(apiToken){headers.set('X-Rustorrent-Token',apiToken);}
+  const res=await fetch(url,{cache:'no-store',headers:headers});
   if(!res.ok){
     let message='HTTP '+res.status;
     try{
@@ -2835,7 +3311,8 @@ function renderSearchResults(results){
       const size=Number(result.size);
       const seeds=Number(result.seeds);
       const leech=Number(result.leech);
-      const desc=result.desc_link?'<a class="search-result-link" href="'+escapeHtml(result.desc_link)+'" target="_blank" rel="noopener noreferrer">Open description</a>':'';
+      const safeDesc=safeExternalUrl(result.desc_link||'');
+      const desc=safeDesc?'<a class="search-result-link" href="'+escapeHtml(safeDesc)+'" target="_blank" rel="noopener noreferrer">Open description</a>':'';
       return ''
         +'<tr>'
         +'<td><div class="search-result-title">'+escapeHtml(result.name||'result')+'</div>'+desc+'</td>'
@@ -3027,8 +3504,19 @@ async function loadSearchCatalog(force){
     renderSearchCatalog(searchCatalogCache);
   }
 }
-async function installCatalogPlugin(url){
+function safeExternalUrl(value){
+  if(!value){return '';}
+  try{
+    const parsed=new URL(String(value),window.location.href);
+    return parsed.protocol==='http:'||parsed.protocol==='https:'?parsed.href:'';
+  }catch(e){return '';}
+}
+function confirmSearchPluginInstall(name){
+  return confirm('Search plugins run third-party Python code on this computer. Install '+(name||'this plugin')+' only if you trust its source. Continue?');
+}
+async function installCatalogPlugin(url,skipConfirmation){
   if(!url){return;}
+  if(!skipConfirmation&&!confirmSearchPluginInstall('the selected plugin')){return;}
   await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)});
   await Promise.all([
     loadSearchStatus(true),
@@ -3041,6 +3529,7 @@ async function updateInstalledCatalogPlugins(){
     alert('No installed community plugins are linked to the live catalog.');
     return;
   }
+  if(!confirmSearchPluginInstall('updates for all installed community plugins')){return;}
   for(const entry of installed){
     await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(entry.download_url)});
   }
@@ -3091,6 +3580,10 @@ async function installSearchPluginFile(e){
   const input=e&&e.target?e.target:null;
   const file=input&&input.files&&input.files[0]?input.files[0]:null;
   if(!file){return;}
+  if(!confirmSearchPluginInstall(file.name)){
+    if(input){input.value='';}
+    return;
+  }
   const bytes=new Uint8Array(await file.arrayBuffer());
   await apiPost('/search/install-plugin?filename='+encodeURIComponent(file.name),{headers:{'Content-Type':'text/x-python'},body:bytes});
   if(input){input.value='';}
@@ -4231,7 +4724,7 @@ fn app_body_html(state: &UiState) -> String {
                             escape_html(&feed.url),
                             escape_html(title),
                             feed.items.len(),
-                            escape_html(&feed.url),
+                            escape_html(&escape_js_single_quoted(&feed.url)),
                         ));
                     }
                     out.push_str("</div>");
@@ -4245,7 +4738,7 @@ fn app_body_html(state: &UiState) -> String {
                             "<div class=\"rss-item\"><span class=\"rss-item-info\">{}: {}</span><button class=\"remove-btn\" onclick=\"removeRssRule('{}')\" title=\"Remove\">\u{00d7}</button></div>",
                             escape_html(&rule.name),
                             escape_html(&rule.pattern),
-                            escape_html(&rule.name),
+                            escape_html(&escape_js_single_quoted(&rule.name)),
                         ));
                     }
                     out.push_str("</div>");
@@ -4544,7 +5037,9 @@ fn app_body_html(state: &UiState) -> String {
                 for (cc, count) in &torrent.peer_country_counts {
                     let flag = crate::geoip::country_flag(cc);
                     out.push_str(&format!(
-                        "<span class=\"country-tag\">{flag} {cc} <b>{count}</b></span>"
+                        "<span class=\"country-tag\">{} {} <b>{count}</b></span>",
+                        escape_html(&flag),
+                        escape_html(cc),
                     ));
                 }
                 out.push_str("</div></div>");
@@ -4957,6 +5452,26 @@ fn escape_html(input: &str) -> String {
     out
 }
 
+fn escape_js_single_quoted(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            '<' => out.push_str("\\x3c"),
+            '>' => out.push_str("\\x3e"),
+            '&' => out.push_str("\\x26"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn escape_json(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -4966,6 +5481,7 @@ fn escape_json(input: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
             _ => out.push(ch),
         }
     }
@@ -5071,11 +5587,147 @@ mod tests {
     }
 
     #[test]
+    fn api_token_json_exposes_the_launcher_owner_secret() {
+        let owner_secret = "a1".repeat(32);
+        let json = api_token_json("0123456789abcdef0123456789abcdef", &owner_secret);
+
+        assert_eq!(
+            json,
+            format!(
+                "{{\"token\":\"0123456789abcdef0123456789abcdef\",\"owner_secret\":\"{owner_secret}\"}}"
+            )
+        );
+    }
+
+    #[test]
+    fn launcher_owner_secret_requires_256_bit_hex() {
+        assert!(valid_ui_owner_secret(&"ab".repeat(32)));
+        assert!(valid_ui_owner_secret(&"AB".repeat(32)));
+        assert!(!valid_ui_owner_secret(&"ab".repeat(31)));
+        assert!(!valid_ui_owner_secret(&"ag".repeat(32)));
+    }
+
+    #[test]
+    fn dns_rebinding_host_cannot_read_api_token() {
+        let request = b"GET /api-token HTTP/1.1\r\nHost: attacker.example:8080\r\n\r\n";
+        let response = run_single_request(request, None);
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("forbidden host"));
+        assert!(!response.contains(api_token()));
+    }
+
+    #[test]
+    fn dns_rebinding_host_cannot_mutate_with_a_stolen_token() {
+        let request = format!(
+            "POST /torrent/pause?id=1 HTTP/1.1\r\nHost: attacker.example:8080\r\nOrigin: http://attacker.example:8080\r\nX-Rustorrent-Token: {}\r\nContent-Length: 0\r\n\r\n",
+            api_token()
+        );
+        let response = run_single_request(request.as_bytes(), None);
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("forbidden host"));
+    }
+
+    #[test]
+    fn safe_host_validation_accepts_ip_literals_and_localhost_only() {
+        for host in [
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "192.168.1.4",
+            "localhost:8080",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![("host".to_string(), host.to_string())],
+                body: Vec::new(),
+            };
+            assert!(request_has_safe_host(&request), "host rejected: {host}");
+        }
+        for host in [
+            "attacker.example:8080",
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "user@127.0.0.1",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![("host".to_string(), host.to_string())],
+                body: Vec::new(),
+            };
+            assert!(
+                !request_has_safe_host(&request),
+                "unsafe host accepted: {host}"
+            );
+        }
+    }
+
+    #[test]
     fn post_without_token_is_forbidden() {
         let request = b"POST /torrent/pause?id=1 HTTP/1.1\r\nHost: 127.0.0.1:19001\r\nContent-Length: 0\r\n\r\n";
         let response = run_single_request(request, None);
         assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(response.contains("missing or invalid api token"));
+    }
+
+    #[test]
+    fn unauthorized_post_is_rejected_before_its_declared_body_is_read() {
+        let state = Arc::new(Mutex::new(UiState::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream, server_state, None).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let request = format!(
+            "POST /add-torrent HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {MAX_REQUEST_BODY_BYTES}\r\n\r\n",
+            addr.port()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        server.join().unwrap();
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("missing or invalid api token"));
+    }
+
+    #[test]
+    fn endpoint_body_limit_is_checked_before_waiting_for_the_body() {
+        let state = Arc::new(Mutex::new(UiState::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream, server_state, None).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let host = format!("127.0.0.1:{}", addr.port());
+        let request = format!(
+            "POST /add-magnet HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nX-Rustorrent-Token: {}\r\nContent-Length: {}\r\n\r\n",
+            api_token(),
+            MAX_FORM_BODY_BYTES + 1
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        server.join().unwrap();
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("bad request"));
     }
 
     #[test]
@@ -5161,6 +5813,21 @@ mod tests {
     }
 
     #[test]
+    fn chunk_header_limit_applies_when_the_terminator_arrives_later() {
+        let host = "127.0.0.1:19015";
+        let mut request = format!(
+            "POST /add-torrent HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nX-Rustorrent-Token: {}\r\nTransfer-Encoding: chunked\r\n\r\n0;",
+            api_token()
+        )
+        .into_bytes();
+        request.extend(std::iter::repeat_n(b'a', MAX_CHUNK_LINE_BYTES + 1));
+        request.extend_from_slice(b"\r\n\r\n");
+
+        let response = run_single_request(&request, None);
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[test]
     fn archive_action_dispatches_archive_command() {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>();
         let command_thread = thread::spawn(move || {
@@ -5225,6 +5892,12 @@ mod tests {
                 ("empty".to_string(), "".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn percent_decode_preserves_utf8_paths_and_names() {
+        assert_eq!(percent_decode("Espa%C3%B1a+%F0%9F%9A%80"), "España 🚀");
+        assert_eq!(percent_decode("café"), "café");
     }
 
     #[test]

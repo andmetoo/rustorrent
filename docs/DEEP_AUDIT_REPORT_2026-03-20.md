@@ -1,5 +1,9 @@
 # Deep Audit Report
 
+> Historical snapshot: this report records the state of a specific branch on 2026-03-20. Findings
+> marked “Still Open” may have been resolved since then. See `docs/TEST_COVERAGE.md` and the current
+> CI results for present-day validation.
+
 Date: 2026-03-20
 
 Branch audited: `codex/macos-standalone-ui`
@@ -144,4 +148,3 @@ What is not yet signed off:
    - Swift launcher compile
    - DMG build
    - mounted binary bind on a test UI port
-

@@ -8,19 +8,21 @@ const SSDP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn map_port(port: u16) -> Result<(), String> {
     let location = discover_gateway().ok_or_else(|| "upnp gateway not found".to_string())?;
-    let description = http::get(&location, 512 * 1024)?;
-    let control_url = parse_control_url(&description, &location)
+    let description = http::get_same_origin(&location, 512 * 1024)?;
+    let control = parse_control_url(&description, &location)
         .ok_or_else(|| "upnp control url not found".to_string())?;
 
-    let body = build_add_port_mapping(port);
-    let headers = vec![
-        ("Content-Type", "text/xml; charset=\"utf-8\"".to_string()),
-        (
-            "SOAPAction",
-            "\"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping\"".to_string(),
-        ),
-    ];
-    let _ = http::post(&control_url, &headers, body.as_bytes(), 128 * 1024)?;
+    for protocol in ["TCP", "UDP"] {
+        let body = build_add_port_mapping(port, protocol, &control.service_type);
+        let headers = vec![
+            ("Content-Type", "text/xml; charset=\"utf-8\"".to_string()),
+            (
+                "SOAPAction",
+                format!("\"{}#AddPortMapping\"", control.service_type),
+            ),
+        ];
+        let _ = http::post(&control.url, &headers, body.as_bytes(), 128 * 1024)?;
+    }
     Ok(())
 }
 
@@ -36,65 +38,80 @@ ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\
 \r\n";
     let _ = socket.send_to(msg.as_bytes(), SSDP_ADDR);
     let mut buf = [0u8; 2048];
-    if let Ok((n, _)) = socket.recv_from(&mut buf) {
+    if let Ok((n, source)) = socket.recv_from(&mut buf) {
         let text = String::from_utf8_lossy(&buf[..n]);
-        for line in text.lines() {
-            if let Some(value) = line.trim().strip_prefix("LOCATION:") {
-                return Some(value.trim().to_string());
-            }
-            if let Some(value) = line.trim().strip_prefix("Location:") {
-                return Some(value.trim().to_string());
+        for line in text.split("\r\n") {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("location") {
+                    let value = value.trim();
+                    if (value.starts_with("http://") || value.starts_with("https://"))
+                        && !value.bytes().any(|b| b.is_ascii_control())
+                        && http::url_host_ip(value) == Some(source.ip())
+                    {
+                        return Some(value.to_string());
+                    }
+                }
             }
         }
     }
     None
 }
 
-fn parse_control_url(xml: &[u8], base: &str) -> Option<String> {
-    let text = String::from_utf8_lossy(xml);
-    let mut service_start = None;
-    for (idx, line) in text.lines().enumerate() {
-        if line.contains("WANIPConnection") || line.contains("WANPPPConnection") {
-            service_start = Some(idx);
-            break;
-        }
-    }
-    let start = service_start?;
-    let mut control = None;
-    for line in text.lines().skip(start) {
-        if let Some(url) = extract_tag(line, "controlURL") {
-            control = Some(url.to_string());
-            break;
-        }
-        if line.contains("</service>") {
-            break;
-        }
-    }
-    let control = control?;
-    if control.starts_with("http://") || control.starts_with("https://") {
-        return Some(control);
-    }
-    let base = base.trim_end_matches('/');
-    Some(format!("{base}{control}"))
+#[derive(Debug, PartialEq, Eq)]
+struct ControlEndpoint {
+    url: String,
+    service_type: String,
 }
 
-fn extract_tag<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = line.find(&open)? + open.len();
-    let end = line[start..].find(&close)? + start;
-    Some(line[start..end].trim())
+fn parse_control_url(xml: &[u8], base: &str) -> Option<ControlEndpoint> {
+    fn local_name(tag: &str) -> &str {
+        tag.rsplit(':').next().unwrap_or(tag)
+    }
+
+    fn find_service(node: &crate::xml::XmlNode) -> Option<(&str, &str)> {
+        if local_name(&node.tag) == "service" {
+            let service_type = node
+                .children
+                .iter()
+                .find(|child| local_name(&child.tag) == "serviceType")?
+                .text
+                .trim();
+            if service_type.contains(":WANIPConnection:")
+                || service_type.contains(":WANPPPConnection:")
+            {
+                let control = node
+                    .children
+                    .iter()
+                    .find(|child| local_name(&child.tag) == "controlURL")?
+                    .text
+                    .trim();
+                return Some((service_type, control));
+            }
+        }
+        node.children.iter().find_map(find_service)
+    }
+
+    let root = crate::xml::parse(xml)?;
+    let (service_type, control) = find_service(&root)?;
+    let url = http::resolve_url(base, control).ok()?;
+    if !http::same_origin(&url, base) {
+        return None;
+    }
+    Some(ControlEndpoint {
+        url,
+        service_type: service_type.to_string(),
+    })
 }
 
-fn build_add_port_mapping(port: u16) -> String {
+fn build_add_port_mapping(port: u16, protocol: &str, service_type: &str) -> String {
     format!(
         "<?xml version=\"1.0\"?>\
 <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
 <s:Body>\
-<u:AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">\
+<u:AddPortMapping xmlns:u=\"{service_type}\">\
 <NewRemoteHost></NewRemoteHost>\
 <NewExternalPort>{port}</NewExternalPort>\
-<NewProtocol>TCP</NewProtocol>\
+<NewProtocol>{protocol}</NewProtocol>\
 <NewInternalPort>{port}</NewInternalPort>\
 <NewInternalClient>{}</NewInternalClient>\
 <NewEnabled>1</NewEnabled>\
@@ -118,16 +135,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_tag_reads_inner_text() {
-        let line = "  <controlURL>/upnp/control/WANIPConn1</controlURL> ";
-        assert_eq!(
-            extract_tag(line, "controlURL"),
-            Some("/upnp/control/WANIPConn1")
-        );
-        assert_eq!(extract_tag(line, "serviceType"), None);
-    }
-
-    #[test]
     fn parse_control_url_supports_relative_and_absolute_urls() {
         let relative = b"
 <service>
@@ -135,8 +142,11 @@ mod tests {
   <controlURL>/upnp/control/WANIPConn1</controlURL>
 </service>";
         assert_eq!(
-            parse_control_url(relative, "http://router.local"),
-            Some("http://router.local/upnp/control/WANIPConn1".to_string())
+            parse_control_url(relative, "http://router.local/rootDesc.xml"),
+            Some(ControlEndpoint {
+                url: "http://router.local/upnp/control/WANIPConn1".to_string(),
+                service_type: "urn:schemas-upnp-org:service:WANIPConnection:1".to_string(),
+            })
         );
 
         let absolute = b"
@@ -145,8 +155,11 @@ mod tests {
   <controlURL>http://router.local/control</controlURL>
 </service>";
         assert_eq!(
-            parse_control_url(absolute, "http://ignored"),
-            Some("http://router.local/control".to_string())
+            parse_control_url(absolute, "http://router.local/rootDesc.xml"),
+            Some(ControlEndpoint {
+                url: "http://router.local/control".to_string(),
+                service_type: "urn:schemas-upnp-org:service:WANPPPConnection:1".to_string(),
+            })
         );
     }
 
@@ -158,9 +171,15 @@ mod tests {
 
     #[test]
     fn add_port_mapping_body_contains_requested_port() {
-        let body = build_add_port_mapping(51413);
+        let body = build_add_port_mapping(
+            51413,
+            "UDP",
+            "urn:schemas-upnp-org:service:WANPPPConnection:1",
+        );
         assert!(body.contains("<NewExternalPort>51413</NewExternalPort>"));
         assert!(body.contains("<NewInternalPort>51413</NewInternalPort>"));
         assert!(body.contains("AddPortMapping"));
+        assert!(body.contains("<NewProtocol>UDP</NewProtocol>"));
+        assert!(body.contains("WANPPPConnection:1"));
     }
 }

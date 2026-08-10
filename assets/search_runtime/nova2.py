@@ -59,7 +59,7 @@ helpers.enable_socks_proxy(True)
 
 THREADED: bool = True
 try:
-    MAX_THREADS: int = cpu_count()
+    MAX_THREADS: int = min(cpu_count(), 8)
 except NotImplementedError:
     MAX_THREADS = 1  # pyright: ignore[reportConstantRedefinition]
 
@@ -234,7 +234,7 @@ if __name__ == "__main__":
         params = ((engine_class, what, category) for e in engines if (engine_class := import_engine(e)) is not None)
 
         search_success = False
-        if THREADED:
+        if THREADED and len(engines) > 1:
             processes = max(min(len(engines), MAX_THREADS), 1)
             with Pool(processes) as pool:
                 search_success = all(pool.map(run_search, params))

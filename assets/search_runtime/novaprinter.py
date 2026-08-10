@@ -40,15 +40,18 @@ SearchResults = TypedDict('SearchResults', {
 
 
 def prettyPrinter(dictionary: SearchResults) -> None:
+    def field(value: object) -> str:
+        return str(value).replace("|", " ").replace("\r", " ").replace("\n", " ")
+
     outtext = "|".join((
-        dictionary["link"],
-        dictionary["name"].replace("|", " "),
-        str(anySizeToBytes(dictionary['size'])),
-        str(dictionary["seeds"]),
-        str(dictionary["leech"]),
-        dictionary["engine_url"],
-        dictionary.get("desc_link", ""),  # Optional
-        str(dictionary.get("pub_date", -1))  # Optional
+        field(dictionary["link"]),
+        field(dictionary["name"]),
+        field(anySizeToBytes(dictionary['size'])),
+        field(dictionary["seeds"]),
+        field(dictionary["leech"]),
+        field(dictionary["engine_url"]),
+        field(dictionary.get("desc_link", "")),  # Optional
+        field(dictionary.get("pub_date", -1))  # Optional
     ))
 
     # fd 1 is stdout

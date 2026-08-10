@@ -1,12 +1,63 @@
 import AppKit
 import Darwin
 import Foundation
+import Security
 import UniformTypeIdentifiers
 import WebKit
 
+private struct UiCredentials {
+    let token: String
+    let ownerSecret: String
+}
+
 private struct UiProbeResult {
     let reachable: Bool
-    let token: String?
+    let credentials: UiCredentials?
+}
+
+private final class BoundedProcessOutput {
+    struct Snapshot {
+        let data: Data
+        let exceededLimit: Bool
+        let readFailed: Bool
+    }
+
+    private let limit: Int
+    private let lock = NSLock()
+    private var data = Data()
+    private var exceededLimit = false
+    private var readFailed = false
+
+    init(limit: Int) {
+        self.limit = max(0, limit)
+    }
+
+    /// Returns true exactly once, when this chunk first crosses the cap.
+    func append(_ chunk: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !exceededLimit else { return false }
+        let remaining = max(0, limit - data.count)
+        if chunk.count <= remaining {
+            data.append(chunk)
+            return false
+        }
+        data.append(contentsOf: chunk.prefix(remaining))
+        exceededLimit = true
+        return true
+    }
+
+    func markReadFailed() {
+        lock.lock()
+        readFailed = true
+        lock.unlock()
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(data: data, exceededLimit: exceededLimit, readFailed: readFailed)
+    }
 }
 
 @main
@@ -15,6 +66,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var uiPort = 9473
     private let maxUiWaitAttempts = 150
     private let webViewLoadTimeout: TimeInterval = 10
+    private let curlOutputLimit = 64 * 1024
     private let openUiOnLaunchKey = "open_ui_on_launch"
     private let downloadDirectoryKey = "download_directory"
 
@@ -33,6 +85,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var logHandle: FileHandle?
     private var openUiWhenReady = true
     private var cachedApiToken: String?
+    private var backendOwnerSecret = ""
 
     private var preferencesWindow: NSWindow?
     private var openUiCheckbox: NSButton?
@@ -57,7 +110,6 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         buildMenus()
         buildStatusItem()
         collectStartupTorrentFiles(from: CommandLine.arguments)
-        resolveUiEndpoint()
         openUiWhenReady = openUiOnLaunchEnabled() || !pendingTorrentFiles.isEmpty
         if openUiWhenReady {
             showMainWindow()
@@ -622,13 +674,6 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         if backendProcess != nil {
             return
         }
-        let existingUi = probeUi(timeout: 0.4, port: uiPort)
-        if let token = existingUi.token {
-            cachedApiToken = token
-            backendOwned = false
-            log("reusing existing compatible backend on port \(uiPort)")
-            return
-        }
 
         let binary = backendBinaryURL()
         guard FileManager.default.isExecutableFile(atPath: binary.path) else {
@@ -638,6 +683,16 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             )
             return
         }
+        guard let ownerSecret = Self.makeBackendOwnerSecret() else {
+            presentFatalError(
+                title: "Rustorrent Startup Failed",
+                text: "Could not generate a secure launcher ownership secret."
+            )
+            return
+        }
+        backendOwnerSecret = ownerSecret
+        cachedApiToken = nil
+        resolveUiEndpoint()
 
         let downloadDir = currentDownloadDirectoryURL()
         let logFile = launcherLogFileURL()
@@ -666,16 +721,16 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.executableURL = binary
         process.arguments = [
-            "-lc",
-            "exec \"$1\" --ui --ui-addr \"$2\" --download-dir \"$3\" --log \"$4\"",
-            "rustorrent-launch",
-            binary.path,
-            "127.0.0.1:\(uiPort)",
-            downloadDir.path,
-            logFile.path,
+            "--ui",
+            "--ui-addr", "127.0.0.1:\(uiPort)",
+            "--download-dir", downloadDir.path,
+            "--log", logFile.path,
         ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["RUSTORRENT_UI_OWNER_SECRET"] = ownerSecret
+        process.environment = environment
         process.currentDirectoryURL = homeDir
 
         process.terminationHandler = { [weak self] proc in
@@ -690,6 +745,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             backendOwned = true
             log("started backend pid \(process.processIdentifier)")
         } catch {
+            backendOwnerSecret = ""
             presentFatalError(
                 title: "Rustorrent Startup Failed",
                 text: "Could not launch rustorrent-bin: \(error.localizedDescription)"
@@ -712,6 +768,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         backendProcess = nil
         backendOwned = false
         cachedApiToken = nil
+        backendOwnerSecret = ""
         if !isUiReachable(timeout: 0.4) {
             let detail = startupFailureDetail(exitStatus: proc.terminationStatus)
             loadPlaceholderPage(
@@ -808,7 +865,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             "--data-binary", "@\(file.path)",
             endpoint,
         ])
-        if firstTry.status == 0 {
+        if torrentPostWasAccepted(firstTry) {
             return true
         }
 
@@ -829,10 +886,30 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             "--data-binary", "@\(file.path)",
             endpoint,
         ])
-        if retry.status != 0 {
-            log("failed to post torrent \(file.lastPathComponent)")
+        if !torrentPostWasAccepted(retry) {
+            log("failed to post torrent \(file.lastPathComponent): \(retry.output)")
+            return false
         }
-        return retry.status == 0
+        return true
+    }
+
+    private func torrentPostWasAccepted(_ result: (status: Int32, output: String)) -> Bool {
+        guard result.status == 0,
+              let data = result.output.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return false
+        }
+        if object["ok"] as? Bool == true {
+            return true
+        }
+        // Re-opening a file that is already present is an idempotent handoff.
+        if let error = object["error"] as? String,
+           error.localizedCaseInsensitiveContains("already added")
+        {
+            return true
+        }
+        return false
     }
 
     private func openWebUi() {
@@ -851,12 +928,15 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func isUiReachable(timeout: TimeInterval) -> Bool {
         let probe = probeUi(timeout: timeout, port: uiPort)
-        if let token = probe.token {
-            cachedApiToken = token
+        if let credentials = probe.credentials,
+           !backendOwnerSecret.isEmpty,
+           credentials.ownerSecret == backendOwnerSecret
+        {
+            cachedApiToken = credentials.token
             return true
         }
         if probe.reachable {
-            log("ui probe on port \(uiPort) returned a non-token response")
+            log("ui probe on port \(uiPort) did not prove launcher ownership")
         }
         return false
     }
@@ -874,21 +954,44 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         guard result.status == 0 else {
             return nil
         }
-        cachedApiToken = parseApiToken(from: result.output)
+        guard let credentials = parseApiCredentials(from: result.output),
+              !backendOwnerSecret.isEmpty,
+              credentials.ownerSecret == backendOwnerSecret
+        else {
+            return nil
+        }
+        cachedApiToken = credentials.token
         return cachedApiToken
     }
 
-    private func parseApiToken(from raw: String) -> String? {
+    private func parseApiCredentials(from raw: String) -> UiCredentials? {
         guard let data = raw.data(using: .utf8) else {
             return nil
         }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        guard let token = object["token"] as? String, !token.isEmpty else {
+        guard let token = object["token"] as? String,
+              let ownerSecret = object["owner_secret"] as? String,
+              isHexString(token, length: 32),
+              isHexString(ownerSecret, length: 64)
+        else {
             return nil
         }
-        return token
+        return UiCredentials(token: token, ownerSecret: ownerSecret)
+    }
+
+    private func isHexString(_ value: String, length: Int) -> Bool {
+        let scalars = value.unicodeScalars
+        guard scalars.count == length else {
+            return false
+        }
+        return scalars.allSatisfy { scalar in
+            let value = scalar.value
+            return (value >= 48 && value <= 57)
+                || (value >= 65 && value <= 70)
+                || (value >= 97 && value <= 102)
+        }
     }
 
     private func runCurl(_ arguments: [String]) -> (status: Int32, output: String) {
@@ -896,19 +999,55 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         process.arguments = arguments
         let outPipe = Pipe()
-        let errPipe = Pipe()
         process.standardOutput = outPipe
-        process.standardError = errPipe
+        // Curl diagnostics are not consumed by launcher callers. Sending them
+        // to a sink avoids a second pipe that a noisy endpoint could fill.
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
         } catch {
+            try? outPipe.fileHandleForReading.close()
+            try? outPipe.fileHandleForWriting.close()
             return (-1, "")
         }
+
+        // The child inherited its own write descriptor during launch. Close
+        // the parent copy so the reader observes EOF when curl exits.
+        try? outPipe.fileHandleForWriting.close()
+
+        let output = BoundedProcessOutput(limit: curlOutputLimit)
+        let readerDone = DispatchGroup()
+        let reader = outPipe.fileHandleForReading
+        let processIdentifier = process.processIdentifier
+        readerDone.enter()
+        DispatchQueue.global(qos: .utility).async {
+            defer {
+                try? reader.close()
+                readerDone.leave()
+            }
+            do {
+                while let chunk = try reader.read(upToCount: 4 * 1024), !chunk.isEmpty {
+                    if output.append(chunk) {
+                        // Continue draining after requesting termination so a
+                        // racing final write can never block curl on this pipe.
+                        _ = Darwin.kill(processIdentifier, SIGTERM)
+                    }
+                }
+            } catch {
+                output.markReadFailed()
+                _ = Darwin.kill(processIdentifier, SIGTERM)
+            }
+        }
+
         process.waitUntilExit()
-        let out = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: out, encoding: .utf8) ?? ""
-        return (process.terminationStatus, output)
+        readerDone.wait()
+        let result = output.snapshot()
+        let text = String(data: result.data, encoding: .utf8) ?? ""
+        if result.exceededLimit || result.readFailed {
+            return (-1, text)
+        }
+        return (process.terminationStatus, text)
     }
 
     private func presentFatalError(title: String, text: String) {
@@ -940,14 +1079,30 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
                 at: logFile.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            if !FileManager.default.fileExists(atPath: logFile.path) {
-                FileManager.default.createFile(atPath: logFile.path, contents: nil)
-            }
-            logHandle = try FileHandle(forWritingTo: logFile)
-            logHandle?.seekToEndOfFile()
         } catch {
-            // Fall back to no-op logging if file setup fails.
+            return
         }
+
+        let flags = O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW
+        let descriptor = logFile.path.withCString {
+            Darwin.open($0, flags, mode_t(S_IRUSR | S_IWUSR))
+        }
+        guard descriptor >= 0 else { return }
+
+        var metadata = stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_nlink == 1,
+              metadata.st_uid == Darwin.geteuid(),
+              metadata.st_mode & mode_t(S_IWGRP | S_IWOTH) == 0,
+              Darwin.fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0
+        else {
+            Darwin.close(descriptor)
+            return
+        }
+        // O_APPEND makes each write target the then-current end of file, even
+        // while rustorrent-bin is appending through its own descriptor.
+        logHandle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
     private func isoTimestamp() -> String {
@@ -958,6 +1113,14 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func uiBaseURL(port: Int? = nil) -> URL {
         URL(string: "http://127.0.0.1:\(port ?? uiPort)")!
+    }
+
+    private static func makeBackendOwnerSecret() -> String? {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            return nil
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
     private func backendBinaryURL() -> URL {
@@ -1040,16 +1203,10 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func resolveUiEndpoint() {
         let preferred = probeUi(timeout: 0.4, port: preferredUiPort)
-        if let token = preferred.token {
-            uiPort = preferredUiPort
-            cachedApiToken = token
-            log("found compatible ui on preferred port \(uiPort)")
-            return
-        }
         if preferred.reachable {
             if let alternatePort = reserveLoopbackPort() {
                 uiPort = alternatePort
-                log("preferred ui port \(preferredUiPort) is occupied by an incompatible service; using \(uiPort)")
+                log("preferred ui port \(preferredUiPort) is occupied by an unowned service; launching a new backend on \(uiPort)")
                 return
             }
             log("preferred ui port \(preferredUiPort) is occupied, but no alternate port was reserved")
@@ -1067,9 +1224,12 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
             uiBaseURL(port: port).appendingPathComponent("api-token").absoluteString,
         ])
         guard result.status == 0 else {
-            return UiProbeResult(reachable: false, token: nil)
+            return UiProbeResult(reachable: false, credentials: nil)
         }
-        return UiProbeResult(reachable: true, token: parseApiToken(from: result.output))
+        return UiProbeResult(
+            reachable: true,
+            credentials: parseApiCredentials(from: result.output)
+        )
     }
 
     private func startupFailureDetail(exitStatus: Int32) -> String {
@@ -1090,9 +1250,9 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
 
         let preferred = probeUi(timeout: 0.3, port: preferredUiPort)
-        if preferred.reachable && preferred.token == nil {
+        if preferred.reachable {
             details.append(
-                "Port \(preferredUiPort) is already serving an incompatible or older Rustorrent UI. Quit the older copy before relaunching."
+                "Port \(preferredUiPort) is already serving a process this launcher does not own. Quit the other process before relaunching."
             )
         }
 

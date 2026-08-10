@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security:
+    name: Dependency advisory audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Select current stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Install the pinned audit tool
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit application and fuzz dependencies
+        run: |
+          cargo audit --deny warnings
+          cargo audit --file fuzz/Cargo.lock --deny warnings
+      - name: Install the pinned license-report tool
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Verify the binary-distribution license notice
+        run: |
+          cargo about generate --locked --all-features --fail about.hbs \
+            --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+          cmp THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Select current stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy rustfmt
+      - name: Check formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - name: Lint every target and feature
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test the full build
+        run: cargo test --locked --all-features -- --test-threads=1
+      - name: Test the minimal build
+        run: cargo test --locked --no-default-features -- --test-threads=1
+      - name: Check optional features independently
+        shell: bash
+        run: |
+          for feature in udp_tracker dht lpd utp mse natpmp upnp webseed verbose; do
+            cargo check --locked --all-targets --no-default-features --features "$feature"
+          done
+      - name: Check the release profile
+        run: cargo check --locked --release --all-targets --all-features
+      - name: Lint fuzz targets
+        run: >-
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --bins --
+          -D warnings -A dead-code
+
+  platform-check:
+    name: ${{ matrix.os }} compile check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Select current stable Rust
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Check all features and targets
+        run: cargo check --locked --all-targets --all-features
+      - name: Check the minimal build
+        run: cargo check --locked --all-targets --no-default-features
+      - name: Check the platform code on Rust 1.89
+        shell: bash
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 check --locked --all-targets --all-features
+          cargo +1.89.0 check --locked --all-targets --no-default-features
+      - name: Run the Windows filesystem and process suite
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features -- --test-threads=1
+      - name: Build and inspect the universal macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ./macos/package_app.sh --universal --output "$RUNNER_TEMP/rustorrent-dist"
+          test -f target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent
+          test -f target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent-bin
+          test -f target/macos-app/build/Rustorrent.app/Contents/Resources/AppIcon.icns
+          test -f target/macos-app/build/Rustorrent.app/Contents/Resources/LICENSE
+          test -f target/macos-app/build/Rustorrent.app/Contents/Resources/THIRD_PARTY_NOTICES.md
+          test -f target/macos-app/build/Rustorrent.app/Contents/Resources/THIRD_PARTY_LICENSES.html
+          plutil -lint target/macos-app/build/Rustorrent.app/Contents/Info.plist
+          lipo target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent -verify_arch x86_64 arm64
+          lipo target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent-bin -verify_arch x86_64 arm64
+          for arch in x86_64 arm64; do
+            xcrun vtool -arch "$arch" -show-build target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent | grep -q "minos 11.0"
+            xcrun vtool -arch "$arch" -show-build target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent-bin | grep -q "minos 11.0"
+          done
+
+  minimum-rust:
+    name: Rust 1.89 compile check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install the minimum supported Rust version
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Check every target and feature
+        run: cargo +1.89.0 check --locked --all-targets --all-features

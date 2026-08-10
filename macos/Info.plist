@@ -24,7 +24,7 @@
         <true/>
     </dict>
     <key>LSMinimumSystemVersion</key>
-    <string>10.13</string>
+    <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSApplicationCategoryType</key>
@@ -70,8 +70,6 @@
             </dict>
         </dict>
     </array>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Rustorrent needs to control other applications for automation.</string>
     <key>NSDownloadsFolderUsageDescription</key>
     <string>Rustorrent needs access to the Downloads folder to save downloaded files.</string>
 </dict>

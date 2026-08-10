@@ -30,7 +30,9 @@ impl Sha256 {
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
-        self.length_bits = self.length_bits.wrapping_add((data.len() as u64) * 8);
+        self.length_bits = self
+            .length_bits
+            .wrapping_add((data.len() as u64).wrapping_mul(8));
 
         if self.buffer_len > 0 {
             let needed = 64 - self.buffer_len;
@@ -143,15 +145,92 @@ impl Sha256 {
     }
 }
 
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize()
 }
 
+/// Hash a BEP 52 logical piece. The v2 piece hash is a Merkle-tree node over
+/// 16 KiB block hashes, not SHA-256 over the whole piece when pieces are larger
+/// than 16 KiB. Missing blocks in the final piece are represented by zero
+/// hashes, as required by BEP 52.
+pub fn merkle_piece_root(data: &[u8], piece_length: u32) -> Option<[u8; 32]> {
+    const BLOCK_LENGTH: usize = 16 * 1024;
+
+    let piece_length = piece_length as usize;
+    if data.is_empty()
+        || piece_length < BLOCK_LENGTH
+        || !piece_length.is_power_of_two()
+        || data.len() > piece_length
+    {
+        return None;
+    }
+
+    let leaf_count = piece_length / BLOCK_LENGTH;
+    let mut layer = Vec::with_capacity(leaf_count);
+    layer.extend(data.chunks(BLOCK_LENGTH).map(sha256));
+    layer.resize(leaf_count, [0u8; 32]);
+    reduce_merkle_layer(layer)
+}
+
+/// Reconstruct a file's BEP 52 root from its piece layer. `piece_hashes`
+/// contains only hashes which cover file data; omitted balancing nodes are
+/// supplied using the zero hash for the selected piece layer.
+pub fn merkle_root_from_piece_layer(
+    piece_hashes: &[[u8; 32]],
+    piece_length: u32,
+) -> Option<[u8; 32]> {
+    const BLOCK_LENGTH: u32 = 16 * 1024;
+
+    if piece_hashes.is_empty() || piece_length < BLOCK_LENGTH || !piece_length.is_power_of_two() {
+        return None;
+    }
+
+    let mut padding_hash = [0u8; 32];
+    let mut covered = BLOCK_LENGTH;
+    while covered < piece_length {
+        padding_hash = hash_pair(&padding_hash, &padding_hash);
+        covered = covered.checked_mul(2)?;
+    }
+
+    let width = piece_hashes.len().checked_next_power_of_two()?;
+    let mut layer = Vec::with_capacity(width);
+    layer.extend_from_slice(piece_hashes);
+    layer.resize(width, padding_hash);
+    reduce_merkle_layer(layer)
+}
+
+fn reduce_merkle_layer(mut layer: Vec<[u8; 32]>) -> Option<[u8; 32]> {
+    if layer.is_empty() || !layer.len().is_power_of_two() {
+        return None;
+    }
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity(layer.len() / 2);
+        for pair in layer.chunks_exact(2) {
+            next.push(hash_pair(&pair[0], &pair[1]));
+        }
+        layer = next;
+    }
+    layer.pop()
+}
+
+fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(left);
+    bytes[32..].copy_from_slice(right);
+    sha256(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{sha256, Sha256};
+    use super::*;
 
     fn to_hex(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -213,6 +292,34 @@ mod tests {
         assert_eq!(
             to_hex(&hash),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn bep52_piece_hash_uses_merkle_nodes_above_16k() {
+        let data = vec![b'a'; 32 * 1024];
+        let left = sha256(&data[..16 * 1024]);
+        let right = sha256(&data[16 * 1024..]);
+        assert_eq!(
+            merkle_piece_root(&data, 32 * 1024),
+            Some(hash_pair(&left, &right))
+        );
+        assert_ne!(merkle_piece_root(&data, 32 * 1024), Some(sha256(&data)));
+    }
+
+    #[test]
+    fn bep52_short_final_piece_is_zero_hash_padded() {
+        let data = vec![b'z'; 16 * 1024 + 7];
+        let left = sha256(&data[..16 * 1024]);
+        let right = sha256(&data[16 * 1024..]);
+        let expected = hash_pair(&left, &right);
+        assert_eq!(merkle_piece_root(&data, 32 * 1024), Some(expected));
+
+        let third_piece = sha256(b"third");
+        let layer = [expected, third_piece];
+        assert_eq!(
+            merkle_root_from_piece_layer(&layer, 32 * 1024),
+            Some(hash_pair(&expected, &third_piece))
         );
     }
 }

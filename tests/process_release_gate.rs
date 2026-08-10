@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -37,6 +37,18 @@ fn wait_for_tcp(port: u16, timeout: Duration) -> bool {
         thread::sleep(Duration::from_millis(25));
     }
     false
+}
+
+fn wait_for_process_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
@@ -210,6 +222,78 @@ fn churn_peer_connection(peer_port: u16, token: usize) {
 }
 
 #[test]
+fn ui_echoes_the_backend_owner_secret_for_launcher_verification() {
+    let root = temp_dir("ui-owner-secret");
+    fs::create_dir_all(&root).unwrap();
+    let ui_port = free_tcp_port();
+    let peer_port = free_tcp_port();
+    let owner_secret = "0123456789abcdef".repeat(4);
+    let args = vec![
+        "--ui".to_string(),
+        "--ui-addr".to_string(),
+        format!("127.0.0.1:{ui_port}"),
+        "--download-dir".to_string(),
+        root.display().to_string(),
+        "--port".to_string(),
+        peer_port.to_string(),
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustorrent"))
+        .args(&args)
+        .env("RUSTORRENT_UI_OWNER_SECRET", &owner_secret)
+        .current_dir(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    assert!(
+        wait_for_tcp(ui_port, Duration::from_secs(6)),
+        "ui port not ready"
+    );
+    let response = http_get(ui_port, "/api-token").unwrap_or_default();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains(&format!("\"owner_secret\":\"{owner_secret}\"")));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "backend exited after serving owner secret"
+    );
+
+    let _ = stop_child(child);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn explicit_ui_bind_failure_is_fatal() {
+    let root = temp_dir("ui-bind-fatal");
+    fs::create_dir_all(&root).unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ui_port = occupied.local_addr().unwrap().port();
+    let peer_port = free_tcp_port();
+    let args = vec![
+        "--ui".to_string(),
+        "--ui-addr".to_string(),
+        format!("127.0.0.1:{ui_port}"),
+        "--download-dir".to_string(),
+        root.display().to_string(),
+        "--port".to_string(),
+        peer_port.to_string(),
+    ];
+    let mut child = spawn_rustorrent(&args, &root);
+
+    let status = wait_for_process_exit(&mut child, Duration::from_secs(6))
+        .expect("backend kept running after explicit UI bind failure");
+    assert!(!status.success(), "UI bind failure returned success");
+    let output = stop_child(child);
+    assert!(
+        output.contains(&format!("UI bind 127.0.0.1:{ui_port} failed")),
+        "missing fatal UI bind diagnostic: {output}"
+    );
+
+    drop(occupied);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn process_survives_truncated_and_oversized_frames() {
     let root = temp_dir("frames");
     fs::create_dir_all(&root).unwrap();
@@ -266,6 +350,40 @@ fn process_survives_truncated_and_oversized_frames() {
 }
 
 #[test]
+fn proxy_mode_does_not_open_direct_peer_or_discovery_listeners() {
+    let root = temp_dir("proxy-listeners");
+    fs::create_dir_all(&root).unwrap();
+    let ui_port = free_tcp_port();
+    let peer_port = free_tcp_port();
+    let args = vec![
+        "--ui".to_string(),
+        "--ui-addr".to_string(),
+        format!("127.0.0.1:{ui_port}"),
+        "--download-dir".to_string(),
+        root.display().to_string(),
+        "--port".to_string(),
+        peer_port.to_string(),
+        "--utp".to_string(),
+        "--proxy".to_string(),
+        "socks5://127.0.0.1:1".to_string(),
+    ];
+    let child = spawn_rustorrent(&args, &root);
+    assert!(
+        wait_for_tcp(ui_port, Duration::from_secs(6)),
+        "ui port not ready"
+    );
+
+    let tcp = TcpListener::bind(("127.0.0.1", peer_port))
+        .expect("proxy mode unexpectedly opened the direct TCP peer listener");
+    let udp = UdpSocket::bind(("127.0.0.1", peer_port))
+        .expect("proxy mode unexpectedly opened a DHT/uTP UDP listener");
+
+    drop((tcp, udp));
+    let _ = stop_child(child);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn process_survives_malformed_extension_payload() {
     let root = temp_dir("ext");
     fs::create_dir_all(&root).unwrap();
@@ -313,7 +431,7 @@ fn process_survives_malformed_extension_payload() {
 }
 
 #[test]
-fn process_recovers_from_corrupt_session_and_resume_files() {
+fn process_fails_closed_on_unrecoverable_session_state() {
     let root = temp_dir("corrupt-state");
     fs::create_dir_all(root.join(".rustorrent")).unwrap();
     let torrent_path = root.join("sample.torrent");
@@ -342,20 +460,13 @@ fn process_recovers_from_corrupt_session_and_resume_files() {
     ];
 
     let mut child = spawn_rustorrent(&args, &root);
-    assert!(
-        wait_for_tcp(ui_port, Duration::from_secs(6)),
-        "ui not ready"
-    );
-    thread::sleep(Duration::from_millis(300));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "process exited with corrupt state files"
-    );
-
+    let status = wait_for_process_exit(&mut child, Duration::from_secs(6))
+        .expect("process did not fail closed on corrupt session state");
+    assert!(!status.success());
     let output = stop_child(child);
     assert!(
-        output.contains("session load failed"),
-        "expected session corruption warning in logs"
+        output.contains("cannot load session state") && output.contains("session load failed"),
+        "expected fatal session corruption error in logs: {output}"
     );
     let _ = fs::remove_dir_all(&root);
 }

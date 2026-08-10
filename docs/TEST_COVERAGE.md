@@ -1,163 +1,136 @@
 # Rustorrent Test Coverage and Scope
 
-## Objective
-This document defines what the automated test suite currently validates for production readiness, which risks are covered by those tests, and what is intentionally left out.
+Last inventory refresh: 2026-07-13
 
-The suite is designed to be deterministic and local-first: no dependency on public trackers, public DHT bootstrap nodes, or consumer-router-specific behavior.
+## Purpose
+
+The automated suite is designed to catch deterministic correctness, safety, and resilience
+regressions without depending on public trackers, public DHT bootstrap nodes, or a particular
+consumer router. It is a release gate, not a claim of complete BitTorrent ecosystem
+interoperability.
 
 ## Current Suite Snapshot
-Latest full run:
 
-```bash
-cargo test --all-features
+The following inventory was compiled with:
+
+```sh
+cargo test --all-features -- --list
 ```
 
-Result at update time:
-- `139` passed,
-- `1` ignored (`soak_swarm` long-running scenario),
-- `0` failed.
-
-Total defined tests: `140`.
-
-Breakdown:
-- `127` unit tests in `src/main.rs` (including per-module test modules),
-- `6` process-level adversarial integration tests in `tests/process_release_gate.rs`,
-- `7` tests in `tests/soak_swarm.rs` (`1` soak ignored by default, `6` uTP helper/protocol tests).
-
-## Hardening Implemented in This Phase
-Before adding the new stress tests, runtime behavior was strengthened in three high-risk areas.
-
-1. UI DoS hardening (`src/ui.rs`)
-- Per-connection read/write timeouts.
-- Absolute header/body parse deadlines to prevent slowloris byte-drip stalls.
-- Maximum active UI connection slots with overload rejection (`503`).
-- Stricter malformed request handling (`invalid content-length`, truncated body, invalid request line/path).
-
-2. Inbound peer storm hardening (`src/main.rs`)
-- Global inbound handler slot cap shared by TCP + uTP inbound paths.
-- Capacity-based early drop under handshake/churn storms instead of unbounded per-connection thread growth.
-- Limit derives from peer settings and is clamped for safety.
-
-3. Restart/recovery hardening (`src/main.rs`)
-- Session writes moved to atomic write+rename flow.
-- Resume writes unified on atomic write path.
-- Primary-file `.bak` sidecar creation on overwrite.
-- Startup/load recovery falls back to backup for session and resume data when primary is corrupt, with restore-to-primary behavior.
-
-## Coverage Summary by Area
-
-| Area | Coverage Highlights |
-|---|---|
-| Parsing and protocol safety | bencode, torrent metainfo, peer wire messages, HTTP parser, tracker body/compact peers, uTP packet decode, MSE helpers |
-| Storage and filesystem safety | multi-file offset correctness, path sanitization, out-of-bounds IO rejection, cache flush semantics, safe delete boundaries |
-| Scheduler and transfer core | piece selection (rarest/sequential), priority handling, reservation/duplication behavior, block completion checks |
-| UI/API behavior and auth | origin/token authorization, mutating action rejection, query parsing, status mapping, escaping/formatting invariants |
-| Local deterministic fixtures | HTTP tracker fixture, UDP tracker fixture, local peer handshake fixture, local DHT fixture-node workflow |
-| Adversarial process resilience | truncated/oversized frame handling, malformed extension payload handling, corrupt session/resume startup recovery |
-| Newly added DoS/restart stress | slowloris-style UI request pressure, high-connection churn + malformed encrypted-handshake storm, repeated kill/restart loops with state-file validity checks |
-| Fuzz entry points | `bencode::parse`, `peer::decode_message`, HTTP/tracker parser surfaces |
-
-## Test Inventory by Module Prefix
-From `cargo test --all-features -- --list` grouping:
-
-| Prefix | Count |
+| Suite | Defined tests |
 |---|---:|
-| `bencode` | 9 |
-| `core_helpers_tests` | 15 |
-| `dht` | 5 |
-| `http` | 7 |
-| `ip_filter` | 4 |
-| `local_harness_tests` | 4 |
-| `lpd` | 3 |
-| `mse` | 5 |
-| `natpmp` | 3 |
-| `parsing_tests` | 7 |
-| `peer` | 6 |
-| `peer_stream` | 2 |
-| `piece` | 9 |
-| `sha1` | 3 |
-| `storage` | 6 |
-| `torrent` | 6 |
-| `tracker` | 9 |
-| `udp_tracker` | 3 |
-| `ui` | 9 |
-| `ui_progress_tests` | 2 |
-| `upnp` | 4 |
-| `utp` | 12 |
-| Process integration tests (`tests/process_release_gate.rs`) | 6 |
-| Soak integration tests (`tests/soak_swarm.rs`) | 7 |
+| Unit and local-fixture tests (`src/main.rs` and modules) | 450 |
+| Adversarial process tests (`tests/process_release_gate.rs`) | 9 |
+| Swarm/uTP tests (`tests/soak_swarm.rs`) | 18 |
+| **Total** | **477** |
 
-## Security/Resilience Scenarios Added
-Process-level additions in `tests/process_release_gate.rs`:
+One long-running mixed-swarm soak test is ignored by default. A normal full run therefore executes
+476 tests and reports one ignored test.
 
-1. `process_survives_slowloris_ui_requests_and_stays_responsive`
-- Holds many partial UI requests open (slowloris-style header stalls).
-- Verifies `/status` remains available under pressure.
+Exact totals will grow as coverage is added. Treat the commands below—not hard-coded module
+counts—as the authoritative release gates.
 
-2. `process_survives_connection_churn_and_encrypted_handshake_storm`
-- High-rate connect/disconnect churn.
-- Mix of truncated plaintext handshake, malformed encrypted handshake prelude, and oversized post-handshake frame writes.
-- Verifies process and UI remain alive.
+## What the Suite Covers
 
-3. `process_restart_recovery_loops_preserve_session_and_resume_files`
-- Repeated forced kill/restart loops while peer churn is active.
-- Validates session/resume files remain parseable bencode after abrupt termination cycles.
-- Validates backup artifacts when present.
+| Area | Representative coverage |
+|---|---|
+| Metainfo and parsing | Canonical bencode, size/depth limits, v1/v2/hybrid torrents, piece layers, malformed/truncated inputs, XML/RSS, HTTP and tracker responses |
+| Hashing and piece state | SHA-1/SHA-256 vectors, BEP 52 Merkle roots, hybrid dual verification, shared peer/web-seed memory budgets, reservation cleanup, rarest/sequential selection, priorities |
+| Storage and filesystem safety | Cross-file I/O, v2-aligned offsets, bounds checks, cache flush/drop behavior, symlink/hardlink/reparse defenses, Windows ACL and full file-identity checks, safe delete/move/rename behavior |
+| Peer and transport protocols | Handshakes, incremental message framing, MSE buffered data, TCP/uTP fixtures, DHT, LPD, HTTP/UDP trackers, proxy parsing and CONNECT behavior |
+| Runtime resilience | Rate-limit concurrency, session locking, atomic session/resume recovery, bounded metadata/tracker inputs, peer retry/ban behavior, shutdown and worker lifecycle |
+| UI and application behavior | Request authorization, origin/token checks, body limits, add/archive/recheck commands, status JSON, stable identifiers, Python compatibility probing, search/RSS parsing, UTF-8 handling |
+| Adversarial process behavior | Slowloris pressure, connection churn, malformed encryption/extension frames, oversized frames, corrupt state recovery, repeated kill/restart loops |
+| Local integration fixtures | HTTP tracker, UDP tracker, peer handshake, DHT response, uTP connector/listener, web UI process probes |
 
-## What Is Still Left Out
-The suite is broad for deterministic CI gating, but these gaps remain:
+## Fuzz Targets
 
-1. True end-to-end interop with public ecosystem
-- Real public tracker variance, real DHT internet routing behavior, third-party client compatibility matrix.
+The `fuzz/` package contains buildable entry points for:
 
-2. Real network hardware behavior
-- Router-specific UPnP/NAT-PMP behavior across consumer gateway implementations.
+- bencode parsing and encode/decode round trips;
+- peer-message decoding and framed reads;
+- HTTP response and tracker-body parsing;
+- storage path-segment validation;
+- full torrent-metainfo parsing.
 
-3. Long-duration reliability and performance characterization
-- Multi-hour soak and trend baselines for memory, CPU, throughput, reconnect rates, and queue latency.
+Lint and compile every fuzz target without starting an unbounded fuzz run:
 
-4. Full continuous fuzzing program
-- Current fuzz targets exist, but long-running corpus growth/minimization and nightly fuzz infrastructure are not yet enforced as a hard gate.
-
-5. Full data-plane restart correctness under active piece transfer
-- Current restart stress validates state-file integrity under abrupt process death with active peer churn.
-- It does not yet run a deterministic local seeder/leecher data-transfer loop that asserts piece-level correctness across repeated crash boundaries.
-
-## Release-Gating Recommendations (Remaining Work)
-High-value additions still recommended for a strict production gate:
-
-1. Add deterministic transfer-grade restart harness
-- Local tracker + deterministic seeder fixture that guarantees active piece flow.
-- Kill/restart at randomized transfer checkpoints and assert resumed piece/accounting correctness.
-
-2. Extend adversarial security matrix
-- Add per-IP abuse scenarios (UI and inbound peer side) and verify fairness under mixed benign/malicious load.
-- Add malformed extension payload families beyond current single-case probes.
-
-3. Promote fuzzing to scheduled CI
-- Persist corpus artifacts and run bounded-time fuzz jobs on every PR or nightly schedule.
-
-4. Expand soak stage duration tiers
-- Keep short CI soak, add periodic 30m/2h soak jobs with memory/error-rate thresholds and trend checks.
-
-5. Expand platform/compiler matrix
-- Keep Linux/macOS feature matrix and add compiler/channel breadth (stable/beta) when CI budget permits.
-
-## Validation Commands
-Core:
-
-```bash
-cargo test --all-features
+```sh
+cargo clippy --locked --manifest-path fuzz/Cargo.toml --bins -- \
+  -D warnings -A dead-code
+cargo audit --deny warnings
+cargo audit --file fuzz/Cargo.lock --deny warnings
+cargo about generate --locked --all-features --fail about.hbs \
+  --output-file /tmp/THIRD_PARTY_LICENSES.html
+cmp THIRD_PARTY_LICENSES.html /tmp/THIRD_PARTY_LICENSES.html
 ```
 
-Process adversarial gate only:
+The audit commands require `cargo-audit` (`cargo install cargo-audit --version 0.22.2 --locked`).
+The license check requires `cargo-about` 0.9.1 with its `cli` feature. CI installs both pinned
+tools automatically.
 
-```bash
+Finite local fuzz smoke runs use a nightly toolchain and an explicit run count, for example:
+
+```sh
+cargo +nightly fuzz run -s none bencode_parse -- -runs=100 -timeout=3
+```
+
+The 2026-07-13 macOS 26 validation used `-s none` because the native nightly AddressSanitizer
+runtime deadlocked during its own initialization. Sanitized, sustained campaigns remain a separate
+release activity rather than a claimed result of this smoke command.
+
+## Release Gates
+
+Run the same checks enforced by CI:
+
+```sh
+cargo fmt --all --check
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features -- --test-threads=1
+cargo test --locked --no-default-features -- --test-threads=1
+cargo check --locked --release --all-targets --all-features
+cargo clippy --locked --manifest-path fuzz/Cargo.toml --bins -- \
+  -D warnings -A dead-code
+```
+
+The CI workflow runs the main gate on Linux, checks the declared Rust 1.89 minimum on Linux,
+macOS, and Windows, and compile-checks both the full and minimal feature sets on each platform. The
+macOS job also builds the universal application bundle, verifies both architectures and the macOS
+11 deployment target, and confirms that dependency notices are reproducible.
+
+Run only the adversarial process gate with visible child output:
+
+```sh
 cargo test --all-features --test process_release_gate -- --nocapture
 ```
 
-Optional soak run:
+Run the ignored soak scenario for five minutes:
 
-```bash
-RUSTORRENT_SOAK_SECS=300 cargo test --all-features --test soak_swarm -- --ignored --nocapture
+```sh
+RUSTORRENT_SOAK_SECS=300 \
+  cargo test --all-features --test soak_swarm -- --ignored --nocapture
 ```
+
+## Known Gaps
+
+- Public tracker, public DHT, and third-party client interoperability varies beyond the local
+  deterministic fixtures.
+- Hybrid torrents accept the BEP 52 handshake upgrade, but tracker, DHT, and LPD discovery do not
+  yet join the v1 and v2 swarms independently.
+- Router-specific UPnP and NAT-PMP behavior needs hardware coverage.
+- Long-duration memory, CPU, throughput, reconnect, and queue-latency trends are not continuously
+  measured.
+- Fuzz targets compile in CI, but sustained corpus growth, minimization, and sanitizer campaigns
+  are not yet scheduled.
+- Search plugins are executable third-party Python code running with the current user's authority;
+  the application warns before installation but does not sandbox them.
+- Crash/restart tests validate state-file integrity; they do not yet kill and resume a guaranteed
+  active piece transfer at randomized checkpoints.
+- Windows-specific handle-relative filesystem behavior cannot run on Unix hosts; the Windows CI
+  job therefore runs the full feature/process suite in addition to both compile configurations.
+- Credential-free CI does not execute Developer ID signing/notarization, the DMG path, or a full
+  launched macOS app flow. Linux aarch64 does not have a continuous runtime gate.
+
+These gaps should remain explicit in release notes until corresponding automated or manual gates
+exist.

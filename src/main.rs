@@ -10,6 +10,7 @@ mod lpd;
 mod mse;
 #[cfg(feature = "natpmp")]
 mod natpmp;
+mod ownership;
 mod peer;
 mod peer_stream;
 mod piece;
@@ -18,6 +19,7 @@ mod rss;
 mod search;
 mod sha1;
 mod sha256;
+mod state_dir;
 mod storage;
 mod torrent;
 mod tracker;
@@ -28,17 +30,24 @@ mod ui;
 mod upnp;
 #[cfg(feature = "utp")]
 mod utp;
+#[cfg(windows)]
+mod windows_fs;
 mod xml;
 
 #[cfg(not(feature = "dht"))]
 mod dht {
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::sync::mpsc;
 
     #[derive(Clone)]
     pub struct Dht;
 
-    pub fn start(_port: u16) -> Dht {
+    pub fn start(_port: u16, _download_dir: &Path) -> Dht {
+        Dht
+    }
+
+    pub fn disabled() -> Dht {
         Dht
     }
 
@@ -67,6 +76,10 @@ mod lpd {
         Lpd
     }
 
+    pub fn disabled() -> Lpd {
+        Lpd
+    }
+
     impl Lpd {
         pub fn add_torrent(
             &self,
@@ -83,6 +96,7 @@ mod lpd {
 #[cfg(not(feature = "udp_tracker"))]
 mod udp_tracker {
     use std::fmt;
+    use std::time::Instant;
 
     use crate::tracker::TrackerResponse;
 
@@ -97,6 +111,7 @@ mod udp_tracker {
 
     impl std::error::Error for Error {}
 
+    #[allow(dead_code)]
     #[derive(Debug, Clone)]
     pub struct ScrapeResult {
         pub seeders: u32,
@@ -105,6 +120,7 @@ mod udp_tracker {
         pub completed: u32,
     }
 
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn announce(
         _url: &str,
         _info_hash: [u8; 20],
@@ -119,6 +135,23 @@ mod udp_tracker {
         Err(Error)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn announce_until(
+        _url: &str,
+        _info_hash: [u8; 20],
+        _peer_id: [u8; 20],
+        _port: u16,
+        _uploaded: u64,
+        _downloaded: u64,
+        _left: u64,
+        _event: Option<&str>,
+        _numwant: u32,
+        _deadline: Instant,
+    ) -> Result<TrackerResponse, Error> {
+        Err(Error)
+    }
+
+    #[allow(dead_code)]
     pub fn scrape(_url: &str, _info_hash: [u8; 20]) -> Result<ScrapeResult, Error> {
         Err(Error)
     }
@@ -180,19 +213,13 @@ mod utp {
 
     impl Read for UtpStream {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "utp disabled",
-            ))
+            Err(std::io::Error::other("utp disabled"))
         }
     }
 
     impl Write for UtpStream {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "utp disabled",
-            ))
+            Err(std::io::Error::other("utp disabled"))
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
@@ -229,16 +256,17 @@ mod mse {
         _info_hash: [u8; 20],
         _allow_plain: bool,
         _initial_payload: &[u8],
-    ) -> Result<(CryptoMode, Option<CipherState>), String> {
+    ) -> Result<(CryptoMode, Option<CipherState>, Vec<u8>), String> {
         Err("mse disabled".to_string())
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn accept<RW: Read + Write>(
         _stream: &mut RW,
         _info_hashes: &[[u8; 20]],
         _first_byte: u8,
         _allow_plain: bool,
-    ) -> Result<(CryptoMode, Option<CipherState>, [u8; 20], Vec<u8>), String> {
+    ) -> Result<(CryptoMode, Option<CipherState>, [u8; 20], Vec<u8>, Vec<u8>), String> {
         Err("mse disabled".to_string())
     }
 }
@@ -247,7 +275,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
@@ -265,6 +293,14 @@ const PIPELINE_DEPTH: usize = 64;
 const MIN_PIPELINE_DEPTH: usize = 32;
 const MAX_PIPELINE_DEPTH: usize = 256;
 const MAX_ACTIVE_PIECES_PER_PEER: usize = 12;
+const MAX_SINGLE_PIECE_BUFFER_BYTES: usize = torrent::MAX_PIECE_LENGTH as usize
+    + (torrent::MAX_PIECE_LENGTH as usize).div_ceil(piece::BLOCK_LEN as usize);
+const MAX_TORRENT_PIECE_BUFFER_BYTES: usize = 4 * MAX_SINGLE_PIECE_BUFFER_BYTES;
+const MAX_GLOBAL_PIECE_BUFFER_BYTES: usize = 16 * MAX_SINGLE_PIECE_BUFFER_BYTES;
+#[cfg(feature = "webseed")]
+const WEBSEED_RESERVATION_ID: u64 = u64::MAX;
+#[cfg(feature = "webseed")]
+const WEBSEED_HTTP_BODY_SLACK: usize = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_UPLOAD_BLOCK_LEN: u32 = 64 * 1024;
 const MAX_IDLE_TICKS: u32 = 180;
@@ -288,6 +324,7 @@ const PEER_RETRY_EXHAUSTED_BAN_SECS: u64 = 15 * 60;
 const PEER_RETRY_MAX_SECS: u64 = 30;
 const PEER_THREAD_STACK: usize = 512 * 1024; // 512KB
 const TRACKER_ANNOUNCE_WAIT_BUDGET: Duration = Duration::from_secs(4);
+const TRACKER_STOPPED_WAIT_BUDGET: Duration = Duration::from_secs(2);
 const TRACKER_ANNOUNCE_POLL: Duration = Duration::from_millis(150);
 const TORRENT_LOOP_INTERVAL: Duration = Duration::from_millis(200);
 const PEER_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -298,6 +335,23 @@ const STARTUP_BURST_BYTES: u64 = 8 * 1024 * 1024;
 const REQUEST_QUEUE_TIME_SECS: f64 = 2.0;
 const DEFAULT_PEER_RATE_BPS: f64 = 512.0 * 1024.0;
 const MAX_TORRENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_PID_FILE_BYTES: usize = 64;
+const MAX_RESUME_STATE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SESSION_STATE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SESSION_ENTRIES: usize = 4096;
+const MAX_ATOMIC_BACKUP_BYTES: usize = MAX_SESSION_STATE_BYTES;
+const MAX_RSS_POLL_WORKERS: usize = 16;
+const MAX_RSS_DOWNLOAD_WORKERS: usize = 16;
+const MAX_RSS_MATCHES_PER_POLL: usize = 64;
+const MAX_TRACKERS_PER_TORRENT: usize = 64;
+const MAX_TRACKER_URL_LEN: usize = 2048;
+const MAX_MAGNET_SOURCES: usize = 16;
+const MAX_MAGNET_WEB_SEEDS: usize = 64;
+const MAX_MAGNET_EXPLICIT_PEERS: usize = 256;
+const MAX_TRACKER_WORKERS: usize = 8;
+const MAX_GLOBAL_TRACKER_WORKERS: usize = 64;
+static ACTIVE_TRACKER_WORKERS: AtomicUsize = AtomicUsize::new(0);
 const MIN_INBOUND_HANDLER_SLOTS: usize = 64;
 const MAX_INBOUND_HANDLER_SLOTS: usize = 1024;
 const METADATA_PIECE_LEN: usize = 16 * 1024;
@@ -311,6 +365,9 @@ const MAGNET_CACHE_URLS: [&str; 2] = [
 ];
 const HANDSHAKE_LEN: usize = 68;
 const SHUTDOWN_SLEEP_SLICE_MS: u64 = 50;
+const TORRENT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const TORRENT_RESOURCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[cfg(unix)]
 const SIGINT: i32 = 2;
@@ -327,6 +384,7 @@ static LOG_LOCK: Mutex<()> = Mutex::new(());
 static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 static SESSION_DOWNLOADED_BYTES: AtomicU64 = AtomicU64::new(0);
 static SESSION_UPLOADED_BYTES: AtomicU64 = AtomicU64::new(0);
+static ATOMIC_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PEER_CONNECTED: AtomicU64 = AtomicU64::new(0);
 static PEER_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 static SEED_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
@@ -367,7 +425,7 @@ struct RssPollResult {
 }
 
 struct RssDownloadResult {
-    guid: String,
+    seen_key: String,
     url: String,
     title: String,
     data: Result<Vec<u8>, String>,
@@ -397,11 +455,77 @@ struct SessionEntry {
     download_dir: PathBuf,
     preallocate: bool,
     label: String,
+    completion_state: CompletionState,
+    completion_move_dir: Option<PathBuf>,
+    pending_delete: bool,
+    file_renames: Vec<(usize, String)>,
+    pending_file_rename: Option<PendingFileRename>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingFileRename {
+    index: usize,
+    target: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CompletionState {
+    #[default]
+    None,
+    Pending,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionAction {
+    None,
+    MarkDone,
+    RunScript,
+    Move,
+}
+
+fn completion_action(
+    state: CompletionState,
+    was_complete: bool,
+    is_complete: bool,
+    move_requested: bool,
+) -> CompletionAction {
+    if !is_complete || state == CompletionState::Done {
+        return CompletionAction::None;
+    }
+    if state == CompletionState::None && was_complete {
+        return CompletionAction::MarkDone;
+    }
+    if move_requested {
+        CompletionAction::Move
+    } else {
+        CompletionAction::RunScript
+    }
+}
+
+impl CompletionState {
+    fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::None => b"none",
+            Self::Pending => b"pending",
+            Self::Done => b"done",
+        }
+    }
+
+    fn from_bytes(value: &[u8]) -> Option<Self> {
+        match value {
+            b"none" => Some(Self::None),
+            b"pending" => Some(Self::Pending),
+            b"done" => Some(Self::Done),
+            _ => None,
+        }
+    }
 }
 
 struct SessionStore {
     path: PathBuf,
     entries: Mutex<HashMap<[u8; 20], SessionEntry>>,
+    operations: Mutex<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,6 +683,13 @@ struct InboundHandlerGuard {
     active: Option<Arc<AtomicUsize>>,
 }
 
+type PeerCancellationRegistry = Arc<Mutex<HashMap<u64, TcpStream>>>;
+
+struct PeerCancellationGuard {
+    registry: PeerCancellationRegistry,
+    peer_tag: u64,
+}
+
 struct RateLimiter {
     limit_bps: AtomicU64,
     state: Mutex<RateState>,
@@ -584,6 +715,26 @@ struct PeerSlots {
 
 struct ActiveTorrentGuard {
     counter: Arc<AtomicUsize>,
+}
+
+struct InFlightTorrentGuard {
+    reservations: InFlightTorrents,
+    info_hash: [u8; 20],
+    torrent_id: u64,
+}
+
+struct PidFileGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+struct SessionLocks {
+    #[cfg(not(windows))]
+    _legacy: fs::File,
+    #[cfg(unix)]
+    _state_directory: fs::File,
+    #[cfg(windows)]
+    _windows: state_dir::SessionLock,
 }
 
 struct UploadManager {
@@ -613,12 +764,13 @@ struct PeerUploadInfo {
 struct TorrentContext {
     id: u64,
     info_hash: [u8; 20],
+    hybrid_v2_info_hash: Option<[u8; 20]>,
     peer_id: [u8; 20],
-    download_dir: PathBuf,
     pieces: Arc<Mutex<piece::PieceManager>>,
     storage: Arc<Mutex<storage::Storage>>,
     completed_log: Arc<Mutex<Vec<u32>>>,
     base_piece_length: u64,
+    v2_hashes: Arc<V2HashStore>,
     file_spans: Arc<Vec<FileSpan>>,
     file_priorities: Arc<Mutex<Vec<u8>>>,
     limits: TransferLimits,
@@ -629,8 +781,15 @@ struct TorrentContext {
     upload_requests_served: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
+    allow_completion_reentry: Arc<AtomicBool>,
+    rechecking: Arc<AtomicBool>,
+    resume_save_requested: Arc<AtomicBool>,
+    delete_data_requested: Arc<AtomicBool>,
+    archive_requested: Arc<AtomicBool>,
+    teardown_failed: Arc<AtomicBool>,
     upload_manager: Arc<UploadManager>,
     peer_tags: Arc<AtomicU64>,
+    peer_cancellations: PeerCancellationRegistry,
     label: Arc<Mutex<String>>,
     trackers: Arc<Mutex<TrackerSet>>,
     #[allow(dead_code)]
@@ -640,6 +799,7 @@ struct TorrentContext {
 }
 
 type SessionRegistry = Arc<Mutex<HashMap<[u8; 20], Arc<TorrentContext>>>>;
+type InFlightTorrents = Arc<Mutex<HashMap<[u8; 20], u64>>>;
 
 macro_rules! log_info {
     ($($t:tt)*) => {
@@ -765,15 +925,19 @@ pub(crate) fn log_stderr(args: std::fmt::Arguments) {
     allow(dead_code)
 )]
 pub(crate) fn system_entropy_u64() -> u64 {
+    let mut random = [0u8; 8];
+    if getrandom::fill(&mut random).is_ok() {
+        return u64::from_ne_bytes(random);
+    }
+
+    // Randomness failure must not turn ordinary bookkeeping (such as a
+    // collision-resistant temporary name) into a process-wide outage. MSE
+    // and UI authentication call the OS provider directly and fail closed;
+    // this mixed fallback is only used by non-secret protocol identifiers.
     use std::sync::OnceLock;
     static BASE: OnceLock<u64> = OnceLock::new();
     let base = *BASE.get_or_init(|| {
-        let mut buf = [0u8; 8];
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            if std::io::Read::read_exact(&mut f, &mut buf).is_ok() {
-                return u64::from_ne_bytes(buf);
-            }
-        }
+        let buf = [0u8; 8];
         let time_part = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -809,14 +973,6 @@ fn install_panic_logger() {
             .unwrap_or_else(|| "<unknown>".to_string());
         let message = format!("panic: {payload} at {location}");
         eprintln!("{message}");
-        let _ = fs::create_dir_all(".rustorrent");
-        if let Ok(mut file) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(".rustorrent/panic.log")
-        {
-            let _ = writeln!(file, "{message}");
-        }
     }));
 }
 
@@ -918,19 +1074,241 @@ fn sleep_with_shutdown_or_stop(duration: Duration, stop_flag: &AtomicBool) {
     }
 }
 
-impl SessionStore {
-    fn load(root: &Path) -> Self {
-        let path = session_path(root);
-        let entries = match load_session_entries_with_recovery(&path, root) {
-            Ok(entries) => entries,
-            Err(err) => {
-                log_warn!("{err}");
-                HashMap::new()
-            }
+fn join_worker(handle: thread::JoinHandle<()>, label: &str) {
+    if handle.join().is_err() {
+        log_warn!("{label} panicked");
+    }
+}
+
+fn join_worker_before(handle: thread::JoinHandle<()>, label: &str, deadline: Instant) -> bool {
+    while !handle.is_finished() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            log_warn!("{label} did not stop before the teardown deadline; detaching it");
+            return false;
         };
-        Self {
+        if remaining.is_zero() {
+            log_warn!("{label} did not stop before the teardown deadline; detaching it");
+            return false;
+        }
+        thread::sleep(remaining.min(TEARDOWN_POLL_INTERVAL));
+    }
+    join_worker(handle, label);
+    true
+}
+
+fn wait_for_torrent_resources(
+    context: &Arc<TorrentContext>,
+    storage: &Arc<Mutex<storage::Storage>>,
+    operation: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    loop {
+        let active_peers = context.active_peers.load(Ordering::Acquire);
+        let rechecking = context.rechecking.load(Ordering::Acquire);
+        let context_refs = Arc::strong_count(context);
+        let storage_refs = Arc::strong_count(storage);
+        if active_peers == 0 && !rechecking && context_refs <= 1 && storage_refs <= 2 {
+            return Ok(());
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(format!(
+                "{operation} timed out waiting for torrent resources to stop \
+                 (active peers: {active_peers}, rechecking: {rechecking}, \
+                 context refs: {context_refs}, storage refs: {storage_refs})"
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(format!(
+                "{operation} timed out waiting for torrent resources to stop \
+                 (active peers: {active_peers}, rechecking: {rechecking}, \
+                 context refs: {context_refs}, storage refs: {storage_refs})"
+            ));
+        }
+        thread::sleep(remaining.min(TEARDOWN_POLL_INTERVAL));
+    }
+}
+
+fn retain_context_after_teardown_failure(
+    registry: &SessionRegistry,
+    context: &Arc<TorrentContext>,
+) {
+    context.teardown_failed.store(true, Ordering::Release);
+    let mut registry = lock_or_recover(registry);
+    registry
+        .entry(context.info_hash)
+        .or_insert_with(|| Arc::clone(context));
+}
+
+fn wait_for_torrent_resources_or_retain(
+    registry: &SessionRegistry,
+    context: &Arc<TorrentContext>,
+    storage: &Arc<Mutex<storage::Storage>>,
+    operation: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    wait_for_torrent_resources(context, storage, operation, deadline).inspect_err(|_| {
+        retain_context_after_teardown_failure(registry, context);
+    })
+}
+
+fn reap_finished_workers(handles: &mut Vec<thread::JoinHandle<()>>, label: &str) {
+    let mut index = 0;
+    while index < handles.len() {
+        if handles[index].is_finished() {
+            let handle = handles.swap_remove(index);
+            join_worker(handle, label);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn spawn_detached<F>(name: &str, worker: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    match thread::Builder::new().name(name.to_string()).spawn(worker) {
+        Ok(_) => true,
+        Err(err) => {
+            log_warn!("{name} worker could not start: {err}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod teardown_liveness_tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    #[test]
+    fn bounded_join_returns_when_a_worker_will_not_stop() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        assert!(!join_worker_before(
+            handle,
+            "blocked test worker",
+            Instant::now() + Duration::from_millis(30),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn peer_cancellation_wakes_a_blocked_tcp_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let stream = PeerStream::tcp(client);
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+        let cancellation = PeerCancellationGuard::new(&registry, 7, &stream);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut stream = stream;
+            let mut byte = [0u8; 1];
+            started_tx.send(()).unwrap();
+            result_tx.send(stream.read(&mut byte)).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        cancel_peer_connections(&registry);
+        let result = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(result, Ok(0) | Err(_)));
+
+        worker.join().unwrap();
+        drop(cancellation);
+        drop(server);
+        assert!(lock_or_recover(&registry).is_empty());
+    }
+}
+
+fn storage_claims_for_session_entry(
+    entry: &SessionEntry,
+) -> Result<Vec<ownership::StorageClaim>, String> {
+    let meta = torrent::parse_torrent(&entry.torrent_bytes)
+        .map_err(|err| format!("storage ownership metainfo: {err}"))?;
+    if meta.info_hash != entry.info_hash {
+        return Err("storage ownership metainfo hash mismatch".to_string());
+    }
+    let pending_rename = entry
+        .pending_file_rename
+        .as_ref()
+        .map(|pending| (pending.index, pending.target.as_str()));
+    let pending_completion = (entry.completion_state == CompletionState::Pending)
+        .then_some(entry.completion_move_dir.as_deref())
+        .flatten();
+    ownership::claims_for_torrent(
+        &meta,
+        &entry.download_dir,
+        &entry.file_renames,
+        pending_rename,
+        pending_completion,
+    )
+}
+
+fn ensure_session_storage_claim_available(
+    entries: &HashMap<[u8; 20], SessionEntry>,
+    proposed: &SessionEntry,
+) -> Result<(), String> {
+    if entries
+        .keys()
+        .all(|info_hash| *info_hash == proposed.info_hash)
+    {
+        return Ok(());
+    }
+    let proposed_claims = storage_claims_for_session_entry(proposed)?;
+    for (other_hash, other) in entries {
+        if *other_hash == proposed.info_hash {
+            continue;
+        }
+        let other_claims = storage_claims_for_session_entry(other)?;
+        for proposed_claim in &proposed_claims {
+            if let Some(other_claim) = other_claims
+                .iter()
+                .find(|other_claim| ownership::claims_conflict(proposed_claim, other_claim))
+            {
+                return Err(format!(
+                    "storage path {} conflicts with torrent {} at {}",
+                    proposed_claim.path().display(),
+                    hex(other_hash),
+                    other_claim.path().display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl SessionStore {
+    fn load(root: &Path) -> Result<Self, String> {
+        let path = session_path(root);
+        let entries = load_session_entries_with_recovery(&path, root)
+            .map_err(|err| format!("cannot load session state {}: {err}", path.display()))?;
+        Ok(Self {
             path,
             entries: Mutex::new(entries),
+            operations: Mutex::new(()),
+        })
+    }
+
+    fn lock_operation(&self) -> MutexGuard<'_, ()> {
+        match self.operations.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 
@@ -958,6 +1336,196 @@ impl SessionStore {
         guard.get(&info_hash).cloned()
     }
 
+    /// Validate the durable claim before crash reconciliation performs any
+    /// physical rename, move adoption, or source cleanup. The caller holds
+    /// `operations`, serializing this check with every claim transition.
+    fn validate_current_storage_claim(&self, info_hash: [u8; 20]) -> Result<(), String> {
+        let guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = guard
+            .get(&info_hash)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        storage_claims_for_session_entry(entry)?;
+        ensure_session_storage_claim_available(&guard, entry)
+    }
+
+    fn begin_delete(&self, info_hash: [u8; 20]) -> Result<bool, String> {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.pending_delete {
+            return Ok(false);
+        }
+        if previous.pending_file_rename.is_some() {
+            return Err("file rename recovery is pending".to_string());
+        }
+        guard
+            .get_mut(&info_hash)
+            .ok_or_else(|| "torrent session metadata disappeared".to_string())?
+            .pending_delete = true;
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(true)
+    }
+
+    fn import_file_renames_if_empty(
+        &self,
+        info_hash: [u8; 20],
+        file_renames: &[(usize, String)],
+    ) -> Result<(), String> {
+        if file_renames.is_empty() {
+            return Ok(());
+        }
+        let mut normalized = file_renames.to_vec();
+        normalized.sort_unstable_by_key(|(index, _)| *index);
+        if normalized.windows(2).any(|pair| pair[0].0 == pair[1].0)
+            || normalized
+                .iter()
+                .any(|(_, name)| !valid_renamed_file_name(name))
+        {
+            return Err("invalid persisted file rename".to_string());
+        }
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if !previous.file_renames.is_empty() {
+            return Ok(());
+        }
+        let mut proposed = previous.clone();
+        proposed.file_renames = normalized;
+        storage_claims_for_session_entry(&proposed)?;
+        ensure_session_storage_claim_available(&guard, &proposed)?;
+        guard.insert(info_hash, proposed);
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(())
+    }
+
+    fn begin_file_rename(
+        &self,
+        info_hash: [u8; 20],
+        index: usize,
+        target: &str,
+    ) -> Result<bool, String> {
+        if !valid_renamed_file_name(target) {
+            return Err("invalid file name".to_string());
+        }
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.pending_delete {
+            return Err("torrent deletion is pending".to_string());
+        }
+        let pending = PendingFileRename {
+            index,
+            target: target.to_string(),
+        };
+        if previous.pending_file_rename.as_ref() == Some(&pending) {
+            return Ok(false);
+        }
+        if previous.pending_file_rename.is_some() {
+            return Err("another file rename is pending".to_string());
+        }
+        let mut proposed = previous.clone();
+        proposed.pending_file_rename = Some(pending);
+        storage_claims_for_session_entry(&proposed)?;
+        ensure_session_storage_claim_available(&guard, &proposed)?;
+        guard.insert(info_hash, proposed);
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(true)
+    }
+
+    fn commit_file_rename(
+        &self,
+        info_hash: [u8; 20],
+        pending: &PendingFileRename,
+    ) -> Result<bool, String> {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.pending_file_rename.as_ref() != Some(pending) {
+            return Ok(false);
+        }
+        let entry = guard
+            .get_mut(&info_hash)
+            .ok_or_else(|| "torrent session metadata disappeared".to_string())?;
+        if let Some((_, name)) = entry
+            .file_renames
+            .iter_mut()
+            .find(|(index, _)| *index == pending.index)
+        {
+            *name = pending.target.clone();
+        } else {
+            entry
+                .file_renames
+                .push((pending.index, pending.target.clone()));
+            entry.file_renames.sort_unstable_by_key(|(index, _)| *index);
+        }
+        entry.pending_file_rename = None;
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(true)
+    }
+
+    fn cancel_file_rename(
+        &self,
+        info_hash: [u8; 20],
+        pending: &PendingFileRename,
+    ) -> Result<bool, String> {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.pending_file_rename.as_ref() != Some(pending) {
+            return Ok(false);
+        }
+        guard
+            .get_mut(&info_hash)
+            .ok_or_else(|| "torrent session metadata disappeared".to_string())?
+            .pending_file_rename = None;
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
     fn upsert(
         &self,
         info_hash: [u8; 20],
@@ -965,11 +1533,32 @@ impl SessionStore {
         torrent_bytes: Vec<u8>,
         download_dir: &Path,
         preallocate: bool,
-    ) {
+    ) -> Result<(), String> {
         let mut guard = match self.entries.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let previous = guard.get(&info_hash).cloned();
+        let (
+            label,
+            completion_state,
+            completion_move_dir,
+            pending_delete,
+            file_renames,
+            pending_file_rename,
+        ) = previous
+            .as_ref()
+            .map(|entry| {
+                (
+                    entry.label.clone(),
+                    entry.completion_state,
+                    entry.completion_move_dir.clone(),
+                    entry.pending_delete,
+                    entry.file_renames.clone(),
+                    entry.pending_file_rename.clone(),
+                )
+            })
+            .unwrap_or_default();
         guard.insert(
             info_hash,
             SessionEntry {
@@ -978,38 +1567,313 @@ impl SessionStore {
                 torrent_bytes,
                 download_dir: download_dir.to_path_buf(),
                 preallocate,
-                label: String::new(),
+                label,
+                completion_state,
+                completion_move_dir,
+                pending_delete,
+                file_renames,
+                pending_file_rename,
             },
         );
         if let Err(err) = save_session(&self.path, &guard) {
-            log_warn!("session save failed: {err}");
-        }
-    }
-
-    fn set_label(&self, info_hash: [u8; 20], label: &str) {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(entry) = guard.get_mut(&info_hash) {
-            entry.label = label.to_string();
-            if let Err(err) = save_session(&self.path, &guard) {
-                log_warn!("session save failed: {err}");
+            match previous {
+                Some(entry) => {
+                    guard.insert(info_hash, entry);
+                }
+                None => {
+                    guard.remove(&info_hash);
+                }
             }
+            return Err(format!("session save failed: {err}"));
         }
+        Ok(())
     }
 
-    fn remove(&self, info_hash: [u8; 20]) {
+    /// Atomically persist a session entry and its effective storage claim.
+    /// The caller holds `operations`; once this returns, later claim changes
+    /// cannot race the Storage open that immediately follows it.
+    fn upsert_with_storage_claim(
+        &self,
+        info_hash: [u8; 20],
+        name: String,
+        torrent_bytes: Vec<u8>,
+        download_dir: &Path,
+        preallocate: bool,
+        initial_file_renames: &[(usize, String)],
+    ) -> Result<(), String> {
+        let mut normalized_renames = initial_file_renames.to_vec();
+        normalized_renames.sort_unstable_by_key(|(index, _)| *index);
+        if normalized_renames
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+            || normalized_renames
+                .iter()
+                .any(|(_, name)| !valid_renamed_file_name(name))
+        {
+            return Err("invalid storage claim file rename".to_string());
+        }
+
         let mut guard = match self.entries.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.remove(&info_hash).is_none() {
-            return;
+        let previous = guard.get(&info_hash).cloned();
+        let (
+            label,
+            completion_state,
+            completion_move_dir,
+            pending_delete,
+            file_renames,
+            pending_file_rename,
+        ) = previous
+            .as_ref()
+            .map(|entry| {
+                (
+                    entry.label.clone(),
+                    entry.completion_state,
+                    entry.completion_move_dir.clone(),
+                    entry.pending_delete,
+                    if entry.file_renames.is_empty() {
+                        normalized_renames.clone()
+                    } else {
+                        entry.file_renames.clone()
+                    },
+                    entry.pending_file_rename.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    String::new(),
+                    CompletionState::None,
+                    None,
+                    false,
+                    normalized_renames,
+                    None,
+                )
+            });
+        let proposed = SessionEntry {
+            info_hash,
+            name,
+            torrent_bytes,
+            download_dir: download_dir.to_path_buf(),
+            preallocate,
+            label,
+            completion_state,
+            completion_move_dir,
+            pending_delete,
+            file_renames,
+            pending_file_rename,
+        };
+        storage_claims_for_session_entry(&proposed)?;
+        ensure_session_storage_claim_available(&guard, &proposed)?;
+        guard.insert(info_hash, proposed);
+        if let Err(err) = save_session(&self.path, &guard) {
+            match previous {
+                Some(entry) => {
+                    guard.insert(info_hash, entry);
+                }
+                None => {
+                    guard.remove(&info_hash);
+                }
+            }
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(())
+    }
+
+    fn set_label(&self, info_hash: [u8; 20], label: &str) -> Result<(), String> {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.label == label {
+            return Ok(());
+        }
+        guard
+            .get_mut(&info_hash)
+            .ok_or_else(|| "torrent session metadata disappeared".to_string())?
+            .label = label.to_string();
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(())
+    }
+
+    fn completion_state(&self, info_hash: [u8; 20]) -> Option<CompletionState> {
+        let guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.get(&info_hash).map(|entry| entry.completion_state)
+    }
+
+    fn completion_move_dir(&self, info_hash: [u8; 20]) -> Option<PathBuf> {
+        let guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .get(&info_hash)
+            .and_then(|entry| entry.completion_move_dir.clone())
+    }
+
+    fn begin_completion(
+        &self,
+        info_hash: [u8; 20],
+        move_dir: Option<&Path>,
+    ) -> Result<bool, String> {
+        let move_dir = match move_dir {
+            Some(path) if path.is_absolute() => Some(path.to_path_buf()),
+            Some(path) => Some(
+                env::current_dir()
+                    .map_err(|err| format!("completion move current directory failed: {err}"))?
+                    .join(path),
+            ),
+            None => None,
+        };
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.pending_delete || previous.completion_state != CompletionState::None {
+            return Ok(false);
+        }
+        let mut proposed = previous.clone();
+        proposed.completion_state = CompletionState::Pending;
+        proposed.completion_move_dir = move_dir;
+        storage_claims_for_session_entry(&proposed)?;
+        ensure_session_storage_claim_available(&guard, &proposed)?;
+        guard.insert(info_hash, proposed);
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(true)
+    }
+
+    fn transition_completion_state(
+        &self,
+        info_hash: [u8; 20],
+        expected: CompletionState,
+        next: CompletionState,
+    ) -> Result<bool, String> {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.pending_delete || previous.completion_state != expected {
+            return Ok(false);
+        }
+        if expected == next {
+            return Ok(true);
+        }
+        let entry = guard
+            .get_mut(&info_hash)
+            .ok_or_else(|| "torrent session metadata disappeared".to_string())?;
+        entry.completion_state = next;
+        if next == CompletionState::Done {
+            entry.completion_move_dir = None;
         }
         if let Err(err) = save_session(&self.path, &guard) {
-            log_warn!("session save failed: {err}");
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
         }
+        Ok(true)
+    }
+
+    fn commit_completion_move(
+        &self,
+        info_hash: [u8; 20],
+        download_dir: &Path,
+    ) -> Result<bool, String> {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.pending_delete || previous.completion_state != CompletionState::Pending {
+            return Ok(false);
+        }
+        let entry = guard
+            .get_mut(&info_hash)
+            .ok_or_else(|| "torrent session metadata disappeared".to_string())?;
+        entry.download_dir = download_dir.to_path_buf();
+        entry.completion_state = CompletionState::Done;
+        entry.completion_move_dir = None;
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(true)
+    }
+
+    fn remove(&self, info_hash: [u8; 20]) -> Result<bool, String> {
+        let mut guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(previous) = guard.remove(&info_hash) else {
+            return Ok(false);
+        };
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(true)
+    }
+}
+
+fn spawn_on_complete_script(
+    script: &Path,
+    torrent_name: &str,
+    torrent_dir: &Path,
+    info_hash: [u8; 20],
+    torrent_size: u64,
+) {
+    let script = script.to_path_buf();
+    let torrent_name = torrent_name.to_string();
+    let torrent_dir = torrent_dir.display().to_string();
+    let torrent_hash = hex(&info_hash);
+    if let Err(err) = thread::Builder::new()
+        .name("rustorrent-on-complete".to_string())
+        .spawn(move || {
+            match std::process::Command::new(&script)
+                .env("TORRENT_NAME", &torrent_name)
+                .env("TORRENT_DIR", &torrent_dir)
+                .env("TORRENT_HASH", &torrent_hash)
+                .env("TORRENT_SIZE", torrent_size.to_string())
+                .status()
+            {
+                Ok(status) => {
+                    if !status.success() {
+                        log_warn!("on-complete script exited {status}");
+                    }
+                }
+                Err(err) => {
+                    log_warn!("on-complete script error: {err}");
+                }
+            }
+        })
+    {
+        // Completion is deliberately recorded before spawning. A launch failure is
+        // therefore at-most-once, rather than risking duplicate external effects.
+        log_warn!("on-complete worker could not start: {err}");
     }
 }
 
@@ -1031,8 +1895,10 @@ impl RateLimiter {
     fn set_limit_bps(&self, limit_bps: u64) {
         self.limit_bps.store(limit_bps, Ordering::SeqCst);
         if let Ok(mut state) = self.state.lock() {
-            let capacity = limit_bps as f64;
-            state.allowance = state.allowance.min(capacity);
+            // A live limit change starts a fresh bucket. In particular, clear
+            // any debt accumulated under the previous limit so a newly
+            // enabled or raised limit takes effect immediately.
+            state.allowance = limit_bps as f64;
             state.last = Instant::now();
         }
     }
@@ -1042,26 +1908,36 @@ impl RateLimiter {
         if limit_bps == 0 || bytes == 0 {
             return;
         }
+        let delay = self.reserve_delay(bytes, limit_bps, Instant::now());
+        if !delay.is_zero() {
+            sleep_with_shutdown(delay);
+        }
+    }
+
+    fn reserve_delay(&self, bytes: usize, limit_bps: u64, now: Instant) -> Duration {
         let mut state = match self.state.lock() {
             Ok(state) => state,
-            Err(_) => return,
+            Err(_) => return Duration::ZERO,
         };
-        let now = Instant::now();
         let elapsed = now.duration_since(state.last).as_secs_f64();
         let capacity = limit_bps as f64;
         state.allowance = (state.allowance + elapsed * capacity).min(capacity);
-        if state.allowance >= bytes as f64 {
-            state.allowance -= bytes as f64;
-            state.last = now;
-            return;
-        }
-        let needed = bytes as f64 - state.allowance;
-        state.allowance = 0.0;
+        state.allowance -= bytes as f64;
+        let sleep_secs = if state.allowance < 0.0 {
+            -state.allowance / capacity
+        } else {
+            0.0
+        };
         state.last = now;
         drop(state);
-        let sleep_secs = needed / capacity;
-        if sleep_secs > 0.0 {
-            sleep_with_shutdown(Duration::from_secs_f64(sleep_secs));
+        // Keep the negative allowance as reserved debt. Concurrent callers
+        // then queue behind one another instead of sleeping for the same
+        // interval and all waking together, which would multiply the limit by
+        // the number of active peers.
+        if sleep_secs.is_finite() && sleep_secs > 0.0 {
+            Duration::from_secs_f64(sleep_secs)
+        } else {
+            Duration::ZERO
         }
     }
 }
@@ -1099,6 +1975,42 @@ impl Drop for InboundHandlerGuard {
         if let Some(active) = self.active.take() {
             active.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+}
+
+impl PeerCancellationGuard {
+    fn new(registry: &PeerCancellationRegistry, peer_tag: u64, stream: &PeerStream) -> Self {
+        let guard = Self {
+            registry: Arc::clone(registry),
+            peer_tag,
+        };
+        guard.replace_stream(stream);
+        guard
+    }
+
+    fn replace_stream(&self, stream: &PeerStream) {
+        let mut registry = lock_or_recover(&self.registry);
+        if let Some(stream) = stream
+            .tcp_stream()
+            .and_then(|stream| stream.try_clone().ok())
+        {
+            registry.insert(self.peer_tag, stream);
+        } else {
+            registry.remove(&self.peer_tag);
+        }
+    }
+}
+
+impl Drop for PeerCancellationGuard {
+    fn drop(&mut self) {
+        lock_or_recover(&self.registry).remove(&self.peer_tag);
+    }
+}
+
+fn cancel_peer_connections(registry: &PeerCancellationRegistry) {
+    let registry = lock_or_recover(registry);
+    for stream in registry.values() {
+        let _ = stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -1146,9 +2058,50 @@ impl ActiveTorrentGuard {
     }
 }
 
+impl InFlightTorrentGuard {
+    fn acquire(
+        reservations: &InFlightTorrents,
+        info_hash: [u8; 20],
+        torrent_id: u64,
+    ) -> Result<Self, String> {
+        let mut guard = lock_or_recover(reservations);
+        if guard.contains_key(&info_hash) {
+            return Err("torrent is already loading or active".to_string());
+        }
+        guard.insert(info_hash, torrent_id);
+        drop(guard);
+        Ok(Self {
+            reservations: Arc::clone(reservations),
+            info_hash,
+            torrent_id,
+        })
+    }
+}
+
 impl Drop for ActiveTorrentGuard {
     fn drop(&mut self) {
         let _ = self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for InFlightTorrentGuard {
+    fn drop(&mut self) {
+        let mut guard = lock_or_recover(&self.reservations);
+        if guard.get(&self.info_hash) == Some(&self.torrent_id) {
+            guard.remove(&self.info_hash);
+        }
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let is_ours = read_file_limited(&self.path, MAX_PID_FILE_BYTES, true)
+            .ok()
+            .and_then(|contents| String::from_utf8(contents).ok())
+            .is_some_and(|contents| contents.trim() == self.pid.to_string());
+        if is_ours {
+            let _ = remove_file_bound(&self.path);
+        }
     }
 }
 
@@ -1337,18 +2290,270 @@ fn inbound_handler_slots(max_peers_global: usize) -> usize {
         .clamp(MIN_INBOUND_HANDLER_SLOTS, MAX_INBOUND_HANDLER_SLOTS)
 }
 
+#[cfg(not(windows))]
+fn acquire_session_lock(download_dir: &Path) -> Result<SessionLocks, String> {
+    let lock_path = download_dir.join(".rustorrent.lock");
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|err| format!("failed to open session lock: {err}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("failed to inspect session lock: {err}"))?;
+    if !metadata.is_file() {
+        return Err("session lock is not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err("session lock must not be hard-linked".to_string());
+        }
+        let path_metadata = fs::symlink_metadata(&lock_path)
+            .map_err(|err| format!("failed to inspect session lock path: {err}"))?;
+        if !path_metadata.is_file()
+            || path_metadata.dev() != metadata.dev()
+            || path_metadata.ino() != metadata.ino()
+        {
+            return Err("session lock path changed while opening".to_string());
+        }
+    }
+    file.try_lock().map_err(|err| {
+        format!(
+            "another instance is using {} ({err})",
+            download_dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    let state_directory = {
+        let directory = state_dir::open_lock_directory(download_dir)
+            .map_err(|err| format!("failed to open pinned state-directory lock: {err}"))?;
+        directory.try_lock().map_err(|err| {
+            format!(
+                "another instance is using {} ({err})",
+                download_dir.display()
+            )
+        })?;
+        directory
+    };
+    Ok(SessionLocks {
+        _legacy: file,
+        #[cfg(unix)]
+        _state_directory: state_directory,
+    })
+}
+
+#[cfg(windows)]
+fn acquire_session_lock(download_dir: &Path) -> Result<SessionLocks, String> {
+    let lock = state_dir::acquire_session_lock(download_dir).map_err(|err| {
+        format!(
+            "another instance may be using {} or its state is unsafe ({err})",
+            download_dir.display()
+        )
+    })?;
+    Ok(SessionLocks { _windows: lock })
+}
+
+pub(crate) fn ensure_private_state_directory(download_dir: &Path) -> Result<(), String> {
+    #[cfg(any(unix, windows))]
+    {
+        state_dir::ensure(download_dir)
+            .map_err(|err| format!("failed to secure state directory: {err}"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::create_dir_all(download_dir).map_err(|err| {
+            format!(
+                "failed to create download directory {}: {err}",
+                download_dir.display()
+            )
+        })?;
+        let canonical_download = fs::canonicalize(download_dir).map_err(|err| {
+            format!(
+                "failed to resolve download directory {}: {err}",
+                download_dir.display()
+            )
+        })?;
+        let state_dir = download_dir.join(".rustorrent");
+        match fs::symlink_metadata(&state_dir) {
+            Ok(metadata) => validate_state_directory_metadata(&state_dir, &metadata)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                #[allow(unused_mut)]
+                let mut builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder
+                    .create(&state_dir)
+                    .map_err(|err| format!("failed to create state directory: {err}"))?;
+            }
+            Err(err) => return Err(format!("failed to inspect state directory: {err}")),
+        }
+
+        let path_metadata = fs::symlink_metadata(&state_dir)
+            .map_err(|err| format!("failed to inspect state directory: {err}"))?;
+        validate_state_directory_metadata(&state_dir, &path_metadata)?;
+        let canonical_state = fs::canonicalize(&state_dir)
+            .map_err(|err| format!("failed to resolve state directory: {err}"))?;
+        if canonical_state.parent() != Some(canonical_download.as_path())
+            || !canonical_state
+                .file_name()
+                .is_some_and(state_dir::is_state_directory_name)
+        {
+            return Err("state directory escapes the download directory".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_state_directory_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "state path {} is not a real directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_file_limited(path: &Path, limit: usize, no_follow: bool) -> io::Result<Vec<u8>> {
+    #[cfg(any(unix, windows))]
+    if state_dir::is_state_file_path(path) {
+        return state_dir::read_limited(path, limit);
+    }
+    if no_follow {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a regular file",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path is a filesystem reparse point",
+                ));
+            }
+        }
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = if no_follow { libc::O_NOFOLLOW } else { 0 };
+        options.custom_flags(flags | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    if no_follow {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    if metadata.len() > limit as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {limit} byte limit"),
+        ));
+    }
+    let mut data = Vec::with_capacity((metadata.len() as usize).min(limit));
+    file.take((limit + 1) as u64).read_to_end(&mut data)?;
+    if data.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {limit} byte limit"),
+        ));
+    }
+    Ok(data)
+}
+
+fn remove_file_bound(path: &Path) -> io::Result<()> {
+    #[cfg(any(unix, windows))]
+    if state_dir::is_state_file_path(path) {
+        return state_dir::remove_file(path);
+    }
+    fs::remove_file(path)
+}
+
+fn open_private_log_file(path: &Path) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|err| format!("failed to open log file: {err}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("failed to inspect log file: {err}"))?;
+    if !metadata.is_file() {
+        return Err("log path is not a regular file".to_string());
+    }
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|err| format!("failed to inspect log path: {err}"))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err("log path is not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 {
+            return Err("log file must not be hard-linked".to_string());
+        }
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err("log path changed while opening".to_string());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to secure log file permissions: {err}"))?;
+    }
+    Ok(file)
+}
+
 fn run() -> Result<(), String> {
     install_signal_handlers();
     install_panic_logger();
     let args = parse_args()?;
 
+    fs::create_dir_all(&args.download_dir).map_err(|err| {
+        format!(
+            "failed to create download directory {}: {err}",
+            args.download_dir.display()
+        )
+    })?;
+
     // Initialize log file if --log was specified
     if let Some(log_path) = args.log_path.as_ref() {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .map_err(|err| format!("failed to open log file: {err}"))?;
+        let file = open_private_log_file(log_path)?;
         let _ = LOG_FILE.set(Mutex::new(file));
     }
     log_info!(
@@ -1391,45 +2596,36 @@ fn run() -> Result<(), String> {
         }
     }
 
-    // Write PID file if requested
-    if let Some(pid_path) = args.pid_file.as_ref() {
-        let pid = std::process::id();
-        fs::write(pid_path, format!("{pid}\n"))
-            .map_err(|err| format!("failed to write pid file: {err}"))?;
-    }
+    // Hold an operating-system lock for the process lifetime. A PID-file-only
+    // check races when two instances start together and can also reject an
+    // unrelated process after PID reuse.
+    let _lock_file = acquire_session_lock(&args.download_dir)?;
+    ensure_private_state_directory(&args.download_dir)?;
 
-    // Session locking: prevent multiple instances using same data directory
-    #[cfg(unix)]
-    let _lock_file = {
-        let lock_path = args.download_dir.join(".rustorrent.lock");
-        if lock_path.exists() {
-            if let Ok(contents) = fs::read_to_string(&lock_path) {
-                if let Ok(pid) = contents.trim().parse::<i32>() {
-                    extern "C" {
-                        fn kill(pid: i32, sig: i32) -> i32;
-                    }
-                    if unsafe { kill(pid, 0) } == 0 && pid != std::process::id() as i32 {
-                        return Err(format!(
-                            "another instance (PID {pid}) is using {}",
-                            args.download_dir.display()
-                        ));
-                    }
-                }
-            }
-        }
-        let mut f = fs::File::create(&lock_path).map_err(|e| format!("lock: {e}"))?;
-        write!(f, "{}", std::process::id()).map_err(|e| format!("lock: {e}"))?;
-        Some((f, lock_path))
+    // Write the optional PID file only after this instance owns the session.
+    let _pid_file_guard = if let Some(pid_path) = args.pid_file.as_ref() {
+        let pid = std::process::id();
+        write_atomic_file(
+            pid_path,
+            format!("{pid}\n").as_bytes(),
+            "PID file",
+            false,
+            true,
+        )?;
+        Some(PidFileGuard {
+            path: pid_path.clone(),
+            pid,
+        })
+    } else {
+        None
     };
-    #[cfg(not(unix))]
-    let _lock_file: Option<(fs::File, PathBuf)> = None;
 
     // Initialize seed ratio from CLI args
     if args.seed_ratio > 0.0 {
         SEED_RATIO_BITS.store(args.seed_ratio.to_bits(), Ordering::SeqCst);
     }
     if args.max_seed_time > 0 {
-        MAX_SEED_TIME_SECS.store(args.max_seed_time * 60, Ordering::SeqCst);
+        MAX_SEED_TIME_SECS.store(args.max_seed_time.saturating_mul(60), Ordering::SeqCst);
     }
     if let Some(script) = args.on_complete.clone() {
         let _ = ON_COMPLETE_SCRIPT.set(script);
@@ -1484,8 +2680,10 @@ fn run() -> Result<(), String> {
         args.max_peers_torrent,
     ));
     let peer_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_global()));
+    let global_piece_buffer_budget =
+        Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES));
     let active_torrents = Arc::new(AtomicUsize::new(0));
-    let session_store = Arc::new(SessionStore::load(&args.download_dir));
+    let session_store = Arc::new(SessionStore::load(&args.download_dir)?);
 
     let state = Arc::new(Mutex::new(ui::UiState::default()));
     let ui_state = Some(state.clone());
@@ -1508,11 +2706,10 @@ fn run() -> Result<(), String> {
     });
     let (cmd_tx, cmd_rx) = mpsc::channel::<ui::UiCommand>();
     if args.ui {
-        if let Err(err) = ui::start(args.ui_addr.clone(), state.clone(), Some(cmd_tx.clone())) {
-            log_warn!("ui error: {err}");
-        } else {
-            log_info!("ui: http://{}", args.ui_addr);
-        }
+        search::set_network_enabled(args.proxy.is_none());
+        ui::start(args.ui_addr.clone(), state.clone(), Some(cmd_tx.clone()))
+            .map_err(|err| format!("UI bind {} failed: {err}", args.ui_addr))?;
+        log_info!("ui: http://{}", args.ui_addr);
     }
     if args.ui {
         if let Err(err) = search::prepare(&args.download_dir) {
@@ -1521,7 +2718,7 @@ fn run() -> Result<(), String> {
     }
     if args.ui {
         let search_root = args.download_dir.clone();
-        thread::spawn(move || {
+        spawn_detached("search-refresh", move || {
             if let Err(err) = search::refresh_plugins() {
                 log_warn!("search refresh error: {err}");
                 // Re-prepare to reset state, but don't recurse into refresh_plugins
@@ -1532,12 +2729,24 @@ fn run() -> Result<(), String> {
 
     let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
     let progress_handle = if !args.daemon && !args.tui {
-        Some(start_console_progress(state.clone(), registry.clone()))
+        match start_console_progress(state.clone(), registry.clone()) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                log_warn!("{err}");
+                None
+            }
+        }
     } else {
         None
     };
     let tui_handle = if args.tui {
-        Some(start_tui(state.clone(), cmd_tx.clone()))
+        match start_tui(state.clone(), cmd_tx.clone()) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                log_warn!("{err}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -1565,7 +2774,7 @@ fn run() -> Result<(), String> {
     }
     {
         let rss_path = args.download_dir.join(".rustorrent").join("rss.benc");
-        let mut rss_state = if rss_path.exists() {
+        let mut rss_state = if rss::saved_state_exists(&rss_path) {
             rss::load_rss_state(&rss_path).unwrap_or_else(|err| {
                 log_warn!("rss load error: {err}");
                 rss::RssState::new()
@@ -1573,6 +2782,13 @@ fn run() -> Result<(), String> {
         } else {
             rss::RssState::new()
         };
+        if rss_state.feeds.len().saturating_add(args.rss_feeds.len()) > rss::MAX_RSS_FEEDS
+            || rss_state.rules.len().saturating_add(args.rss_rules.len()) > rss::MAX_RSS_RULES
+        {
+            return Err(
+                "RSS state plus command-line additions exceeds the configured limit".to_string(),
+            );
+        }
         for url in &args.rss_feeds {
             if !rss_state.feeds.iter().any(|f| f.url == *url) {
                 rss_state.feeds.push(rss::RssFeed {
@@ -1582,7 +2798,7 @@ fn run() -> Result<(), String> {
                     last_poll: 0,
                     poll_interval_secs: args.rss_interval,
                 });
-                log_info!("rss added feed: {url}");
+                log_info!("rss added feed: {}", safe_network_url_label(url));
             }
         }
         for (feed_url, pattern) in &args.rss_rules {
@@ -1602,45 +2818,71 @@ fn run() -> Result<(), String> {
         ))),
         active_handlers: Arc::new(AtomicUsize::new(0)),
     };
-    start_inbound_listener(args.port, registry.clone(), inbound.clone());
-    let utp_connector = if args.enable_utp {
+    let direct_discovery = args.proxy.is_none();
+    let inbound_listener_handle = if direct_discovery {
+        match start_inbound_listener(args.port, registry.clone(), inbound.clone()) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                log_warn!("inbound listener failed: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut utp_listener_handle = None;
+    let utp_connector = if args.enable_utp && direct_discovery {
         let (connector, listener) = utp::start(args.port);
-        start_utp_listener(listener, registry.clone(), inbound.clone());
+        match start_utp_listener(listener, registry.clone(), inbound.clone()) {
+            Ok(handle) => utp_listener_handle = Some(handle),
+            Err(err) => {
+                log_warn!("uTP listener failed: {err}");
+            }
+        }
         Some(connector)
     } else {
         None
     };
-    let dht = dht::start(args.port);
-    let lpd = lpd::start();
-    let port = args.port;
-    let mapping_ui = ui_state.clone();
-    thread::spawn(move || {
-        record_port_mapping_result(&mapping_ui, "nat-pmp", port, natpmp::map_port(port, 3600));
-    });
-    let port = args.port;
-    let mapping_ui = ui_state.clone();
-    thread::spawn(move || {
-        record_port_mapping_result(&mapping_ui, "upnp", port, upnp::map_port(port));
-    });
+    let dht = if direct_discovery {
+        // uTP and DHT are different protocols over UDP. Until they share a
+        // demultiplexing socket, reserve the configured/mapped UDP port for
+        // uTP and let DHT advertise its own ephemeral source port.
+        let dht_port = if args.enable_utp { 0 } else { args.port };
+        dht::start(dht_port, &args.download_dir)
+    } else {
+        dht::disabled()
+    };
+    let lpd = if direct_discovery {
+        lpd::start()
+    } else {
+        lpd::disabled()
+    };
+    if direct_discovery {
+        let port = args.port;
+        let mapping_ui = ui_state.clone();
+        spawn_detached("nat-pmp-mapping", move || {
+            record_port_mapping_result(&mapping_ui, "nat-pmp", port, natpmp::map_port(port, 3600));
+        });
+        let port = args.port;
+        let mapping_ui = ui_state.clone();
+        spawn_detached("upnp-mapping", move || {
+            record_port_mapping_result(&mapping_ui, "upnp", port, upnp::map_port(port));
+        });
+    } else {
+        update_ui(&ui_state, |state| {
+            state.natpmp_status = "disabled while proxy is active".to_string();
+            state.upnp_status = "disabled while proxy is active".to_string();
+        });
+    }
 
     let mut queue: VecDeque<TorrentRequest> = VecDeque::new();
+    let in_flight: InFlightTorrents = Arc::new(Mutex::new(HashMap::new()));
     let mut next_id = 1u64;
     let (rss_poll_tx, rss_poll_rx) = mpsc::channel::<RssPollResult>();
     let (rss_download_tx, rss_download_rx) = mpsc::channel::<RssDownloadResult>();
     let mut rss_poll_inflight: HashSet<String> = HashSet::new();
     let mut rss_download_inflight: HashSet<String> = HashSet::new();
-    for entry in session_store.list() {
-        let label = session_entry_label(&entry);
-        let request = TorrentRequest {
-            id: next_id,
-            source: TorrentSource::Bytes(entry.torrent_bytes.clone()),
-            download_dir: entry.download_dir.clone(),
-            preallocate: entry.preallocate,
-            initial_label: entry.label.clone(),
-        };
-        next_id = next_id.saturating_add(1);
-        enqueue_request_with_label(&mut queue, &ui_state, request, label);
-    }
+    restore_session_entries(&session_store, &mut queue, &ui_state, &mut next_id);
     if let Some(link) = args.magnet.clone() {
         let request = TorrentRequest {
             id: next_id,
@@ -1649,8 +2891,17 @@ fn run() -> Result<(), String> {
             preallocate: args.preallocate,
             initial_label: String::new(),
         };
-        next_id = next_id.saturating_add(1);
-        enqueue_request(&mut queue, &ui_state, request);
+        if enqueue_request_if_new(
+            &registry,
+            &mut queue,
+            &session_store,
+            &in_flight,
+            &ui_state,
+            request,
+            None,
+        ) {
+            next_id = next_id.saturating_add(1);
+        }
     }
 
     if let Some(path) = args.torrent_path.clone() {
@@ -1661,8 +2912,17 @@ fn run() -> Result<(), String> {
             preallocate: args.preallocate,
             initial_label: String::new(),
         };
-        next_id = next_id.saturating_add(1);
-        enqueue_request(&mut queue, &ui_state, request);
+        if enqueue_request_if_new(
+            &registry,
+            &mut queue,
+            &session_store,
+            &in_flight,
+            &ui_state,
+            request,
+            None,
+        ) {
+            next_id = next_id.saturating_add(1);
+        }
     }
 
     update_idle_state(&ui_state, &args, queue.len());
@@ -1671,6 +2931,7 @@ fn run() -> Result<(), String> {
     let mut last_watch_scan = Instant::now();
 
     loop {
+        reap_finished_workers(&mut handles, "torrent");
         if !args.watch_dirs.is_empty() && last_watch_scan.elapsed() >= Duration::from_secs(5) {
             for watch_dir in &args.watch_dirs {
                 scan_watch_dir(
@@ -1680,6 +2941,9 @@ fn run() -> Result<(), String> {
                     &mut next_id,
                     &args.download_dir,
                     args.preallocate,
+                    &registry,
+                    &session_store,
+                    &in_flight,
                 );
             }
             last_watch_scan = Instant::now();
@@ -1698,6 +2962,7 @@ fn run() -> Result<(), String> {
             &peer_settings,
             &peer_slots,
             &inbound,
+            &in_flight,
         );
 
         // Scheduled commands
@@ -1728,6 +2993,9 @@ fn run() -> Result<(), String> {
             &mut next_id,
             &mut rss_poll_inflight,
             &mut rss_download_inflight,
+            &registry,
+            &session_store,
+            &in_flight,
         );
         drain_rss_download_results(
             &args,
@@ -1736,13 +3004,38 @@ fn run() -> Result<(), String> {
             &ui_state,
             &mut next_id,
             &mut rss_download_inflight,
+            &registry,
+            &session_store,
+            &in_flight,
         );
 
         let can_start = args.max_active_torrents == 0
             || active_torrents.load(Ordering::SeqCst) < args.max_active_torrents;
         if can_start {
-            if let Some(request) = queue.pop_front() {
+            if let Some(mut request) = queue.pop_front() {
                 let request_id = request.id;
+                let in_flight_guard = match freeze_request_source(&mut request) {
+                    Ok(info_hash) => {
+                        InFlightTorrentGuard::acquire(&in_flight, info_hash, request_id)
+                    }
+                    Err(err) => Err(err),
+                };
+                let in_flight_guard = match in_flight_guard {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        update_ui(&ui_state, |state| {
+                            state.queue_len = queue.len();
+                            state.status = "error".to_string();
+                            state.last_error = err.clone();
+                            update_torrent_entry(state, request_id, |torrent| {
+                                torrent.status = "error".to_string();
+                                torrent.last_error = err.clone();
+                            });
+                        });
+                        continue;
+                    }
+                };
+                let retry_request = request.clone();
                 let is_magnet = matches!(request.source, TorrentSource::Magnet(_));
                 let load_status = if is_magnet {
                     "fetching metadata"
@@ -1772,37 +3065,59 @@ fn run() -> Result<(), String> {
                 let global_up = global_up.clone();
                 let peer_slots = peer_slots.clone();
                 let peer_settings = peer_settings.clone();
-                let handle = thread::spawn(move || {
-                    let _guard = active_guard;
-                    if let Err(err) = run_torrent(
-                        request,
-                        &args_clone,
-                        &ui_clone,
-                        &registry_clone,
-                        &session_clone,
-                        &dht_clone,
-                        &lpd_clone,
-                        utp_clone,
-                        filter_clone,
-                        global_down,
-                        global_up,
-                        peer_settings,
-                        peer_slots,
-                    ) {
-                        log_warn!("torrent error: {err}");
-                        update_ui(&ui_clone, |state| {
-                            state.status = "error".to_string();
-                            state.last_error = err;
-                            let last_error = state.last_error.clone();
+                let global_piece_buffer_budget = Arc::clone(&global_piece_buffer_budget);
+                match thread::Builder::new()
+                    .name(format!("torrent-{request_id}"))
+                    .spawn(move || {
+                        let _in_flight_guard = in_flight_guard;
+                        let _guard = active_guard;
+                        if let Err(err) = run_torrent(
+                            request,
+                            &args_clone,
+                            &ui_clone,
+                            &registry_clone,
+                            &session_clone,
+                            &dht_clone,
+                            &lpd_clone,
+                            utp_clone,
+                            filter_clone,
+                            global_down,
+                            global_up,
+                            peer_settings,
+                            peer_slots,
+                            global_piece_buffer_budget,
+                        ) {
+                            log_warn!("torrent error: {err}");
+                            update_ui(&ui_clone, |state| {
+                                state.status = "error".to_string();
+                                state.last_error = err;
+                                let last_error = state.last_error.clone();
+                                update_torrent_entry(state, request_id, |torrent| {
+                                    torrent.status = "error".to_string();
+                                    torrent.last_error = last_error;
+                                });
+                            });
+                        }
+                    }) {
+                    Ok(handle) => {
+                        handles.push(handle);
+                        continue;
+                    }
+                    Err(err) => {
+                        log_warn!("torrent worker could not start: {err}");
+                        queue.push_front(retry_request);
+                        update_ui(&ui_state, |state| {
+                            state.queue_len = queue.len();
+                            state.status = "queued".to_string();
+                            state.last_error = format!("torrent worker could not start: {err}");
                             update_torrent_entry(state, request_id, |torrent| {
-                                torrent.status = "error".to_string();
-                                torrent.last_error = last_error;
+                                torrent.status = "queued".to_string();
+                                torrent.last_error =
+                                    format!("torrent worker could not start: {err}");
                             });
                         });
                     }
-                });
-                handles.push(handle);
-                continue;
+                }
             }
         }
 
@@ -1814,20 +3129,21 @@ fn run() -> Result<(), String> {
         sleep_with_shutdown(Duration::from_millis(200));
     }
 
+    let shutdown_deadline = Instant::now() + TORRENT_WORKER_SHUTDOWN_TIMEOUT;
     for handle in handles {
-        let _ = handle.join();
+        join_worker_before(handle, "torrent", shutdown_deadline);
+    }
+    if let Some(handle) = inbound_listener_handle {
+        join_worker_before(handle, "TCP listener", shutdown_deadline);
+    }
+    if let Some(handle) = utp_listener_handle {
+        join_worker_before(handle, "uTP listener", shutdown_deadline);
     }
     if let Some(handle) = progress_handle {
-        let _ = handle.join();
+        join_worker_before(handle, "console progress", shutdown_deadline);
     }
     if let Some(handle) = tui_handle {
-        let _ = handle.join();
-    }
-
-    // Clean up lock file
-    #[cfg(unix)]
-    if let Some((_, lock_path)) = _lock_file.as_ref() {
-        let _ = fs::remove_file(lock_path);
+        join_worker_before(handle, "terminal UI", shutdown_deadline);
     }
 
     Ok(())
@@ -1847,6 +3163,7 @@ fn drain_ui_commands(
     peer_settings: &Arc<PeerRuntimeSettings>,
     peer_slots: &Arc<PeerSlots>,
     inbound: &InboundConfig,
+    in_flight: &InFlightTorrents,
 ) {
     loop {
         match rx.try_recv() {
@@ -1865,7 +3182,13 @@ fn drain_ui_commands(
                         initial_label: String::new(),
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
-                        if is_duplicate_torrent(registry, queue, session_store, info_hash) {
+                        if is_duplicate_torrent(
+                            registry,
+                            queue,
+                            session_store,
+                            in_flight,
+                            info_hash,
+                        ) {
                             let message = "torrent already added".to_string();
                             update_ui(ui_state, |state| {
                                 state.last_error = message.clone();
@@ -1898,7 +3221,13 @@ fn drain_ui_commands(
                         initial_label: String::new(),
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
-                        if is_duplicate_torrent(registry, queue, session_store, info_hash) {
+                        if is_duplicate_torrent(
+                            registry,
+                            queue,
+                            session_store,
+                            in_flight,
+                            info_hash,
+                        ) {
                             let message = "torrent already added".to_string();
                             update_ui(ui_state, |state| {
                                 state.last_error = message.clone();
@@ -1924,9 +3253,15 @@ fn drain_ui_commands(
                     let _ = reply.send(result);
                 }
                 ui::UiCommand::ResumeTorrent { torrent_id, reply } => {
-                    let result =
-                        resume_torrent(registry, ui_state, queue, torrent_id, session_store)
-                            .map(|_| ui::UiCommandSuccess::Ok);
+                    let result = resume_torrent(
+                        registry,
+                        ui_state,
+                        queue,
+                        torrent_id,
+                        session_store,
+                        in_flight,
+                    )
+                    .map(|_| ui::UiCommandSuccess::Ok);
                     if let Err(err) = result.as_ref() {
                         log_warn!("resume torrent error: {err}");
                         update_ui(ui_state, |state| {
@@ -1936,8 +3271,15 @@ fn drain_ui_commands(
                     let _ = reply.send(result);
                 }
                 ui::UiCommand::StopTorrent { torrent_id, reply } => {
-                    let result = stop_torrent(registry, ui_state, queue, torrent_id, session_store)
-                        .map(|_| ui::UiCommandSuccess::Ok);
+                    let result = stop_torrent(
+                        registry,
+                        ui_state,
+                        queue,
+                        torrent_id,
+                        session_store,
+                        in_flight,
+                    )
+                    .map(|_| ui::UiCommandSuccess::Ok);
                     if let Err(err) = result.as_ref() {
                         log_warn!("stop torrent error: {err}");
                         update_ui(ui_state, |state| {
@@ -1947,9 +3289,15 @@ fn drain_ui_commands(
                     let _ = reply.send(result);
                 }
                 ui::UiCommand::ArchiveTorrent { torrent_id, reply } => {
-                    let result =
-                        archive_torrent(registry, ui_state, queue, torrent_id, session_store)
-                            .map(|_| ui::UiCommandSuccess::Ok);
+                    let result = archive_torrent(
+                        registry,
+                        ui_state,
+                        queue,
+                        torrent_id,
+                        session_store,
+                        in_flight,
+                    )
+                    .map(|_| ui::UiCommandSuccess::Ok);
                     if let Err(err) = result.as_ref() {
                         log_warn!("archive torrent error: {err}");
                         update_ui(ui_state, |state| {
@@ -1970,6 +3318,7 @@ fn drain_ui_commands(
                         torrent_id,
                         remove_data,
                         session_store,
+                        in_flight,
                     );
                     if let Err(err) = result.as_ref() {
                         log_warn!("delete torrent error: {err}");
@@ -2001,7 +3350,14 @@ fn drain_ui_commands(
                     new_name,
                     reply,
                 } => {
-                    let result = apply_file_rename(registry, torrent_id, file_index, &new_name);
+                    let result = apply_file_rename(
+                        registry,
+                        ui_state,
+                        session_store,
+                        torrent_id,
+                        file_index,
+                        &new_name,
+                    );
                     if let Err(err) = result.as_ref() {
                         log_warn!("file rename error: {err}");
                         update_ui(ui_state, |state| {
@@ -2130,6 +3486,7 @@ fn is_duplicate_torrent(
     registry: &SessionRegistry,
     queue: &VecDeque<TorrentRequest>,
     session_store: &SessionStore,
+    in_flight: &InFlightTorrents,
     info_hash: [u8; 20],
 ) -> bool {
     if let Ok(guard) = registry.lock() {
@@ -2138,6 +3495,9 @@ fn is_duplicate_torrent(
         }
     }
     if session_store.contains(info_hash) {
+        return true;
+    }
+    if lock_or_recover(in_flight).contains_key(&info_hash) {
         return true;
     }
     queue_contains_info_hash(queue, info_hash)
@@ -2160,6 +3520,55 @@ fn session_entry_label(entry: &SessionEntry) -> String {
     }
 }
 
+fn restore_session_entries(
+    session_store: &SessionStore,
+    queue: &mut VecDeque<TorrentRequest>,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    next_id: &mut u64,
+) {
+    for entry in session_store.list() {
+        if entry.pending_delete {
+            match retry_pending_delete(session_store, entry.info_hash) {
+                Ok(()) => continue,
+                Err(err) => {
+                    log_warn!("pending deletion retry failed: {err}");
+                    let torrent_id = *next_id;
+                    *next_id = next_id.saturating_add(1);
+                    update_ui(ui_state, |state| {
+                        update_torrent_entry(state, torrent_id, |torrent| {
+                            torrent.name = session_entry_label(&entry);
+                            torrent.info_hash = hex(&entry.info_hash);
+                            torrent.download_dir = entry.download_dir.display().to_string();
+                            torrent.preallocate = entry.preallocate;
+                            torrent.label = entry.label.clone();
+                            torrent.status = "delete failed".to_string();
+                            torrent.last_error = err.clone();
+                        });
+                    });
+                    continue;
+                }
+            }
+        }
+        let label = session_entry_label(&entry);
+        if queue_contains_info_hash(queue, entry.info_hash) {
+            log_warn!(
+                "duplicate restored session ignored: {}",
+                hex(&entry.info_hash)
+            );
+            continue;
+        }
+        let request = TorrentRequest {
+            id: *next_id,
+            source: TorrentSource::Bytes(entry.torrent_bytes.clone()),
+            download_dir: entry.download_dir.clone(),
+            preallocate: entry.preallocate,
+            initial_label: entry.label.clone(),
+        };
+        *next_id = next_id.saturating_add(1);
+        enqueue_request_with_label(queue, ui_state, request, label);
+    }
+}
+
 fn normalize_download_dir(value: String, fallback: &Path) -> PathBuf {
     if value.trim().is_empty() {
         fallback.to_path_buf()
@@ -2175,6 +3584,40 @@ fn enqueue_request(
 ) {
     let label = label_for_source(&request.source);
     enqueue_request_with_label(queue, ui_state, request, label);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_request_if_new(
+    registry: &SessionRegistry,
+    queue: &mut VecDeque<TorrentRequest>,
+    session_store: &SessionStore,
+    in_flight: &InFlightTorrents,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    mut request: TorrentRequest,
+    label: Option<String>,
+) -> bool {
+    let info_hash = match freeze_request_source(&mut request) {
+        Ok(info_hash) => info_hash,
+        Err(err) => {
+            update_ui(ui_state, |state| {
+                state.status = "error".to_string();
+                state.last_error = err.clone();
+                update_torrent_entry(state, request.id, |torrent| {
+                    torrent.status = "error".to_string();
+                    torrent.last_error = err.clone();
+                });
+            });
+            return false;
+        }
+    };
+    if is_duplicate_torrent(registry, queue, session_store, in_flight, info_hash) {
+        return false;
+    }
+    match label {
+        Some(label) => enqueue_request_with_label(queue, ui_state, request, label),
+        None => enqueue_request(queue, ui_state, request),
+    }
+    true
 }
 
 fn enqueue_request_with_label(
@@ -2250,6 +3693,47 @@ fn update_idle_state(ui_state: &Option<Arc<Mutex<ui::UiState>>>, args: &Args, qu
 
 #[allow(clippy::too_many_arguments)]
 fn run_torrent(
+    mut request: TorrentRequest,
+    args: &Args,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    registry: &SessionRegistry,
+    session_store: &Arc<SessionStore>,
+    dht: &dht::Dht,
+    lpd: &lpd::Lpd,
+    utp: Option<utp::UtpConnector>,
+    ip_filter: Option<Arc<IpFilter>>,
+    global_down: Arc<RateLimiter>,
+    global_up: Arc<RateLimiter>,
+    peer_settings: Arc<PeerRuntimeSettings>,
+    peer_slots: Arc<PeerSlots>,
+    global_piece_buffer_budget: Arc<piece::PieceBufferBudget>,
+) -> Result<(), String> {
+    loop {
+        let next = run_torrent_once(
+            request,
+            args,
+            ui_state,
+            registry,
+            session_store,
+            dht,
+            lpd,
+            utp.clone(),
+            ip_filter.clone(),
+            Arc::clone(&global_down),
+            Arc::clone(&global_up),
+            Arc::clone(&peer_settings),
+            Arc::clone(&peer_slots),
+            Arc::clone(&global_piece_buffer_budget),
+        )?;
+        match next {
+            Some(next) if !shutdown_requested() => request = next,
+            _ => return Ok(()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_torrent_once(
     request: TorrentRequest,
     args: &Args,
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
@@ -2263,7 +3747,9 @@ fn run_torrent(
     global_up: Arc<RateLimiter>,
     peer_settings: Arc<PeerRuntimeSettings>,
     peer_slots: Arc<PeerSlots>,
-) -> Result<(), String> {
+    global_piece_buffer_budget: Arc<piece::PieceBufferBudget>,
+) -> Result<Option<TorrentRequest>, String> {
+    let mut request = request;
     let connect_cfg = ConnectionConfig {
         encryption: args.encryption,
         utp,
@@ -2271,7 +3757,9 @@ fn run_torrent(
         proxy: args.proxy.clone(),
     };
     if args.proxy.is_some() {
-        log_info!("proxy: configured, disabling DHT/UTP/UDP trackers");
+        log_info!(
+            "proxy: outbound peer TCP enabled; inbound peers, DHT/LPD/uTP/UDP trackers disabled"
+        );
     }
     let data = resolve_torrent_data(
         &request,
@@ -2281,8 +3769,16 @@ fn run_torrent(
         peer_settings.metadata_peer_limit(),
     )?;
     let meta = torrent::parse_torrent(&data).map_err(|err| format!("parse error: {err}"))?;
-    let file_spans = Arc::new(build_file_spans(&meta));
-    let resume_path = resume_path(&request.download_dir, meta.info_hash);
+    ensure_private_state_directory(&request.download_dir)?;
+    let hybrid_v2_info_hash = if meta.meta_version == 3 {
+        meta.info_hash_v2.map(truncate_v2_info_hash)
+    } else {
+        None
+    };
+    let file_spans = Arc::new(build_file_spans(&meta)?);
+    let v2_hashes = Arc::new(V2HashStore::new(&meta)?);
+    let getright_multi_file = is_getright_multi_file(&meta);
+    let mut resume_path = resume_path(&request.download_dir, meta.info_hash);
     let resume_data = load_resume_data_with_recovery(&resume_path).and_then(|data| {
         if data.info_hash == meta.info_hash {
             Some(data)
@@ -2294,12 +3790,126 @@ fn run_torrent(
             None
         }
     });
-    let mut file_priorities = vec![piece::PRIORITY_NORMAL; file_spans.len()];
+    let mut file_priorities = file_spans
+        .iter()
+        .map(|span| {
+            if span.is_padding {
+                piece::PRIORITY_SKIP
+            } else {
+                piece::PRIORITY_NORMAL
+            }
+        })
+        .collect::<Vec<_>>();
     if let Some(resume) = resume_data.as_ref() {
         if resume.file_priorities.len() == file_priorities.len() {
             file_priorities.clone_from(&resume.file_priorities);
         }
     }
+    for (priority, span) in file_priorities.iter_mut().zip(file_spans.iter()) {
+        if span.is_padding {
+            *priority = piece::PRIORITY_SKIP;
+        }
+    }
+    // Reconciliation and the durable claim are one lifecycle transaction.
+    // Once the claim is saved, every later rename/move/delete transition is
+    // serialized by the same operation lock.
+    let storage_claim_operation = session_store.lock_operation();
+    let session_entry = session_store.get(meta.info_hash);
+    if session_entry.is_some() {
+        session_store.validate_current_storage_claim(meta.info_hash)?;
+    }
+    if session_entry
+        .as_ref()
+        .is_some_and(|entry| entry.pending_delete)
+    {
+        return Err("torrent deletion is pending".to_string());
+    }
+    let legacy_resume_renames = resume_data
+        .as_ref()
+        .map(|resume| resume.file_renames.clone())
+        .unwrap_or_default();
+    let mut saved_renames = session_entry
+        .as_ref()
+        .filter(|entry| !entry.file_renames.is_empty())
+        .map(|entry| entry.file_renames.clone())
+        .unwrap_or_else(|| legacy_resume_renames.clone());
+    saved_renames.sort_unstable_by_key(|(index, _)| *index);
+    if session_entry
+        .as_ref()
+        .is_some_and(|entry| entry.pending_file_rename.is_some())
+    {
+        let entry = session_store
+            .get(meta.info_hash)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        saved_renames =
+            reconcile_pending_file_rename(&meta, &request.download_dir, session_store, &entry)?;
+    }
+    let initial_renames: HashMap<usize, String> = saved_renames.iter().cloned().collect();
+    let mut completion_move_reconciled = false;
+    if session_store.completion_state(meta.info_hash) == Some(CompletionState::Pending) {
+        let entry = session_store
+            .get(meta.info_hash)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if entry.pending_delete {
+            return Err("torrent deletion is pending".to_string());
+        }
+        if let Some(dest) = entry.completion_move_dir {
+            let source_override =
+                single_file_source_override(&meta, &request.download_dir, &saved_renames)?;
+            let completed_move = completed_move_paths(
+                &meta,
+                &request.download_dir,
+                &dest,
+                source_override.as_deref(),
+            )?;
+            if let CompletionMoveRecovery::AdoptDestination { remove_source } =
+                completion_move_recovery(&meta, &dest, &saved_renames, &completed_move)?
+            {
+                if remove_source {
+                    let source_paths = if saved_renames.is_empty() {
+                        storage::data_paths(&meta, &request.download_dir)
+                    } else {
+                        storage::data_paths_with_file_renames(
+                            &meta,
+                            &request.download_dir,
+                            &saved_renames,
+                        )
+                    }
+                    .map_err(|err| format!("completion source paths: {err}"))?;
+                    delete_storage_paths(&request.download_dir, &source_paths)?;
+                }
+                // Source cleanup precedes the durable directory switch. If the
+                // process stops between these steps, the still-pending journal
+                // will verify and adopt the destination again on next launch.
+                // Committing first would lose the only durable evidence that
+                // duplicate source files still need cleanup.
+                if !session_store.commit_completion_move(meta.info_hash, &dest)? {
+                    return Err("completion move state changed during recovery".to_string());
+                }
+                let relocated_resume = crate::resume_path(&dest, meta.info_hash);
+                if let Err(err) = relocate_resume_state(&resume_path, &relocated_resume) {
+                    log_warn!("move-completed resume relocation failed: {err}");
+                }
+                resume_path = relocated_resume;
+                request.download_dir = dest;
+                completion_move_reconciled = true;
+                log_info!(
+                    "reconciled completed move at {}",
+                    completed_move.destination.display()
+                );
+            }
+        }
+    }
+    let name = String::from_utf8_lossy(&meta.info.name).into_owned();
+    session_store.upsert_with_storage_claim(
+        meta.info_hash,
+        name.clone(),
+        data.clone(),
+        &request.download_dir,
+        request.preallocate,
+        &saved_renames,
+    )?;
+    drop(storage_claim_operation);
     let mut pieces =
         piece::PieceManager::new(&meta).map_err(|err| format!("piece error: {err}"))?;
     pieces.set_sequential(args.sequential);
@@ -2310,14 +3920,20 @@ fn run_torrent(
         meta.info.piece_length,
     )
     .map_err(|err| format!("priority error: {err}"))?;
-    let mut storage = storage::Storage::new(
-        &meta,
-        &request.download_dir,
-        storage::StorageOptions {
-            preallocate: request.preallocate,
-            write_cache_bytes: args.write_cache_bytes,
-        },
-    )
+    let storage_options = storage::StorageOptions {
+        preallocate: request.preallocate,
+        write_cache_bytes: args.write_cache_bytes,
+    };
+    let mut storage = if saved_renames.is_empty() {
+        storage::Storage::new(&meta, &request.download_dir, storage_options)
+    } else {
+        storage::Storage::new_with_file_renames(
+            &meta,
+            &request.download_dir,
+            storage_options,
+            &saved_renames,
+        )
+    }
     .map_err(|err| format!("storage error: {err}"))?;
     let peer_id = generate_peer_id();
 
@@ -2326,7 +3942,6 @@ fn run_torrent(
         &mut storage,
         meta.info.piece_length,
         &file_spans,
-        &request.download_dir,
         resume_data.as_ref(),
     )
     .map_err(|err| format!("resume error: {err}"))?;
@@ -2346,19 +3961,78 @@ fn run_torrent(
         torrent_up,
     };
 
-    let name = String::from_utf8_lossy(&meta.info.name).into_owned();
-    session_store.upsert(
-        meta.info_hash,
-        name.clone(),
-        data.clone(),
-        &request.download_dir,
-        request.preallocate,
-    );
+    let initial_complete = pieces.is_complete();
+    if completion_move_reconciled {
+        if let Some(script) = ON_COMPLETE_SCRIPT.get() {
+            spawn_on_complete_script(
+                script,
+                &name,
+                &request.download_dir,
+                meta.info_hash,
+                meta.info.total_length(),
+            );
+        }
+    }
+    let mut completion_state = session_store
+        .completion_state(meta.info_hash)
+        .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+    let mut completion_move_dir = session_store.completion_move_dir(meta.info_hash);
+    let mut completion_move_pending = false;
+    match completion_action(
+        completion_state,
+        initial_complete,
+        initial_complete,
+        if completion_state == CompletionState::Pending {
+            completion_move_dir.is_some()
+        } else {
+            args.move_completed.is_some()
+        },
+    ) {
+        CompletionAction::None => {}
+        CompletionAction::MarkDone => {
+            if session_store.transition_completion_state(
+                meta.info_hash,
+                CompletionState::None,
+                CompletionState::Done,
+            )? {
+                completion_state = CompletionState::Done;
+                completion_move_dir = None;
+            }
+        }
+        CompletionAction::RunScript => {
+            // A persisted pending state is recovery evidence from a real prior
+            // incomplete -> complete transition. Mark it done before launching
+            // the external process so the hook is explicitly at-most-once.
+            if session_store.transition_completion_state(
+                meta.info_hash,
+                CompletionState::Pending,
+                CompletionState::Done,
+            )? {
+                completion_state = CompletionState::Done;
+                completion_move_dir = None;
+                if let Some(script) = ON_COMPLETE_SCRIPT.get() {
+                    spawn_on_complete_script(
+                        script,
+                        &name,
+                        &request.download_dir,
+                        meta.info_hash,
+                        meta.info.total_length(),
+                    );
+                }
+            }
+        }
+        CompletionAction::Move => {
+            completion_move_pending = true;
+        }
+    }
     let file_priorities = Arc::new(Mutex::new(file_priorities));
     let downloaded = Arc::new(AtomicU64::new(resume_downloaded));
     let uploaded = Arc::new(AtomicU64::new(resume_uploaded));
     let paused_flag = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(AtomicBool::new(false));
+    if completion_move_pending {
+        stop_flag.store(true, Ordering::SeqCst);
+    }
     let peer_queue = Arc::new(Mutex::new(PeerQueue::new_with_local_addrs(
         ip_filter.clone(),
         local_peer_addrs(args.port),
@@ -2374,21 +4048,22 @@ fn run_torrent(
             }
         }
     }
-    let ui_files = build_ui_files(
-        &file_spans,
-        &pieces,
-        meta.info.piece_length,
-        &lock_or_recover(&file_priorities),
-    );
+    let mut ui_files = build_ui_files(&file_spans, &pieces, &lock_or_recover(&file_priorities));
+    apply_ui_file_renames(&mut ui_files, &initial_renames);
     let announce = meta
         .announce
         .as_ref()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .map(|bytes| safe_network_url_label(&String::from_utf8_lossy(bytes)))
         .unwrap_or_else(|| "<none>".to_string());
     let trackers = collect_trackers(&meta);
-    let web_seeds = collect_web_seeds(&meta);
+    let web_seeds = if args.proxy.is_none() {
+        collect_web_seeds(&meta)
+    } else {
+        Vec::new()
+    };
 
-    log_info!("name: {name}");
+    let log_name = tracker::sanitize_failure_reason(name.as_bytes());
+    log_info!("name: {log_name}");
     log_info!("announce: {announce}");
     log_info!(
         "trackers: {} (http={}, udp={})",
@@ -2468,25 +4143,28 @@ fn run_torrent(
     let pieces = Arc::new(Mutex::new(pieces));
     let storage = Arc::new(Mutex::new(storage));
     let completed_log = Arc::new(Mutex::new(Vec::new()));
+    let piece_buffer_budgets = piece::PieceBufferBudgets::new(
+        Arc::clone(&global_piece_buffer_budget),
+        Arc::new(piece::PieceBufferBudget::new(
+            MAX_TORRENT_PIECE_BUFFER_BYTES,
+        )),
+    );
     let peer_tags = Arc::new(AtomicU64::new(1));
     let upload_manager = Arc::new(UploadManager::new(UPLOAD_SLOTS));
     let active_peers = Arc::new(AtomicUsize::new(0));
     let interested_peers = Arc::new(AtomicUsize::new(0));
     let upload_requests_served = Arc::new(AtomicU64::new(0));
     let shared_trackers = Arc::new(Mutex::new(trackers.clone()));
-    let initial_renames: HashMap<usize, String> = resume_data
-        .as_ref()
-        .map(|r| r.file_renames.iter().cloned().collect())
-        .unwrap_or_default();
     let context = Arc::new(TorrentContext {
         id: request.id,
         info_hash: meta.info_hash,
+        hybrid_v2_info_hash,
         peer_id,
-        download_dir: request.download_dir.clone(),
         pieces: Arc::clone(&pieces),
         storage: Arc::clone(&storage),
         completed_log: Arc::clone(&completed_log),
         base_piece_length: meta.info.piece_length,
+        v2_hashes: Arc::clone(&v2_hashes),
         file_spans: Arc::clone(&file_spans),
         file_priorities: Arc::clone(&file_priorities),
         limits: limits.clone(),
@@ -2497,51 +4175,95 @@ fn run_torrent(
         upload_requests_served: Arc::clone(&upload_requests_served),
         paused: Arc::clone(&paused_flag),
         stop_requested: Arc::clone(&stop_flag),
+        allow_completion_reentry: Arc::new(AtomicBool::new(true)),
+        rechecking: Arc::new(AtomicBool::new(false)),
+        resume_save_requested: Arc::new(AtomicBool::new(false)),
+        delete_data_requested: Arc::new(AtomicBool::new(false)),
+        archive_requested: Arc::new(AtomicBool::new(false)),
+        teardown_failed: Arc::new(AtomicBool::new(false)),
         upload_manager: Arc::clone(&upload_manager),
         peer_tags: Arc::clone(&peer_tags),
+        peer_cancellations: Arc::new(Mutex::new(HashMap::new())),
         label: Arc::new(Mutex::new(request.initial_label.clone())),
         trackers: Arc::clone(&shared_trackers),
         throttle_group: Arc::new(Mutex::new(None)),
         ratio_group: Arc::new(Mutex::new(None)),
         file_renames: Arc::new(Mutex::new(initial_renames)),
     });
-    register_session(registry, Arc::clone(&context));
-    let resume_handle = start_resume_worker(
+    register_session(registry, Arc::clone(&context))?;
+    let resume_handle = match start_resume_worker(
         resume_path.clone(),
         meta.info_hash,
         meta.info.piece_length,
         Arc::clone(&pieces),
+        Arc::clone(&storage),
         Arc::clone(&file_priorities),
         Arc::clone(&file_spans),
-        request.download_dir.clone(),
         Arc::clone(&downloaded),
         Arc::clone(&uploaded),
         Arc::clone(&peer_queue),
         Arc::clone(&stop_flag),
         Arc::clone(&context.file_renames),
-    );
-    let webseed_handle = start_webseed_worker(
+        Arc::clone(&context.resume_save_requested),
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            unregister_session(registry, meta.info_hash, request.id);
+            return Err(err);
+        }
+    };
+    let webseed_handle = match start_webseed_worker(
         web_seeds.clone(),
         Arc::clone(&pieces),
         Arc::clone(&storage),
         Arc::clone(&completed_log),
         Arc::clone(&file_spans),
+        getright_multi_file,
         meta.info.piece_length,
+        meta.info_hash,
         limits.clone(),
         Arc::clone(&downloaded),
         Arc::clone(&stop_flag),
+        piece_buffer_budgets.clone(),
         ui_state.clone(),
         request.id,
-    );
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            stop_flag.store(true, Ordering::SeqCst);
+            let stopped = join_worker_before(
+                resume_handle,
+                "resume",
+                Instant::now() + TORRENT_WORKER_SHUTDOWN_TIMEOUT,
+            );
+            if stopped {
+                unregister_session(registry, meta.info_hash, request.id);
+            } else {
+                retain_context_after_teardown_failure(registry, &context);
+            }
+            return Err(err);
+        }
+    };
 
-    let has_network_sources = !trackers.http.is_empty()
-        || !trackers.udp.is_empty()
-        || !meta.info.private
+    let decentralized_discovery = !meta.info.private && args.proxy.is_none();
+    let has_network_sources = tracker_set_has_usable_source(&trackers, args.proxy.is_none())
+        || decentralized_discovery
         || !web_seeds.is_empty();
-    if has_network_sources {
+    if !has_network_sources {
+        log_warn!(
+            "torrent has no outbound discovery source; waiting for an inbound peer or stop request"
+        );
+    }
+    let mut discovery_handles = Vec::new();
+    let mut resource_workers_stopped = true;
+    let mut was_complete = initial_complete;
+    {
         let total_length = wanted_bytes;
         let mut started = true;
-        let mut completed_sent = false;
+        // A resumed/pre-seeded torrent did not complete in this process. Only
+        // emit the tracker completed event for a live incomplete -> complete
+        // transition, including the run immediately before a completion move.
+        let mut completed_sent = initial_complete;
         let mut interval = 1800u64; // Default to 30 minutes
         let mut last_announce = Instant::now() - Duration::from_secs(interval + 1); // Force first announce
         let mut rate_last_at = Instant::now();
@@ -2554,7 +4276,6 @@ fn run_torrent(
             std::collections::VecDeque::new();
         let mut up_snapshots: std::collections::VecDeque<(u64, Instant)> =
             std::collections::VecDeque::new();
-        let has_trackers = !trackers.http.is_empty() || !trackers.udp.is_empty();
         // Track per-tracker failures for exponential backoff: url -> (fail_count, last_failure)
         let mut tracker_failures: HashMap<String, (u32, Instant)> = HashMap::new();
         let per_torrent_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_torrent()));
@@ -2564,7 +4285,7 @@ fn run_torrent(
         if meta.info.private {
             log_info!("private torrent: DHT/PEX/LPD disabled");
         }
-        let dht_rx = if !meta.info.private {
+        let dht_rx = if decentralized_discovery {
             let (tx, rx) = mpsc::channel();
             dht.add_torrent(meta.info_hash, args.port, tx);
             Some(rx)
@@ -2573,17 +4294,22 @@ fn run_torrent(
         };
         if let Some(rx) = dht_rx {
             let queue_clone = Arc::clone(&peer_queue);
-            thread::Builder::new()
+            match thread::Builder::new()
+                .name(format!("dht-peers-{torrent_id}"))
                 .stack_size(PEER_THREAD_STACK)
                 .spawn(move || {
                     for peers in rx {
                         let mut queue = lock_or_recover(&queue_clone);
                         queue.enqueue_with_source(peers, PeerSource::Dht);
                     }
-                })
-                .unwrap();
+                }) {
+                Ok(handle) => discovery_handles.push(handle),
+                Err(err) => {
+                    log_warn!("DHT peer receiver could not start: {err}");
+                }
+            }
         }
-        let lpd_rx = if !meta.info.private {
+        let lpd_rx = if decentralized_discovery {
             let (tx, rx) = mpsc::channel();
             lpd.add_torrent(meta.info_hash, args.port, tx);
             Some(rx)
@@ -2592,22 +4318,27 @@ fn run_torrent(
         };
         if let Some(rx) = lpd_rx {
             let queue_clone = Arc::clone(&peer_queue);
-            thread::Builder::new()
+            match thread::Builder::new()
+                .name(format!("lpd-peers-{torrent_id}"))
                 .stack_size(PEER_THREAD_STACK)
                 .spawn(move || {
                     for peers in rx {
                         let mut queue = lock_or_recover(&queue_clone);
                         queue.enqueue_with_source(peers, PeerSource::Lpd);
                     }
-                })
-                .unwrap();
+                }) {
+                Ok(handle) => discovery_handles.push(handle),
+                Err(err) => {
+                    log_warn!("LPD peer receiver could not start: {err}");
+                }
+            }
         }
 
         let mut handles = Vec::new();
-        let mut worker_count = 0usize;
 
         let mut seed_start: Option<Instant> = None;
         while !torrent_stop_requested(&stop_flag) {
+            reap_finished_workers(&mut handles, "peer");
             let desired_workers = peer_settings.max_peers_torrent();
             let startup_burst = downloaded.load(Ordering::SeqCst) < STARTUP_BURST_BYTES;
             let live_target = if startup_burst {
@@ -2619,7 +4350,7 @@ fn run_torrent(
                 desired_workers
             };
             per_torrent_slots.set_max(live_target);
-            while worker_count < live_target {
+            while handles.len() < live_target {
                 let pieces_clone = Arc::clone(&pieces);
                 let storage_clone = Arc::clone(&storage);
                 let completed_clone = Arc::clone(&completed_log);
@@ -2629,9 +4360,11 @@ fn run_torrent(
                 let upload_requests_clone = Arc::clone(&upload_requests_served);
                 let tags_clone = Arc::clone(&peer_tags);
                 let file_spans = Arc::clone(&file_spans);
+                let v2_hashes = Arc::clone(&v2_hashes);
                 let downloaded = Arc::clone(&downloaded);
                 let uploaded = Arc::clone(&uploaded);
                 let upload_manager = Arc::clone(&upload_manager);
+                let peer_cancellations = Arc::clone(&context.peer_cancellations);
                 let paused_flag = Arc::clone(&paused_flag);
                 let stop_flag = Arc::clone(&stop_flag);
                 let ui_clone = ui_state.clone();
@@ -2641,12 +4374,15 @@ fn run_torrent(
                 let limits = limits.clone();
                 let peer_slots = Arc::clone(&peer_slots);
                 let per_torrent_slots = Arc::clone(&per_torrent_slots);
+                let piece_buffer_budgets = piece_buffer_budgets.clone();
 
-                let handle = thread::Builder::new()
+                let spawn_result = thread::Builder::new()
+                    .name(format!("peer-{torrent_id}-{}", handles.len()))
                     .stack_size(PEER_THREAD_STACK)
                     .spawn(move || {
                         peer_worker_loop(
                             info_hash,
+                            hybrid_v2_info_hash,
                             peer_id,
                             torrent_id,
                             &tags_clone,
@@ -2660,27 +4396,162 @@ fn run_torrent(
                             &upload_requests_clone,
                             &file_spans,
                             base_piece_length,
+                            &v2_hashes,
                             connect_cfg,
                             limits,
                             &downloaded,
                             &uploaded,
                             &upload_manager,
+                            &peer_cancellations,
                             &paused_flag,
                             &stop_flag,
                             peer_slots,
                             per_torrent_slots,
+                            piece_buffer_budgets,
                             &ui_clone,
                         );
-                    })
-                    .unwrap();
-                handles.push(handle);
-                worker_count += 1;
+                    });
+                match spawn_result {
+                    Ok(handle) => handles.push(handle),
+                    Err(err) => {
+                        log_warn!("peer worker could not start: {err}");
+                        break;
+                    }
+                }
             }
 
             let (is_complete, completed_pieces, completed_bytes) = {
                 let p = lock_or_recover(&pieces);
                 (p.is_complete(), p.completed_pieces(), p.completed_bytes())
             };
+            let mut completion_recorded = true;
+            match completion_action(
+                completion_state,
+                was_complete,
+                is_complete,
+                if completion_state == CompletionState::Pending {
+                    completion_move_dir.is_some()
+                } else {
+                    args.move_completed.is_some()
+                },
+            ) {
+                CompletionAction::None => {}
+                CompletionAction::MarkDone => {
+                    match session_store.transition_completion_state(
+                        meta.info_hash,
+                        CompletionState::None,
+                        CompletionState::Done,
+                    ) {
+                        Ok(true) => {
+                            completion_state = CompletionState::Done;
+                            completion_move_dir = None;
+                        }
+                        Ok(false) => {
+                            completion_state = session_store
+                                .completion_state(meta.info_hash)
+                                .unwrap_or(completion_state);
+                            completion_move_dir = session_store.completion_move_dir(meta.info_hash);
+                        }
+                        Err(err) => {
+                            completion_recorded = false;
+                            log_warn!("completion state save failed: {err}");
+                        }
+                    }
+                }
+                CompletionAction::RunScript => {
+                    if completion_state == CompletionState::None {
+                        let begin_result = {
+                            let _operation = session_store.lock_operation();
+                            session_store.begin_completion(meta.info_hash, None)
+                        };
+                        match begin_result {
+                            Ok(true) => {
+                                completion_state = CompletionState::Pending;
+                                completion_move_dir = None;
+                            }
+                            Ok(false) => {
+                                completion_state = session_store
+                                    .completion_state(meta.info_hash)
+                                    .unwrap_or(completion_state);
+                                completion_move_dir =
+                                    session_store.completion_move_dir(meta.info_hash);
+                            }
+                            Err(err) => {
+                                completion_recorded = false;
+                                log_warn!("completion pending save failed: {err}");
+                            }
+                        }
+                    }
+                    if completion_recorded && completion_state == CompletionState::Pending {
+                        match session_store.transition_completion_state(
+                            meta.info_hash,
+                            CompletionState::Pending,
+                            CompletionState::Done,
+                        ) {
+                            Ok(true) => {
+                                completion_state = CompletionState::Done;
+                                completion_move_dir = None;
+                                if let Some(script) = ON_COMPLETE_SCRIPT.get() {
+                                    spawn_on_complete_script(
+                                        script,
+                                        &name,
+                                        &request.download_dir,
+                                        meta.info_hash,
+                                        meta.info.total_length(),
+                                    );
+                                }
+                            }
+                            Ok(false) => {
+                                completion_state = session_store
+                                    .completion_state(meta.info_hash)
+                                    .unwrap_or(completion_state);
+                                completion_move_dir =
+                                    session_store.completion_move_dir(meta.info_hash);
+                            }
+                            Err(err) => {
+                                log_warn!("completion done save failed: {err}");
+                            }
+                        }
+                    }
+                }
+                CompletionAction::Move => {
+                    if completion_state == CompletionState::None {
+                        let begin_result = {
+                            let _operation = session_store.lock_operation();
+                            session_store
+                                .begin_completion(meta.info_hash, args.move_completed.as_deref())
+                        };
+                        match begin_result {
+                            Ok(true) => {
+                                completion_state = CompletionState::Pending;
+                                completion_move_dir =
+                                    session_store.completion_move_dir(meta.info_hash);
+                            }
+                            Ok(false) => {
+                                completion_state = session_store
+                                    .completion_state(meta.info_hash)
+                                    .unwrap_or(completion_state);
+                                completion_move_dir =
+                                    session_store.completion_move_dir(meta.info_hash);
+                            }
+                            Err(err) => {
+                                completion_recorded = false;
+                                log_warn!("completion pending save failed: {err}");
+                            }
+                        }
+                    }
+                    if completion_recorded && completion_state == CompletionState::Pending {
+                        completion_move_pending = true;
+                        // Moving open content while peer and resume workers are active
+                        // creates races. Stop this torrent and move only after all workers
+                        // below have joined.
+                        stop_flag.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+            if completion_recorded || !is_complete {
+                was_complete = is_complete;
+            }
             let downloaded = downloaded.load(Ordering::SeqCst);
             let uploaded = uploaded.load(Ordering::SeqCst);
             let left = total_length.saturating_sub(completed_bytes);
@@ -2713,8 +4584,9 @@ fn run_torrent(
                     if snaps.len() < 2 {
                         return 0.0;
                     }
-                    let first = snaps.front().unwrap();
-                    let last = snaps.back().unwrap();
+                    let (Some(first), Some(last)) = (snaps.front(), snaps.back()) else {
+                        return 0.0;
+                    };
                     let elapsed = last.1.duration_since(first.1).as_secs_f64();
                     if elapsed < 0.1 {
                         return 0.0;
@@ -2754,6 +4626,12 @@ fn run_torrent(
             let seed_needs_peers = is_complete
                 && active_count < LOW_PEER_THRESHOLD
                 && time_since_announce >= SEED_REANNOUNCE_SECS;
+            // Tracker edits are live. In particular, adding the first tracker
+            // to a trackerless torrent must make the pending `started`
+            // announce eligible without restarting the torrent.
+            let current_trackers = lock_or_recover(&shared_trackers).clone();
+            let has_trackers =
+                tracker_set_has_usable_source(&current_trackers, args.proxy.is_none());
             let should_announce = has_trackers
                 && (started
                     || completed_pending
@@ -2784,10 +4662,10 @@ fn run_torrent(
                 } else {
                     None
                 };
+                let sent_completed_event = event == Some("completed");
                 log_info!("announcing to trackers...");
                 let announce_numwant = peer_settings.numwant();
 
-                let current_trackers = lock_or_recover(&shared_trackers).clone();
                 // Filter out trackers in backoff period
                 let filtered_trackers = {
                     let now = Instant::now();
@@ -2798,7 +4676,8 @@ fn run_torrent(
                                     300u64.min(30u64.saturating_mul(1u64 << failures.min(10)));
                                 if now.duration_since(last_fail).as_secs() < backoff {
                                     log_debug!(
-                                        "skipping backed-off tracker {url} (failures={failures})"
+                                        "skipping backed-off tracker {} (failures={failures})",
+                                        safe_network_url_label(url)
                                     );
                                     return true;
                                 }
@@ -2813,12 +4692,16 @@ fn run_torrent(
                             .filter(|u| !should_skip(u))
                             .cloned()
                             .collect(),
-                        udp: current_trackers
-                            .udp
-                            .iter()
-                            .filter(|u| !should_skip(u))
-                            .cloned()
-                            .collect(),
+                        udp: if args.proxy.is_none() {
+                            current_trackers
+                                .udp
+                                .iter()
+                                .filter(|u| !should_skip(u))
+                                .cloned()
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
                     }
                 };
                 let (announce_rx, mut announce_pending) = spawn_tracker_announces(
@@ -2832,6 +4715,7 @@ fn run_torrent(
                     event,
                     announce_numwant,
                     meta.info.private,
+                    args.proxy.clone(),
                     TRACKER_ANNOUNCE_WAIT_BUDGET,
                 );
                 let announce_deadline = Instant::now() + TRACKER_ANNOUNCE_WAIT_BUDGET;
@@ -2859,13 +4743,13 @@ fn run_torrent(
                                     if result.is_udp {
                                         log_info!(
                                             "udp tracker {} returned {} peers",
-                                            result.tracker_url,
+                                            safe_network_url_label(&result.tracker_url),
                                             response.peers.len()
                                         );
                                     } else {
                                         log_info!(
                                             "tracker {} returned {} peers",
-                                            result.tracker_url,
+                                            safe_network_url_label(&result.tracker_url),
                                             response.peers.len()
                                         );
                                     }
@@ -2882,7 +4766,10 @@ fn run_torrent(
                                         .or_insert((0, Instant::now()));
                                     entry.0 = entry.0.saturating_add(1);
                                     entry.1 = Instant::now();
-                                    let err = format!("{}: {err}", result.tracker_url);
+                                    let err = format!(
+                                        "{}: {err}",
+                                        safe_network_url_label(&result.tracker_url)
+                                    );
                                     if result.is_udp {
                                         log_warn!("udp tracker error: {err}");
                                     } else {
@@ -2933,7 +4820,7 @@ fn run_torrent(
                 }
                 last_announce = Instant::now();
                 started = false;
-                if completed_pending && any_success {
+                if sent_completed_event && any_success {
                     completed_sent = true;
                 }
             }
@@ -3036,7 +4923,16 @@ fn run_torrent(
             sleep_with_shutdown_or_stop(TORRENT_LOOP_INTERVAL, &stop_flag);
         }
 
-        if has_trackers {
+        // Closing cloned TCP handles wakes peers that are blocked in a read,
+        // write, or handshake. uTP and any other worker still have the bounded
+        // join/resource-drain fallback below.
+        cancel_peer_connections(&context.peer_cancellations);
+
+        let mut stop_trackers = lock_or_recover(&shared_trackers).clone();
+        if args.proxy.is_some() {
+            stop_trackers.udp.clear();
+        }
+        if tracker_set_has_usable_source(&stop_trackers, args.proxy.is_none()) {
             let completed_bytes = {
                 let p = lock_or_recover(&pieces);
                 p.completed_bytes()
@@ -3044,48 +4940,187 @@ fn run_torrent(
             let downloaded = downloaded.load(Ordering::SeqCst);
             let uploaded = uploaded.load(Ordering::SeqCst);
             let left = total_length.saturating_sub(completed_bytes);
-            let stop_trackers = lock_or_recover(&shared_trackers).clone();
             let stop_numwant = peer_settings.numwant();
             log_info!("sending tracker stopped event...");
-            for tracker_url in &stop_trackers.http {
-                let _ = tracker::announce_with_private(
-                    tracker_url,
-                    meta.info_hash,
-                    peer_id,
-                    args.port,
-                    uploaded,
-                    downloaded,
-                    left,
-                    Some("stopped"),
-                    stop_numwant,
-                    meta.info.private,
-                );
-            }
-            for tracker_url in &stop_trackers.udp {
-                let _ = udp_tracker::announce(
-                    tracker_url,
-                    meta.info_hash,
-                    peer_id,
-                    args.port,
-                    uploaded,
-                    downloaded,
-                    left,
-                    Some("stopped"),
-                    stop_numwant,
-                );
+            let (stop_rx, mut stop_pending) = spawn_tracker_announces(
+                &stop_trackers,
+                meta.info_hash,
+                peer_id,
+                args.port,
+                uploaded,
+                downloaded,
+                left,
+                Some("stopped"),
+                stop_numwant,
+                meta.info.private,
+                args.proxy.clone(),
+                TRACKER_STOPPED_WAIT_BUDGET,
+            );
+            let stop_deadline = Instant::now() + TRACKER_STOPPED_WAIT_BUDGET;
+            while stop_pending > 0 {
+                let Some(remaining) = stop_deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                if remaining.is_zero() {
+                    break;
+                }
+                match stop_rx.recv_timeout(remaining.min(TRACKER_ANNOUNCE_POLL)) {
+                    Ok(_) => stop_pending = stop_pending.saturating_sub(1),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         }
 
+        let peer_shutdown_deadline = Instant::now() + TORRENT_WORKER_SHUTDOWN_TIMEOUT;
         for handle in handles {
-            let _ = handle.join();
+            resource_workers_stopped &= join_worker_before(handle, "peer", peer_shutdown_deadline);
+        }
+        if decentralized_discovery {
+            dht.remove_torrent(meta.info_hash);
+            lpd.remove_torrent(meta.info_hash);
+        }
+        for handle in discovery_handles.drain(..) {
+            join_worker_before(handle, "peer discovery", peer_shutdown_deadline);
         }
     }
 
+    let auxiliary_shutdown_deadline = Instant::now() + TORRENT_WORKER_SHUTDOWN_TIMEOUT;
     if let Some(handle) = webseed_handle {
-        let _ = handle.join();
+        resource_workers_stopped &=
+            join_worker_before(handle, "web seed", auxiliary_shutdown_deadline);
     }
 
-    let _ = resume_handle.join();
+    resource_workers_stopped &=
+        join_worker_before(resume_handle, "resume", auxiliary_shutdown_deadline);
+    if !resource_workers_stopped {
+        retain_context_after_teardown_failure(registry, &context);
+        return Err(
+            "torrent teardown timed out; restart before retrying lifecycle operations".to_string(),
+        );
+    }
+    let lifecycle_operation = session_store.lock_operation();
+
+    if context.delete_data_requested.load(Ordering::Acquire) {
+        let queue_len = ui_state
+            .as_ref()
+            .and_then(|state| state.lock().ok().map(|state| state.queue_len))
+            .unwrap_or(0);
+        let entry = retain_delete_error(
+            session_store
+                .get(meta.info_hash)
+                .ok_or_else(|| "torrent session metadata is unavailable".to_string()),
+            ui_state,
+            request.id,
+            queue_len,
+        )?;
+        if !entry.pending_delete {
+            return retain_delete_error(
+                Err("active data deletion lost its durable tombstone".to_string()),
+                ui_state,
+                request.id,
+                queue_len,
+            );
+        }
+        if !meta.info.private {
+            dht.remove_torrent(meta.info_hash);
+            lpd.remove_torrent(meta.info_hash);
+        }
+        unregister_session(registry, meta.info_hash, request.id);
+
+        // Destructive deletion remains fail-closed: if a detached handler or
+        // recheck does not relinquish Storage by the deadline, retain the
+        // durable tombstone and leave every payload path untouched.
+        retain_delete_error(
+            wait_for_torrent_resources_or_retain(
+                registry,
+                &context,
+                &storage,
+                "delete data",
+                Instant::now() + TORRENT_RESOURCE_DRAIN_TIMEOUT,
+            ),
+            ui_state,
+            request.id,
+            queue_len,
+        )?;
+
+        let delete_paths = {
+            let mut storage_guard = lock_or_recover(&storage);
+            retain_delete_error(
+                storage_guard
+                    .flush()
+                    .map_err(|err| format!("delete data flush failed: {err}")),
+                ui_state,
+                request.id,
+                queue_len,
+            )?;
+            (0..storage_guard.file_count())
+                .filter_map(|index| storage_guard.file_path(index).map(Path::to_path_buf))
+                .collect::<Vec<_>>()
+        };
+
+        drop(context);
+        let storage_mutex = retain_delete_error(
+            Arc::try_unwrap(storage)
+                .map_err(|_| "delete data aborted because storage is still in use".to_string()),
+            ui_state,
+            request.id,
+            queue_len,
+        )?;
+        drop(match storage_mutex.into_inner() {
+            Ok(storage) => storage,
+            Err(poisoned) => poisoned.into_inner(),
+        });
+        if let Err(err) = delete_storage_paths(&request.download_dir, &delete_paths)
+            .and_then(|()| remove_resume_files(&resume_path))
+        {
+            mark_delete_failed_ui(ui_state, request.id, &err, queue_len);
+            return Err(err);
+        }
+        if let Err(err) = session_store.remove(meta.info_hash) {
+            mark_delete_failed_ui(ui_state, request.id, &err, queue_len);
+            return Err(err);
+        }
+        remove_torrent_ui(ui_state, request.id, queue_len);
+        return Ok(None);
+    }
+
+    if context.archive_requested.load(Ordering::Acquire) {
+        let queue_len = ui_state
+            .as_ref()
+            .and_then(|state| state.lock().ok().map(|state| state.queue_len))
+            .unwrap_or(0);
+        let entry = session_store
+            .get(meta.info_hash)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if entry.pending_delete {
+            return Err("data deletion is pending; retry delete with data".to_string());
+        }
+        unregister_session(registry, meta.info_hash, request.id);
+        wait_for_torrent_resources_or_retain(
+            registry,
+            &context,
+            &storage,
+            "archive",
+            Instant::now() + TORRENT_RESOURCE_DRAIN_TIMEOUT,
+        )?;
+        {
+            let mut storage_guard = lock_or_recover(&storage);
+            storage_guard
+                .flush()
+                .map_err(|err| format!("archive data flush failed: {err}"))?;
+        }
+        drop(context);
+        let storage_mutex = Arc::try_unwrap(storage)
+            .map_err(|_| "archive aborted because storage is still in use".to_string())?;
+        drop(match storage_mutex.into_inner() {
+            Ok(storage) => storage,
+            Err(poisoned) => poisoned.into_inner(),
+        });
+        session_store.remove(meta.info_hash)?;
+        remove_torrent_ui(ui_state, request.id, queue_len);
+        return Ok(None);
+    }
 
     let finished_complete = {
         let p = lock_or_recover(&pieces);
@@ -3123,34 +5158,114 @@ fn run_torrent(
         });
     });
 
-    if finished_complete {
-        if let Some(dest) = args.move_completed.as_ref() {
-            move_completed_files(&meta, &request.download_dir, dest);
-        }
-        if let Some(script) = ON_COMPLETE_SCRIPT.get() {
-            let script = script.clone();
-            let torrent_name = name.clone();
-            let torrent_dir = request.download_dir.display().to_string();
-            let torrent_hash = hex(&meta.info_hash);
-            let torrent_size = meta.info.total_length();
-            thread::spawn(move || {
-                match std::process::Command::new(&script)
-                    .env("TORRENT_NAME", &torrent_name)
-                    .env("TORRENT_DIR", &torrent_dir)
-                    .env("TORRENT_HASH", &torrent_hash)
-                    .env("TORRENT_SIZE", torrent_size.to_string())
-                    .output()
-                {
-                    Ok(out) => {
-                        if !out.status.success() {
-                            log_warn!("on-complete script exited {}", out.status);
+    let mut completion_reentry = None;
+    if completion_move_pending
+        && finished_complete
+        && session_store.get(meta.info_hash).is_some_and(|entry| {
+            !entry.pending_delete && entry.completion_state == CompletionState::Pending
+        })
+    {
+        let Some(dest) = completion_move_dir.as_ref() else {
+            return Err("completion move is pending without a destination".to_string());
+        };
+        let prepared_source = {
+            let mut storage = lock_or_recover(&storage);
+            storage.flush().map_err(|err| err.to_string()).map(|()| {
+                meta.info
+                    .length
+                    .and_then(|_| storage.file_path(0).map(Path::to_path_buf))
+            })
+        };
+        match prepared_source {
+            Ok(source_override) => {
+                // Prevent new inbound lookups before waiting for every existing
+                // storage user. Closing Storage before the rename is required on
+                // platforms that do not permit moving open files.
+                unregister_session(registry, meta.info_hash, request.id);
+                wait_for_torrent_resources_or_retain(
+                    registry,
+                    &context,
+                    &storage,
+                    "move-completed",
+                    Instant::now() + TORRENT_RESOURCE_DRAIN_TIMEOUT,
+                )?;
+                let allow_reentry = context.allow_completion_reentry.load(Ordering::SeqCst);
+                drop(context);
+                let storage_mutex = Arc::try_unwrap(storage).map_err(|_| {
+                    "move-completed aborted because storage is still in use".to_string()
+                })?;
+                drop(match storage_mutex.into_inner() {
+                    Ok(storage) => storage,
+                    Err(poisoned) => poisoned.into_inner(),
+                });
+
+                match move_completed_files(
+                    &meta,
+                    &request.download_dir,
+                    dest,
+                    source_override.as_deref(),
+                ) {
+                    Ok(completed_move) => {
+                        let commit_result =
+                            commit_completed_move(completed_move.as_ref(), || match session_store
+                                .commit_completion_move(meta.info_hash, dest)?
+                            {
+                                true => Ok(()),
+                                false => {
+                                    Err("completion state changed before move commit".to_string())
+                                }
+                            });
+                        match commit_result {
+                            Ok(()) => {
+                                let relocated_resume = crate::resume_path(dest, meta.info_hash);
+                                if let Err(err) =
+                                    relocate_resume_state(&resume_path, &relocated_resume)
+                                {
+                                    log_warn!("move-completed resume relocation failed: {err}");
+                                }
+                                update_ui(ui_state, |state| {
+                                    update_torrent_entry(state, request.id, |torrent| {
+                                        torrent.download_dir = dest.display().to_string();
+                                    });
+                                });
+                                if let Some(script) = ON_COMPLETE_SCRIPT.get() {
+                                    spawn_on_complete_script(
+                                        script,
+                                        &name,
+                                        dest,
+                                        meta.info_hash,
+                                        meta.info.total_length(),
+                                    );
+                                }
+                                if allow_reentry && !shutdown_requested() {
+                                    completion_reentry = Some(TorrentRequest {
+                                        id: request.id,
+                                        source: TorrentSource::Bytes(data.clone()),
+                                        download_dir: dest.clone(),
+                                        preallocate: request.preallocate,
+                                        initial_label: request.initial_label.clone(),
+                                    });
+                                }
+                            }
+                            Err(err) => {
+                                log_warn!("move-completed commit failed: {err}");
+                            }
                         }
                     }
                     Err(err) => {
-                        log_warn!("on-complete script error: {err}");
+                        log_warn!("move-completed failed: {err}");
                     }
                 }
-            });
+                if !meta.info.private {
+                    dht.remove_torrent(meta.info_hash);
+                    lpd.remove_torrent(meta.info_hash);
+                }
+                unregister_session(registry, meta.info_hash, request.id);
+                return Ok(completion_reentry);
+            }
+            Err(err) => {
+                log_warn!("move-completed skipped because data flush failed: {err}");
+            }
         }
     }
 
@@ -3160,7 +5275,26 @@ fn run_torrent(
     }
     unregister_session(registry, meta.info_hash, request.id);
 
-    Ok(())
+    // Keep the durable claim until every inbound user has released its
+    // context and the payload locks have actually closed. An archive request
+    // waiting on `operations` can only remove the session after this point.
+    wait_for_torrent_resources_or_retain(
+        registry,
+        &context,
+        &storage,
+        "torrent shutdown",
+        Instant::now() + TORRENT_RESOURCE_DRAIN_TIMEOUT,
+    )?;
+    drop(context);
+    let storage_mutex = Arc::try_unwrap(storage)
+        .map_err(|_| "torrent stopped while storage is still in use".to_string())?;
+    drop(match storage_mutex.into_inner() {
+        Ok(storage) => storage,
+        Err(poisoned) => poisoned.into_inner(),
+    });
+    drop(lifecycle_operation);
+
+    Ok(completion_reentry)
 }
 
 fn resolve_torrent_data(
@@ -3171,10 +5305,14 @@ fn resolve_torrent_data(
     metadata_peer_limit: usize,
 ) -> Result<Vec<u8>, String> {
     let data = match &request.source {
-        TorrentSource::Path(path) => {
-            fs::read(path).map_err(|err| format!("failed to read {}: {err}", path))?
+        TorrentSource::Path(path) => read_file_limited(Path::new(path), MAX_TORRENT_BYTES, false)
+            .map_err(|err| format!("failed to read {path}: {err}"))?,
+        TorrentSource::Bytes(data) => {
+            if data.len() > MAX_TORRENT_BYTES {
+                return Err("torrent file too large".to_string());
+            }
+            data.clone()
         }
-        TorrentSource::Bytes(data) => data.clone(),
         TorrentSource::Magnet(link) => {
             fetch_torrent_from_magnet(link, port, dht, connect_cfg, metadata_peer_limit)?
         }
@@ -3185,14 +5323,91 @@ fn resolve_torrent_data(
     Ok(data)
 }
 
+#[derive(Debug)]
 struct MagnetMeta {
+    /// The 20-byte swarm identifier used by trackers, DHT, and handshakes.
     info_hash: [u8; 20],
-    #[allow(dead_code)]
+    info_hash_v1: Option<[u8; 20]>,
     info_hash_v2: Option<[u8; 32]>,
     sources: Vec<String>,
     trackers: Vec<String>,
     web_seeds: Vec<String>,
     peers: Vec<SocketAddr>,
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedInfoHashes {
+    v1: Option<[u8; 20]>,
+    v2: Option<[u8; 32]>,
+}
+
+impl MagnetMeta {
+    fn expected_hashes(&self) -> ExpectedInfoHashes {
+        ExpectedInfoHashes {
+            v1: self.info_hash_v1,
+            v2: self.info_hash_v2,
+        }
+    }
+}
+
+impl ExpectedInfoHashes {
+    fn swarm_id(self) -> Result<[u8; 20], String> {
+        if let Some(hash) = self.v1 {
+            return Ok(hash);
+        }
+        let v2 = self
+            .v2
+            .ok_or_else(|| "magnet is missing an exact topic".to_string())?;
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&v2[..20]);
+        Ok(hash)
+    }
+
+    fn hybrid_v2_swarm_id(self) -> Option<[u8; 20]> {
+        self.v1.and(self.v2.map(truncate_v2_info_hash))
+    }
+}
+
+fn truncate_v2_info_hash(hash: [u8; 32]) -> [u8; 20] {
+    let mut truncated = [0u8; 20];
+    truncated.copy_from_slice(&hash[..20]);
+    truncated
+}
+
+fn validate_info_hashes(info: &[u8], expected: ExpectedInfoHashes) -> Result<(), String> {
+    if let Some(hash) = expected.v1 {
+        if sha1::sha1(info) != hash {
+            return Err("metadata SHA-1 hash mismatch".to_string());
+        }
+    }
+    if let Some(hash) = expected.v2 {
+        if sha256::sha256(info) != hash {
+            return Err("metadata SHA-256 hash mismatch".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_magnet_torrent(data: &[u8], expected: ExpectedInfoHashes) -> Result<(), String> {
+    if data.len() > MAX_TORRENT_BYTES {
+        return Err("torrent file too large".to_string());
+    }
+    let meta =
+        torrent::parse_torrent(data).map_err(|err| format!("invalid torrent metadata: {err}"))?;
+    if let Some(hash) = expected.v1 {
+        if meta.meta_version != 1 && meta.meta_version != 3 {
+            return Err("source torrent is missing the requested v1 metadata".to_string());
+        }
+        if meta.info_hash != hash {
+            return Err("source torrent SHA-1 hash mismatch".to_string());
+        }
+    }
+    if let Some(hash) = expected.v2 {
+        if meta.info_hash_v2 != Some(hash) {
+            return Err("source torrent SHA-256 hash mismatch".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn fetch_torrent_from_magnet(
@@ -3203,6 +5418,7 @@ fn fetch_torrent_from_magnet(
     metadata_peer_limit: usize,
 ) -> Result<Vec<u8>, String> {
     let meta = parse_magnet(link)?;
+    let expected_hashes = meta.expected_hashes();
     let deadline = Instant::now() + METADATA_TOTAL_TIMEOUT;
     let hash = hex(&meta.info_hash);
     log_info!(
@@ -3214,50 +5430,87 @@ fn fetch_torrent_from_magnet(
         meta.peers.len()
     );
     for (idx, tracker) in meta.trackers.iter().enumerate() {
-        log_info!("magnet: tracker[{idx}]={tracker}");
+        log_info!("magnet: tracker[{idx}]={}", safe_network_url_label(tracker));
     }
     for (idx, source) in meta.sources.iter().enumerate() {
-        log_info!("magnet: source[{idx}]={source}");
+        log_info!("magnet: source[{idx}]={}", safe_network_url_label(source));
     }
     for (idx, seed) in meta.web_seeds.iter().enumerate() {
-        log_info!("magnet: webseed[{idx}]={seed}");
+        log_info!("magnet: webseed[{idx}]={}", safe_network_url_label(seed));
     }
     for (idx, peer) in meta.peers.iter().enumerate() {
         log_info!("magnet: peer[{idx}]={peer}");
     }
     let mut source_err: Option<String> = None;
     let mut metadata_err: Option<String> = None;
-    for source in &meta.sources {
-        log_info!("magnet: fetching source {source}");
-        match http::get(source, MAX_TORRENT_BYTES) {
-            Ok(data) => {
-                log_info!("magnet: source fetch ok ({source})");
-                return Ok(data);
-            }
+    for source in meta.sources.iter().filter(|_| connect_cfg.proxy.is_none()) {
+        if shutdown_requested() {
+            return Err("metadata fetch cancelled".to_string());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        let source_label = safe_network_url_label(source);
+        log_info!("magnet: fetching source {source_label}");
+        match http::get_public_until(source, MAX_TORRENT_BYTES, deadline, Some(&SHUTDOWN)) {
+            Ok(data) => match validate_magnet_torrent(&data, expected_hashes) {
+                Ok(()) => {
+                    log_info!("magnet: source fetch and hash validation ok ({source_label})");
+                    return Ok(data);
+                }
+                Err(err) => {
+                    log_warn!("magnet: source validation failed ({source_label}): {err}");
+                    if source_err.is_none() {
+                        source_err = Some(err);
+                    }
+                }
+            },
             Err(err) => {
-                log_warn!("magnet: source fetch failed ({source}): {err}");
+                log_warn!("magnet: source fetch failed ({source_label}): {err}");
                 if source_err.is_none() {
                     source_err = Some(err);
                 }
             }
         }
     }
-    let info_hash = hash;
-    for base in MAGNET_CACHE_URLS {
-        let url = format!("{base}{info_hash}.torrent");
-        log_info!("magnet: fetching cache {url}");
-        match http::get(&url, MAX_TORRENT_BYTES) {
-            Ok(data) => {
-                log_info!("magnet: cache fetch ok ({url})");
-                return Ok(data);
+    if let Some(v1_hash) = meta.info_hash_v1.filter(|_| connect_cfg.proxy.is_none()) {
+        let info_hash = hex(&v1_hash);
+        for base in MAGNET_CACHE_URLS {
+            if shutdown_requested() {
+                return Err("metadata fetch cancelled".to_string());
             }
-            Err(err) => {
-                log_warn!("magnet: cache fetch failed ({url}): {err}");
-                if source_err.is_none() {
-                    source_err = Some(err);
+            if Instant::now() >= deadline {
+                break;
+            }
+            let url = format!("{base}{info_hash}.torrent");
+            log_info!("magnet: fetching cache {url}");
+            match http::get_public_until(&url, MAX_TORRENT_BYTES, deadline, Some(&SHUTDOWN)) {
+                Ok(data) => match validate_magnet_torrent(&data, expected_hashes) {
+                    Ok(()) => {
+                        log_info!("magnet: cache fetch and hash validation ok ({url})");
+                        return Ok(data);
+                    }
+                    Err(err) => {
+                        log_warn!("magnet: cache validation failed ({url}): {err}");
+                        if source_err.is_none() {
+                            source_err = Some(err);
+                        }
+                    }
+                },
+                Err(err) => {
+                    log_warn!("magnet: cache fetch failed ({url}): {err}");
+                    if source_err.is_none() {
+                        source_err = Some(err);
+                    }
                 }
             }
         }
+    }
+    if meta.info_hash_v2.is_some() {
+        return Err(source_err.unwrap_or_else(|| {
+            "v2/hybrid magnet peer metadata requires BEP 52 piece-layer exchange; provide an xs/as URL for the complete .torrent file"
+                .to_string()
+        }));
     }
     if !meta.peers.is_empty() {
         let peer_id = generate_peer_id();
@@ -3267,7 +5520,7 @@ fn fetch_torrent_from_magnet(
                 break;
             }
             log_info!("metadata: trying explicit peer {addr}");
-            match fetch_metadata_from_peer(*addr, meta.info_hash, peer_id, deadline, connect_cfg) {
+            match fetch_metadata_from_peer(*addr, expected_hashes, peer_id, deadline, connect_cfg) {
                 Ok(info_bytes) => {
                     log_info!("metadata: explicit peer {addr} delivered metadata");
                     let data = wrap_torrent_with_info(&info_bytes, &meta.trackers, &meta.web_seeds);
@@ -3286,7 +5539,7 @@ fn fetch_torrent_from_magnet(
         let peer_id = generate_peer_id();
         log_info!("magnet: fetching metadata from trackers");
         match fetch_metadata_from_trackers(
-            meta.info_hash,
+            expected_hashes,
             peer_id,
             port,
             &meta.trackers,
@@ -3307,26 +5560,28 @@ fn fetch_torrent_from_magnet(
             }
         }
     }
-    let peer_id = generate_peer_id();
-    log_info!("magnet: fetching metadata from dht");
-    match fetch_metadata_from_dht(
-        meta.info_hash,
-        peer_id,
-        port,
-        deadline,
-        dht,
-        connect_cfg,
-        metadata_peer_limit,
-    ) {
-        Ok(info_bytes) => {
-            log_info!("magnet: metadata fetched from dht");
-            let data = wrap_torrent_with_info(&info_bytes, &meta.trackers, &meta.web_seeds);
-            return Ok(data);
-        }
-        Err(err) => {
-            log_warn!("magnet: dht metadata failed: {err}");
-            if metadata_err.is_none() {
-                metadata_err = Some(err);
+    if connect_cfg.proxy.is_none() {
+        let peer_id = generate_peer_id();
+        log_info!("magnet: fetching metadata from dht");
+        match fetch_metadata_from_dht(
+            expected_hashes,
+            peer_id,
+            port,
+            deadline,
+            dht,
+            connect_cfg,
+            metadata_peer_limit,
+        ) {
+            Ok(info_bytes) => {
+                log_info!("magnet: metadata fetched from dht");
+                let data = wrap_torrent_with_info(&info_bytes, &meta.trackers, &meta.web_seeds);
+                return Ok(data);
+            }
+            Err(err) => {
+                log_warn!("magnet: dht metadata failed: {err}");
+                if metadata_err.is_none() {
+                    metadata_err = Some(err);
+                }
             }
         }
     }
@@ -3342,7 +5597,7 @@ fn parse_magnet(link: &str) -> Result<MagnetMeta, String> {
     let query = trimmed
         .strip_prefix("magnet:?")
         .ok_or_else(|| "invalid magnet link".to_string())?;
-    let mut info_hash: Option<[u8; 20]> = None;
+    let mut info_hash_v1: Option<[u8; 20]> = None;
     let mut info_hash_v2: Option<[u8; 32]> = None;
     let mut sources = Vec::new();
     let mut trackers = Vec::new();
@@ -3353,50 +5608,82 @@ fn parse_magnet(link: &str) -> Result<MagnetMeta, String> {
             "xt" => {
                 let lower = value.to_ascii_lowercase();
                 if let Some(rest) = lower.strip_prefix("urn:btih:") {
-                    info_hash = parse_info_hash(rest);
-                } else if let Some(rest) = lower.strip_prefix("urn:btmh:") {
-                    if let Some(hash) = parse_multihash_sha256(rest) {
-                        if info_hash.is_none() {
-                            let mut truncated = [0u8; 20];
-                            truncated.copy_from_slice(&hash[..20]);
-                            info_hash = Some(truncated);
-                        }
-                        info_hash_v2 = Some(hash);
+                    let hash = parse_info_hash(rest)
+                        .ok_or_else(|| "invalid magnet v1 info hash".to_string())?;
+                    if info_hash_v1.is_some_and(|existing| existing != hash) {
+                        return Err("magnet contains conflicting v1 info hashes".to_string());
                     }
+                    info_hash_v1 = Some(hash);
+                } else if let Some(rest) = lower.strip_prefix("urn:btmh:") {
+                    let hash = parse_multihash_sha256(rest)
+                        .ok_or_else(|| "invalid magnet v2 info hash".to_string())?;
+                    if info_hash_v2.is_some_and(|existing| existing != hash) {
+                        return Err("magnet contains conflicting v2 info hashes".to_string());
+                    }
+                    info_hash_v2 = Some(hash);
                 }
             }
             "xs" | "as" => {
-                if !value.is_empty() {
+                if sources.len() < MAX_MAGNET_SOURCES
+                    && valid_magnet_http_url(&value)
+                    && !sources.contains(&value)
+                {
                     sources.push(value);
                 }
             }
             "tr" => {
-                if !value.is_empty() {
+                if trackers.len() < MAX_TRACKERS_PER_TORRENT
+                    && valid_tracker_url(&value)
+                    && !trackers.contains(&value)
+                {
                     trackers.push(value);
                 }
             }
             "ws" => {
-                if !value.is_empty() {
+                if web_seeds.len() < MAX_MAGNET_WEB_SEEDS
+                    && valid_magnet_http_url(&value)
+                    && !web_seeds.contains(&value)
+                {
                     web_seeds.push(value);
                 }
             }
             "x.pe" => {
-                if let Ok(addr) = value.parse::<SocketAddr>() {
-                    peers.push(addr);
+                if peers.len() < MAX_MAGNET_EXPLICIT_PEERS {
+                    if let Ok(addr) = value.parse::<SocketAddr>() {
+                        let Some(addr) = safe_metadata_peer(addr, PeerSource::Magnet, None) else {
+                            continue;
+                        };
+                        if !peers.contains(&addr) {
+                            peers.push(addr);
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
-    let info_hash = info_hash.ok_or_else(|| "magnet missing info hash".to_string())?;
+    let info_hash = match (info_hash_v1, info_hash_v2) {
+        (Some(hash), _) => hash,
+        (None, Some(hash)) => {
+            let mut truncated = [0u8; 20];
+            truncated.copy_from_slice(&hash[..20]);
+            truncated
+        }
+        (None, None) => return Err("magnet missing info hash".to_string()),
+    };
     Ok(MagnetMeta {
         info_hash,
+        info_hash_v1,
         info_hash_v2,
         sources,
         trackers,
         web_seeds,
         peers,
     })
+}
+
+fn valid_magnet_http_url(url: &str) -> bool {
+    valid_network_url(url, &["http://", "https://"])
 }
 
 fn parse_info_hash(value: &str) -> Option<[u8; 20]> {
@@ -3479,7 +5766,7 @@ fn base32_value(ch: char) -> Option<u8> {
 }
 
 fn fetch_metadata_from_trackers(
-    info_hash: [u8; 20],
+    expected_hashes: ExpectedInfoHashes,
     peer_id: [u8; 20],
     port: u16,
     trackers: &[String],
@@ -3487,6 +5774,7 @@ fn fetch_metadata_from_trackers(
     connect_cfg: &ConnectionConfig,
     metadata_peer_limit: usize,
 ) -> Result<Vec<u8>, String> {
+    let info_hash = expected_hashes.swarm_id()?;
     log_info!(
         "metadata: tracker announce start (trackers={}, deadline={}s)",
         trackers.len(),
@@ -3500,11 +5788,15 @@ fn fetch_metadata_from_trackers(
             })
             .cloned()
             .collect(),
-        udp: trackers
-            .iter()
-            .filter(|tracker_url| tracker_url.starts_with("udp://"))
-            .cloned()
-            .collect(),
+        udp: if connect_cfg.proxy.is_none() {
+            trackers
+                .iter()
+                .filter(|tracker_url| tracker_url.starts_with("udp://"))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
     let mut last_err: Option<String> = None;
     let (announce_rx, mut announce_pending) = spawn_tracker_announces(
@@ -3518,6 +5810,7 @@ fn fetch_metadata_from_trackers(
         Some("started"),
         metadata_peer_limit as u32,
         false,
+        connect_cfg.proxy.clone(),
         TRACKER_ANNOUNCE_WAIT_BUDGET,
     );
     let mut seen = HashSet::new();
@@ -3539,17 +5832,24 @@ fn fetch_metadata_from_trackers(
                         if result.is_udp {
                             log_info!(
                                 "metadata: udp tracker {} returned {} peers",
-                                result.tracker_url,
+                                safe_network_url_label(&result.tracker_url),
                                 response.peers.len()
                             );
                         } else {
                             log_info!(
                                 "metadata: http tracker {} returned {} peers",
-                                result.tracker_url,
+                                safe_network_url_label(&result.tracker_url),
                                 response.peers.len()
                             );
                         }
                         for peer in response.peers {
+                            let Some(peer) = safe_metadata_peer(
+                                peer,
+                                PeerSource::Tracker,
+                                connect_cfg.ip_filter.as_deref(),
+                            ) else {
+                                continue;
+                            };
                             if seen.insert(peer) {
                                 unique.push(peer);
                                 if unique.len() >= metadata_peer_limit {
@@ -3562,7 +5862,10 @@ fn fetch_metadata_from_trackers(
                         }
                     }
                     Err(err) => {
-                        last_err = Some(format!("{}: {err}", result.tracker_url));
+                        last_err = Some(format!(
+                            "{}: {err}",
+                            safe_network_url_label(&result.tracker_url)
+                        ));
                     }
                 }
             }
@@ -3580,7 +5883,7 @@ fn fetch_metadata_from_trackers(
             break;
         }
         log_info!("metadata: trying peer {addr}");
-        match fetch_metadata_from_peer(addr, info_hash, peer_id, deadline, connect_cfg) {
+        match fetch_metadata_from_peer(addr, expected_hashes, peer_id, deadline, connect_cfg) {
             Ok(data) => {
                 log_info!("metadata: peer {addr} delivered metadata");
                 return Ok(data);
@@ -3596,7 +5899,7 @@ fn fetch_metadata_from_trackers(
 }
 
 fn fetch_metadata_from_dht(
-    info_hash: [u8; 20],
+    expected_hashes: ExpectedInfoHashes,
     peer_id: [u8; 20],
     port: u16,
     deadline: Instant,
@@ -3604,6 +5907,7 @@ fn fetch_metadata_from_dht(
     connect_cfg: &ConnectionConfig,
     metadata_peer_limit: usize,
 ) -> Result<Vec<u8>, String> {
+    let info_hash = expected_hashes.swarm_id()?;
     if !cfg!(feature = "dht") {
         let _ = dht;
         return Err("dht disabled".to_string());
@@ -3631,7 +5935,7 @@ fn fetch_metadata_from_dht(
                 break;
             }
             log_info!("metadata: trying dht peer {addr}");
-            match fetch_metadata_from_peer(addr, info_hash, peer_id, deadline, connect_cfg) {
+            match fetch_metadata_from_peer(addr, expected_hashes, peer_id, deadline, connect_cfg) {
                 Ok(data) => {
                     log_info!("metadata: dht peer {addr} delivered metadata");
                     result = Some(data);
@@ -3659,6 +5963,11 @@ fn fetch_metadata_from_dht(
                     log_info!("metadata: dht peers received batch size={}", peers.len());
                 }
                 for peer in peers {
+                    let Some(peer) =
+                        safe_metadata_peer(peer, PeerSource::Dht, connect_cfg.ip_filter.as_deref())
+                    else {
+                        continue;
+                    };
                     if seen.len() >= metadata_peer_limit {
                         break;
                     }
@@ -3683,11 +5992,13 @@ fn fetch_metadata_from_dht(
 
 fn fetch_metadata_from_peer(
     addr: SocketAddr,
-    info_hash: [u8; 20],
+    expected_hashes: ExpectedInfoHashes,
     peer_id: [u8; 20],
     deadline: Instant,
     connect_cfg: &ConnectionConfig,
 ) -> Result<Vec<u8>, String> {
+    let info_hash = expected_hashes.swarm_id()?;
+    let hybrid_v2_info_hash = expected_hashes.hybrid_v2_swarm_id();
     log_info!(
         "metadata: peer {addr} connect (deadline={}s)",
         deadline.saturating_duration_since(Instant::now()).as_secs()
@@ -3701,9 +6012,15 @@ fn fetch_metadata_from_peer(
         .map_err(|err| format!("write timeout failed: {err}"))?;
 
     let handshake = if connect_cfg.encryption == EncryptionMode::Require {
-        outbound_handshake(&mut stream, info_hash, peer_id, connect_cfg.encryption)?
+        outbound_handshake(
+            &mut stream,
+            info_hash,
+            hybrid_v2_info_hash,
+            peer_id,
+            connect_cfg.encryption,
+        )?
     } else {
-        match plaintext_handshake(&mut stream, info_hash, peer_id) {
+        match plaintext_handshake(&mut stream, info_hash, hybrid_v2_info_hash, peer_id) {
             Ok(handshake) => handshake,
             Err(_err) if connect_cfg.encryption == EncryptionMode::Prefer => {
                 let mut retry = connect_peer_for_metadata(addr, connect_cfg)?;
@@ -3713,8 +6030,13 @@ fn fetch_metadata_from_peer(
                 retry
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .map_err(|err| format!("write timeout failed: {err}"))?;
-                let handshake =
-                    outbound_handshake(&mut retry, info_hash, peer_id, EncryptionMode::Prefer)?;
+                let handshake = outbound_handshake(
+                    &mut retry,
+                    info_hash,
+                    hybrid_v2_info_hash,
+                    peer_id,
+                    EncryptionMode::Prefer,
+                )?;
                 stream = retry;
                 handshake
             }
@@ -3774,13 +6096,19 @@ fn fetch_metadata_from_peer(
                                 }
                             }
                             if let Some(size) = size {
-                                if metadata_size.is_none() {
-                                    metadata_size = Some(size);
-                                    pieces = vec![None; metadata_piece_count(size)];
-                                    log_info!(
-                                        "metadata: peer {addr} metadata_size={size} pieces={}",
-                                        pieces.len()
-                                    );
+                                match metadata_size {
+                                    Some(existing) if existing != size => {
+                                        return Err("peer changed metadata size".to_string());
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        metadata_size = Some(size);
+                                        pieces = vec![None; metadata_piece_count(size)];
+                                        log_info!(
+                                            "metadata: peer {addr} metadata_size={size} pieces={}",
+                                            pieces.len()
+                                        );
+                                    }
                                 }
                             }
                             if let Some(id) = ut_metadata_id {
@@ -3818,8 +6146,16 @@ fn fetch_metadata_from_peer(
                                 return Err("metadata rejected".to_string());
                             }
                             if msg.msg_type == 1 {
-                                if metadata_size.is_none() {
-                                    if let Some(total) = msg.total_size {
+                                let advertised_total = msg.total_size.ok_or_else(|| {
+                                    "metadata data missing total size".to_string()
+                                })?;
+                                match metadata_size {
+                                    Some(existing) if existing != advertised_total => {
+                                        return Err("peer changed metadata size".to_string());
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        let total = advertised_total;
                                         metadata_size = Some(total);
                                         pieces = vec![None; metadata_piece_count(total)];
                                         log_info!(
@@ -3847,36 +6183,46 @@ fn fetch_metadata_from_peer(
                                         }
                                     }
                                 }
-                                if !pieces.is_empty() {
-                                    let idx = msg.piece as usize;
-                                    if idx < pieces.len() && pieces[idx].is_none() {
-                                        pieces[idx] = Some(msg.data);
-                                        received += 1;
-                                        last_receive = Instant::now();
-                                        last_progress = Instant::now();
-                                        if received == 1
-                                            || received == pieces.len()
-                                            || received - last_progress_log >= 5
-                                        {
-                                            last_progress_log = received;
-                                            log_info!(
-                                                "metadata: peer {addr} received {}/{} pieces",
-                                                received,
-                                                pieces.len()
-                                            );
-                                        }
+                                let total = metadata_size
+                                    .ok_or_else(|| "metadata size unavailable".to_string())?;
+                                let idx = msg.piece as usize;
+                                let expected_len = expected_metadata_piece_len(total, idx)
+                                    .ok_or_else(|| {
+                                        "metadata piece index out of range".to_string()
+                                    })?;
+                                if msg.data.len() != expected_len {
+                                    return Err(format!(
+                                        "invalid metadata piece length {} (expected {expected_len})",
+                                        msg.data.len()
+                                    ));
+                                }
+                                if pieces[idx].is_none() {
+                                    pieces[idx] = Some(msg.data);
+                                    received += 1;
+                                    last_receive = Instant::now();
+                                    last_progress = Instant::now();
+                                    if received == 1
+                                        || received == pieces.len()
+                                        || received - last_progress_log >= 5
+                                    {
+                                        last_progress_log = received;
+                                        log_info!(
+                                            "metadata: peer {addr} received {}/{} pieces",
+                                            received,
+                                            pieces.len()
+                                        );
                                     }
                                 }
                                 if let Some(total) = metadata_size {
                                     if pieces.iter().all(|piece| piece.is_some()) {
                                         let info = assemble_metadata(&pieces, total);
-                                        let actual = sha1::sha1(&info);
-                                        if actual != info_hash {
-                                            log_warn!(
-                                                "metadata: peer {addr} metadata hash mismatch"
-                                            );
-                                            return Err("metadata hash mismatch".to_string());
-                                        }
+                                        validate_info_hashes(&info, expected_hashes).inspect_err(
+                                            |_| {
+                                                log_warn!(
+                                                    "metadata: peer {addr} metadata hash mismatch"
+                                                );
+                                            },
+                                        )?;
                                         log_info!("metadata: peer {addr} metadata hash ok");
                                         return Ok(info);
                                     }
@@ -3958,6 +6304,23 @@ fn fetch_metadata_from_peer(
 
 fn metadata_piece_count(total: usize) -> usize {
     total.div_ceil(METADATA_PIECE_LEN)
+}
+
+fn validate_metadata_size(size: usize) -> Result<usize, String> {
+    if size == 0 || size > MAX_TORRENT_BYTES {
+        return Err(format!(
+            "invalid metadata size {size} (maximum {MAX_TORRENT_BYTES})"
+        ));
+    }
+    Ok(size)
+}
+
+fn expected_metadata_piece_len(total: usize, piece: usize) -> Option<usize> {
+    let start = piece.checked_mul(METADATA_PIECE_LEN)?;
+    if start >= total {
+        return None;
+    }
+    Some((total - start).min(METADATA_PIECE_LEN))
 }
 
 fn build_ext_handshake(metadata_size: Option<usize>, allow_pex: bool) -> Vec<u8> {
@@ -4057,9 +6420,8 @@ fn parse_extended_handshake(payload: &[u8]) -> Result<ExtendedHandshakeCaps, Str
         }
     }
     if let Some(Value::Int(size)) = dict_get(&dict, b"metadata_size") {
-        if *size > 0 {
-            metadata_size = Some(*size as usize);
-        }
+        let size = usize::try_from(*size).map_err(|_| "invalid metadata size".to_string())?;
+        metadata_size = Some(validate_metadata_size(size)?);
     }
     Ok((ut_metadata, ut_pex, metadata_size))
 }
@@ -4075,19 +6437,25 @@ fn parse_metadata_message(payload: &[u8]) -> Result<MetadataMessage, String> {
     let (dict, used) = parse_bencode_dict(payload)?;
     let msg_type = dict_get_int(&dict, b"msg_type").unwrap_or(-1);
     let piece = dict_get_int(&dict, b"piece").unwrap_or(-1);
-    if msg_type < 0 || piece < 0 {
+    if !(0..=2).contains(&msg_type) || piece < 0 || piece > u32::MAX as i64 {
         return Err("invalid metadata message".to_string());
     }
-    let total_size = dict_get_int(&dict, b"total_size").and_then(|size| {
-        if size > 0 {
-            Some(size as usize)
-        } else {
-            None
+    let total_size = match dict_get_int(&dict, b"total_size") {
+        Some(size) => {
+            let size = usize::try_from(size).map_err(|_| "invalid metadata size".to_string())?;
+            Some(validate_metadata_size(size)?)
         }
-    });
+        None => None,
+    };
     let data = if msg_type == 1 {
+        if total_size.is_none() {
+            return Err("metadata data message missing total_size".to_string());
+        }
         payload[used..].to_vec()
     } else {
+        if used != payload.len() {
+            return Err("unexpected metadata message payload".to_string());
+        }
         Vec::new()
     };
     Ok(MetadataMessage {
@@ -4142,6 +6510,8 @@ fn wrap_torrent_with_info(info: &[u8], trackers: &[String], web_seeds: &[String]
         }
         out.push(b'e');
     }
+    out.extend_from_slice(b"4:info");
+    out.extend_from_slice(info);
     if !web_seeds.is_empty() {
         out.extend_from_slice(b"8:url-list");
         out.push(b'l');
@@ -4150,8 +6520,6 @@ fn wrap_torrent_with_info(info: &[u8], trackers: &[String], web_seeds: &[String]
         }
         out.push(b'e');
     }
-    out.extend_from_slice(b"4:info");
-    out.extend_from_slice(info);
     out.push(b'e');
     out
 }
@@ -4179,7 +6547,7 @@ fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
 
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0;
     while idx < bytes.len() {
         match bytes[idx] {
@@ -4187,22 +6555,22 @@ fn percent_decode(input: &str) -> String {
                 let hi = bytes[idx + 1] as char;
                 let lo = bytes[idx + 2] as char;
                 if let (Some(hi), Some(lo)) = (hi.to_digit(16), lo.to_digit(16)) {
-                    out.push((hi * 16 + lo) as u8 as char);
+                    out.push((hi * 16 + lo) as u8);
                     idx += 3;
                     continue;
                 }
             }
             b'+' => {
-                out.push(' ');
+                out.push(b' ');
                 idx += 1;
                 continue;
             }
             _ => {}
         }
-        out.push(bytes[idx] as char);
+        out.push(bytes[idx]);
         idx += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 struct PeerQueue {
@@ -4221,6 +6589,7 @@ struct PeerQueue {
 enum PeerSource {
     Tracker,
     Dht,
+    Magnet,
     Lpd,
     Pex,
 }
@@ -4261,6 +6630,7 @@ impl PeerQueue {
         let mut added = 0usize;
         let high_priority = matches!(source, PeerSource::Tracker);
         for addr in peers {
+            let addr = normalize_peer_addr(addr);
             if !is_viable_peer_addr(addr, source) {
                 continue;
             }
@@ -4445,7 +6815,34 @@ impl PeerQueue {
     }
 }
 
+fn normalize_peer_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(addr_v6) => addr_v6
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ipv4| SocketAddr::from((ipv4, addr_v6.port())))
+            .unwrap_or(SocketAddr::V6(addr_v6)),
+        addr_v4 => addr_v4,
+    }
+}
+
+fn safe_metadata_peer(
+    addr: SocketAddr,
+    source: PeerSource,
+    filter: Option<&IpFilter>,
+) -> Option<SocketAddr> {
+    let addr = normalize_peer_addr(addr);
+    if !is_viable_peer_addr(addr, source)
+        || filter.is_some_and(|filter| filter.is_blocked(addr.ip()))
+    {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
 fn is_viable_peer_addr(addr: SocketAddr, source: PeerSource) -> bool {
+    let addr = normalize_peer_addr(addr);
     if addr.port() == 0 {
         return false;
     }
@@ -4462,6 +6859,7 @@ fn is_viable_peer_addr(addr: SocketAddr, source: PeerSource) -> bool {
                 || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000)
                 || (octets[0] == 169 && octets[1] == 254)
                 || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
                 || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
                 || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
                 || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
@@ -4477,16 +6875,15 @@ fn is_viable_peer_addr(addr: SocketAddr, source: PeerSource) -> bool {
         SocketAddr::V6(addr) => {
             let ip = *addr.ip();
             let segments = ip.segments();
-            if ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_loopback()
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-            {
-                return matches!(source, PeerSource::Lpd) && (segments[0] & 0xfe00) == 0xfc00;
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return matches!(source, PeerSource::Lpd);
             }
-            true
+            (segments[0] & 0xe000) == 0x2000
+                && !(segments[0] == 0x2001 && (segments[1] & 0xfe00) == 0)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && segments[0] != 0x2002
+                && (segments[0] & 0xfff0) != 0x3ff0
+                && !ip.is_multicast()
         }
     }
 }
@@ -4523,18 +6920,530 @@ fn is_self_peer_id(local_peer_id: &[u8; 20], remote_peer_id: &[u8; 20]) -> bool 
 #[derive(Debug, Clone)]
 struct FileSpan {
     path: String,
+    #[cfg_attr(not(feature = "webseed"), allow(dead_code))]
+    web_path: Vec<u8>,
+    is_padding: bool,
     offset: u64,
     length: u64,
 }
 
-fn build_file_spans(meta: &torrent::TorrentMeta) -> Vec<FileSpan> {
+#[derive(Debug)]
+struct V2HashStore {
+    piece_length: u64,
+    files: Vec<V2HashFile>,
+}
+
+#[derive(Debug)]
+struct V2HashFile {
+    pieces_root: [u8; 32],
+    offset: u64,
+    length: u64,
+    leaf_width: usize,
+    tree_height: u32,
+    piece_layer: u32,
+    /// Complete, power-of-two layers from the piece layer through the root.
+    layers: Vec<Vec<[u8; 32]>>,
+}
+
+const HASH_REQUEST_WINDOW: Duration = Duration::from_secs(60);
+const MAX_HASH_REQUESTS_PER_WINDOW: u32 = 32;
+const MAX_HASH_DISK_BYTES_PER_WINDOW: u64 = 64 * 1024 * 1024;
+const HASH_MESSAGE_FIXED_PAYLOAD_BYTES: usize = 1 + 32 + (4 * 4);
+
+struct HashRequestBudget {
+    window_started: Instant,
+    requests: u32,
+    disk_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashBudgetDecision {
+    ServeAfter(Duration),
+    Reject,
+}
+
+impl HashRequestBudget {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            requests: 0,
+            disk_bytes: 0,
+        }
+    }
+
+    fn reserve(&mut self, disk_bytes: u64, must_serve: bool) -> HashBudgetDecision {
+        self.reserve_at(disk_bytes, must_serve, Instant::now())
+    }
+
+    fn reserve_at(
+        &mut self,
+        disk_bytes: u64,
+        must_serve: bool,
+        now: Instant,
+    ) -> HashBudgetDecision {
+        if now.saturating_duration_since(self.window_started) >= HASH_REQUEST_WINDOW {
+            self.window_started = now;
+            self.requests = 0;
+            self.disk_bytes = 0;
+        }
+
+        let over_budget = self.requests >= MAX_HASH_REQUESTS_PER_WINDOW
+            || self.disk_bytes.saturating_add(disk_bytes) > MAX_HASH_DISK_BYTES_PER_WINDOW;
+        if over_budget {
+            if !must_serve {
+                return HashBudgetDecision::Reject;
+            }
+
+            // BEP 52 requires an immediately-following leaf-hash request for a
+            // serviced chunk to receive a response. Preserve that guarantee by
+            // deferring it into the next compute window instead of bypassing the
+            // disk/request budget. Each peer loop is sequential, so reserving the
+            // next window before waiting cannot race another request.
+            let next_window = self
+                .window_started
+                .checked_add(HASH_REQUEST_WINDOW)
+                .unwrap_or(now);
+            let delay = next_window.saturating_duration_since(now);
+            self.window_started = next_window.max(now);
+            self.requests = 1;
+            self.disk_bytes = disk_bytes;
+            return HashBudgetDecision::ServeAfter(delay);
+        }
+
+        self.requests = self.requests.saturating_add(1);
+        self.disk_bytes = self.disk_bytes.saturating_add(disk_bytes);
+        HashBudgetDecision::ServeAfter(Duration::ZERO)
+    }
+}
+
+impl V2HashStore {
+    fn new(meta: &torrent::TorrentMeta) -> Result<Self, String> {
+        if meta.meta_version == 1 {
+            return Ok(Self {
+                piece_length: meta.info.piece_length,
+                files: Vec::new(),
+            });
+        }
+        let block_length = piece::BLOCK_LEN as u64;
+        if meta.info.piece_length < block_length || !meta.info.piece_length.is_power_of_two() {
+            return Err("invalid v2 piece length".to_string());
+        }
+        let piece_layer = (meta.info.piece_length / block_length).trailing_zeros();
+        let mut padding_hash = [0u8; 32];
+        for _ in 0..piece_layer {
+            padding_hash = v2_hash_parent(padding_hash, padding_hash);
+        }
+
+        let file_offsets = v2_file_offsets(meta)?;
+        if file_offsets.len() != meta.info.file_tree.len() {
+            return Err("invalid v2 file offsets".to_string());
+        }
+
+        let mut files = Vec::new();
+        for (entry, offset) in meta.info.file_tree.iter().zip(file_offsets) {
+            if entry.length == 0 {
+                continue;
+            }
+            let pieces_root = entry
+                .pieces_root
+                .ok_or_else(|| "v2 file is missing its pieces root".to_string())?;
+            let real_leaf_count = usize::try_from(entry.length.div_ceil(block_length))
+                .map_err(|_| "v2 file is too large".to_string())?;
+            let leaf_width = real_leaf_count
+                .checked_next_power_of_two()
+                .ok_or_else(|| "v2 hash tree is too large".to_string())?;
+            let tree_height = leaf_width.trailing_zeros();
+
+            let mut layers = Vec::new();
+            if entry.length > meta.info.piece_length {
+                let piece_hashes = meta
+                    .piece_layers
+                    .iter()
+                    .find_map(|(root, hashes)| {
+                        (root.as_slice() == pieces_root.as_slice()).then_some(hashes)
+                    })
+                    .ok_or_else(|| "v2 file is missing its piece layer".to_string())?;
+                let width = piece_hashes
+                    .len()
+                    .checked_next_power_of_two()
+                    .ok_or_else(|| "v2 piece layer is too large".to_string())?;
+                let mut base = Vec::new();
+                base.try_reserve_exact(width)
+                    .map_err(|_| "v2 piece layer is too large".to_string())?;
+                base.extend_from_slice(piece_hashes);
+                base.resize(width, padding_hash);
+                layers.push(base);
+                while layers.last().is_some_and(|layer| layer.len() > 1) {
+                    let previous = layers
+                        .last()
+                        .ok_or_else(|| "v2 piece layer disappeared".to_string())?;
+                    let mut next = Vec::with_capacity(previous.len() / 2);
+                    for pair in previous.chunks_exact(2) {
+                        next.push(v2_hash_parent(pair[0], pair[1]));
+                    }
+                    layers.push(next);
+                }
+                if layers.last().and_then(|layer| layer.first()).copied() != Some(pieces_root) {
+                    return Err("v2 piece layer does not match its root".to_string());
+                }
+            }
+            files.push(V2HashFile {
+                pieces_root,
+                offset,
+                length: entry.length,
+                leaf_width,
+                tree_height,
+                piece_layer,
+                layers,
+            });
+        }
+        Ok(Self {
+            piece_length: meta.info.piece_length,
+            files,
+        })
+    }
+
+    fn find_file(&self, pieces_root: [u8; 32]) -> Option<&V2HashFile> {
+        self.files
+            .iter()
+            .find(|file| file.pieces_root == pieces_root)
+    }
+
+    fn static_hashes_for(&self, request: peer::HashRequest) -> Option<Vec<[u8; 32]>> {
+        let file = self.find_file(request.pieces_root)?;
+        if request.base_layer != file.piece_layer || file.layers.is_empty() {
+            return None;
+        }
+        let base = file.layers.first()?;
+        let start = usize::try_from(request.index).ok()?;
+        let length = usize::try_from(request.length).ok()?;
+        let end = start.checked_add(length)?;
+        let proof_layers = usize::try_from(request.proof_layers).ok()?;
+        if length < 2
+            || !length.is_power_of_two()
+            || start % length != 0
+            || end > base.len()
+            || proof_layers >= file.layers.len()
+        {
+            return None;
+        }
+
+        let mut hashes = base[start..end].to_vec();
+        let mut range_start = start;
+        let mut range_length = length;
+        for layer_index in 0..proof_layers {
+            let layer = file.layers.get(layer_index)?;
+            if range_length == 1 {
+                hashes.push(*layer.get(range_start ^ 1)?);
+            }
+            range_start /= 2;
+            range_length = (range_length / 2).max(1);
+        }
+        Some(hashes)
+    }
+
+    fn estimated_disk_bytes(&self, request: peer::HashRequest) -> Option<u64> {
+        let file = self.find_file(request.pieces_root)?;
+        if request.base_layer != 0 {
+            self.static_hashes_for(request)?;
+            return Some(0);
+        }
+        let (start, length, proof_layers) = validate_v2_hash_range(file, request)?;
+        if start >= usize::try_from(file.length.div_ceil(piece::BLOCK_LEN as u64)).ok()? {
+            return None;
+        }
+
+        let known_layer = if file.layers.is_empty() {
+            file.tree_height
+        } else {
+            file.piece_layer
+        };
+        let mut leaf_reads = u64::try_from(length).ok()?;
+        let mut range_length = length;
+        for layer in 0..proof_layers {
+            if range_length == 1 && layer < known_layer {
+                leaf_reads = leaf_reads.checked_add(1u64.checked_shl(layer)?)?;
+            }
+            range_length = (range_length / 2).max(1);
+        }
+        leaf_reads.checked_mul(piece::BLOCK_LEN as u64)
+    }
+
+    fn leaf_hashes_for(
+        &self,
+        request: peer::HashRequest,
+        pieces: &piece::PieceManager,
+        storage: &mut storage::Storage,
+    ) -> Option<Vec<[u8; 32]>> {
+        let file = self.find_file(request.pieces_root)?;
+        if request.base_layer != 0 {
+            return None;
+        }
+        let (start, length, proof_layers) = validate_v2_hash_range(file, request)?;
+        let real_leaves = usize::try_from(file.length.div_ceil(piece::BLOCK_LEN as u64)).ok()?;
+        if start >= real_leaves {
+            return None;
+        }
+
+        let mut cache = HashMap::new();
+        let mut hashes = Vec::with_capacity(length.saturating_add(proof_layers as usize));
+        for index in start..start.checked_add(length)? {
+            // Requested leaf hashes must be derived from verified local data,
+            // even when a 16 KiB piece layer is present in metainfo.
+            hashes.push(v2_leaf_hash(self, file, index, pieces, storage)?);
+        }
+
+        let mut range_start = start;
+        let mut range_length = length;
+        for layer in 0..proof_layers {
+            if range_length == 1 {
+                hashes.push(v2_node_hash(
+                    self,
+                    file,
+                    layer,
+                    range_start ^ 1,
+                    pieces,
+                    storage,
+                    &mut cache,
+                )?);
+            }
+            range_start /= 2;
+            range_length = (range_length / 2).max(1);
+        }
+        Some(hashes)
+    }
+
+    fn request_covers_chunk(
+        &self,
+        request: peer::HashRequest,
+        piece_index: u32,
+        begin: u32,
+        length: u32,
+        pieces: &piece::PieceManager,
+    ) -> bool {
+        let Some(file) = self.find_file(request.pieces_root) else {
+            return false;
+        };
+        if request.base_layer != 0 {
+            return false;
+        }
+        let Some((start, hash_count, _)) = validate_v2_hash_range(file, request) else {
+            return false;
+        };
+        let Some(piece_start) = pieces.piece_offset(piece_index) else {
+            return false;
+        };
+        let Some(chunk_start) = piece_start.checked_add(begin as u64) else {
+            return false;
+        };
+        let Some(chunk_end) = chunk_start.checked_add(length as u64) else {
+            return false;
+        };
+        let Some(range_start) = (start as u64)
+            .checked_mul(piece::BLOCK_LEN as u64)
+            .and_then(|offset| file.offset.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(range_end) = (hash_count as u64)
+            .checked_mul(piece::BLOCK_LEN as u64)
+            .and_then(|bytes| range_start.checked_add(bytes))
+            .map(|end| end.min(file.offset.saturating_add(file.length)))
+        else {
+            return false;
+        };
+        chunk_start >= range_start && chunk_end <= range_end
+    }
+}
+
+fn v2_file_offsets(meta: &torrent::TorrentMeta) -> Result<Vec<u64>, String> {
+    if meta.info.length.is_some() || meta.info.files.is_empty() {
+        return meta
+            .file_offsets()
+            .ok_or_else(|| "v2 file layout overflow".to_string());
+    }
+    let offsets = meta
+        .file_offsets()
+        .ok_or_else(|| "v2 file layout overflow".to_string())?;
+    Ok(meta
+        .info
+        .files
+        .iter()
+        .zip(offsets)
+        .filter_map(|(file, offset)| (!file.attr.contains(&b'p')).then_some(offset))
+        .collect())
+}
+
+fn validate_v2_hash_range(
+    file: &V2HashFile,
+    request: peer::HashRequest,
+) -> Option<(usize, usize, u32)> {
+    if request.base_layer > file.tree_height
+        || request.proof_layers > file.tree_height.checked_sub(request.base_layer)?
+    {
+        return None;
+    }
+    let width = file.leaf_width.checked_shr(request.base_layer)?;
+    let start = usize::try_from(request.index).ok()?;
+    let length = usize::try_from(request.length).ok()?;
+    let end = start.checked_add(length)?;
+    if length < 2 || !length.is_power_of_two() || start % length != 0 || end > width {
+        return None;
+    }
+    Some((start, length, request.proof_layers))
+}
+
+fn v2_known_node(file: &V2HashFile, layer: u32, index: usize) -> Option<[u8; 32]> {
+    if layer == file.tree_height && index == 0 {
+        return Some(file.pieces_root);
+    }
+    let relative = layer.checked_sub(file.piece_layer)?;
+    file.layers
+        .get(relative as usize)
+        .and_then(|nodes| nodes.get(index))
+        .copied()
+}
+
+fn v2_leaf_hash(
+    store: &V2HashStore,
+    file: &V2HashFile,
+    index: usize,
+    pieces: &piece::PieceManager,
+    storage: &mut storage::Storage,
+) -> Option<[u8; 32]> {
+    let within_file = u64::try_from(index)
+        .ok()?
+        .checked_mul(piece::BLOCK_LEN as u64)?;
+    if within_file >= file.length {
+        return Some([0u8; 32]);
+    }
+    let read_len = usize::try_from(
+        file.length
+            .checked_sub(within_file)?
+            .min(piece::BLOCK_LEN as u64),
+    )
+    .ok()?;
+    let absolute = file.offset.checked_add(within_file)?;
+    let piece_index = u32::try_from(absolute / store.piece_length).ok()?;
+    if !pieces.is_piece_complete(piece_index) {
+        return None;
+    }
+    let piece_start = pieces.piece_offset(piece_index)?;
+    let piece_end = piece_start.checked_add(pieces.piece_length(piece_index)? as u64)?;
+    if absolute < piece_start || absolute.checked_add(read_len as u64)? > piece_end {
+        return None;
+    }
+    let mut data = vec![0u8; read_len];
+    storage.read_at(absolute, &mut data).ok()?;
+    Some(sha256::sha256(&data))
+}
+
+fn v2_node_hash(
+    store: &V2HashStore,
+    file: &V2HashFile,
+    layer: u32,
+    index: usize,
+    pieces: &piece::PieceManager,
+    storage: &mut storage::Storage,
+    cache: &mut HashMap<(u32, usize), [u8; 32]>,
+) -> Option<[u8; 32]> {
+    if let Some(hash) = cache.get(&(layer, index)).copied() {
+        return Some(hash);
+    }
+    if let Some(hash) = v2_known_node(file, layer, index) {
+        cache.insert((layer, index), hash);
+        return Some(hash);
+    }
+    let hash = if layer == 0 {
+        v2_leaf_hash(store, file, index, pieces, storage)?
+    } else {
+        let child = index.checked_mul(2)?;
+        let left = v2_node_hash(store, file, layer - 1, child, pieces, storage, cache)?;
+        let right = v2_node_hash(store, file, layer - 1, child + 1, pieces, storage, cache)?;
+        v2_hash_parent(left, right)
+    };
+    cache.insert((layer, index), hash);
+    Some(hash)
+}
+
+fn v2_hash_parent(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let mut data = [0u8; 64];
+    data[..32].copy_from_slice(&left);
+    data[32..].copy_from_slice(&right);
+    sha256::sha256(&data)
+}
+
+struct V2HashResponseResources<'a> {
+    store: &'a V2HashStore,
+    pieces: &'a Arc<Mutex<piece::PieceManager>>,
+    storage: &'a Arc<Mutex<storage::Storage>>,
+    limits: &'a TransferLimits,
+    stop_flag: &'a AtomicBool,
+}
+
+fn respond_v2_hash_request<W: Write>(
+    writer: &mut W,
+    resources: V2HashResponseResources<'_>,
+    budget: &mut HashRequestBudget,
+    must_serve: bool,
+    request: peer::HashRequest,
+) -> Result<(), String> {
+    let estimated_bytes = resources.store.estimated_disk_bytes(request).unwrap_or(0);
+    let hashes = match budget.reserve(estimated_bytes, must_serve) {
+        HashBudgetDecision::Reject => None,
+        HashBudgetDecision::ServeAfter(delay) => {
+            sleep_with_shutdown_or_stop(delay, resources.stop_flag);
+            if torrent_stop_requested(resources.stop_flag) {
+                return Err("hash response cancelled".to_string());
+            }
+            if request.base_layer == 0 {
+                let pieces = lock_or_recover(resources.pieces);
+                let mut storage = lock_or_recover(resources.storage);
+                resources
+                    .store
+                    .leaf_hashes_for(request, &pieces, &mut storage)
+            } else {
+                resources.store.static_hashes_for(request)
+            }
+        }
+    };
+    let response = match hashes {
+        Some(hashes) => peer::Message::Hashes { request, hashes },
+        None => peer::Message::HashReject(request),
+    };
+    let response_bytes = hash_response_payload_bytes(&response);
+    resources.limits.global_up.throttle(response_bytes);
+    resources.limits.torrent_up.throttle(response_bytes);
+    if torrent_stop_requested(resources.stop_flag) {
+        return Err("hash response cancelled".to_string());
+    }
+    peer::write_message(writer, &response).map_err(|err| format!("hash response failed: {err}"))
+}
+
+fn hash_response_payload_bytes(message: &peer::Message) -> usize {
+    match message {
+        peer::Message::Hashes { hashes, .. } => {
+            HASH_MESSAGE_FIXED_PAYLOAD_BYTES.saturating_add(hashes.len().saturating_mul(32))
+        }
+        peer::Message::HashReject(_) => HASH_MESSAGE_FIXED_PAYLOAD_BYTES,
+        _ => 0,
+    }
+}
+
+fn build_file_spans(meta: &torrent::TorrentMeta) -> Result<Vec<FileSpan>, String> {
     let name = String::from_utf8_lossy(&meta.info.name).into_owned();
     if let Some(length) = meta.info.length {
-        return vec![FileSpan {
+        return Ok(vec![FileSpan {
             path: name,
+            web_path: meta.info.name.clone(),
+            is_padding: false,
             offset: 0,
             length,
-        }];
+        }]);
     }
 
     let mut spans = if !meta.info.files.is_empty() {
@@ -4542,43 +7451,71 @@ fn build_file_spans(meta: &torrent::TorrentMeta) -> Vec<FileSpan> {
     } else {
         Vec::with_capacity(meta.info.file_tree.len())
     };
-    let mut offset = 0u64;
+    let offsets = meta
+        .file_offsets()
+        .ok_or_else(|| "file layout overflow".to_string())?;
     if !meta.info.files.is_empty() {
-        for file in &meta.info.files {
+        for (file, offset) in meta.info.files.iter().zip(offsets) {
             let mut path = name.clone();
+            let mut web_path = meta.info.name.clone();
             for segment in &file.path {
                 path.push('/');
                 path.push_str(&String::from_utf8_lossy(segment));
+                web_path.push(b'/');
+                web_path.extend_from_slice(segment);
             }
             spans.push(FileSpan {
                 path,
+                web_path,
+                is_padding: file.attr.contains(&b'p'),
                 offset,
                 length: file.length,
             });
-            offset = offset.saturating_add(file.length);
         }
     } else {
-        for file in &meta.info.file_tree {
+        let single_v2_file = !is_getright_multi_file(meta);
+        for (file, offset) in meta.info.file_tree.iter().zip(offsets) {
             let mut path = name.clone();
+            let mut web_path = if single_v2_file {
+                Vec::new()
+            } else {
+                meta.info.name.clone()
+            };
             for segment in &file.path {
                 path.push('/');
                 path.push_str(&String::from_utf8_lossy(segment));
+                if !web_path.is_empty() {
+                    web_path.push(b'/');
+                }
+                web_path.extend_from_slice(segment);
             }
             spans.push(FileSpan {
                 path,
+                web_path,
+                is_padding: false,
                 offset,
                 length: file.length,
             });
-            offset = offset.saturating_add(file.length);
         }
     }
-    spans
+    Ok(spans)
+}
+
+/// BEP 19's URL rules are based on the metainfo layout, not the number of
+/// physical spans. A valid multi-file torrent may contain only one file.
+fn is_getright_multi_file(meta: &torrent::TorrentMeta) -> bool {
+    if meta.info.length.is_some() {
+        return false;
+    }
+    if !meta.info.files.is_empty() {
+        return true;
+    }
+    !(meta.info.file_tree.len() == 1 && meta.info.file_tree[0].path.len() == 1)
 }
 
 fn build_ui_files(
     spans: &[FileSpan],
     pieces: &piece::PieceManager,
-    base_piece_length: u64,
     file_priorities: &[u8],
 ) -> Vec<ui::UiFile> {
     let mut files: Vec<ui::UiFile> = spans
@@ -4602,11 +7539,28 @@ fn build_ui_files(
             Some(len) => len as u64,
             None => continue,
         };
-        let piece_start = (index as u64).saturating_mul(base_piece_length);
+        let Some(piece_start) = pieces.piece_offset(index) else {
+            continue;
+        };
         apply_piece_to_files(&mut files, spans, piece_start, piece_len);
     }
 
     files
+}
+
+fn apply_ui_file_renames(files: &mut [ui::UiFile], renames: &HashMap<usize, String>) {
+    for (index, name) in renames {
+        if let Some(file) = files.get_mut(*index) {
+            file.path = renamed_display_path(&file.path, name);
+        }
+    }
+}
+
+fn renamed_display_path(path: &str, name: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{name}"),
+        None => name.to_string(),
+    }
 }
 
 fn apply_file_priorities(
@@ -4640,6 +7594,9 @@ fn compute_piece_priorities(
         return priorities;
     }
     for (idx, span) in spans.iter().enumerate() {
+        if span.is_padding || span.length == 0 {
+            continue;
+        }
         let priority = file_priorities
             .get(idx)
             .copied()
@@ -4662,13 +7619,29 @@ fn compute_piece_priorities(
 }
 
 #[cfg(feature = "webseed")]
-fn collect_web_seeds(meta: &torrent::TorrentMeta) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebSeed {
+    /// BEP 19/GetRight-style static file or directory URL.
+    GetRight(String),
+    /// BEP 17/Hoffman-style script endpoint.
+    Hoffman(String),
+}
+
+#[cfg(feature = "webseed")]
+fn collect_web_seeds(meta: &torrent::TorrentMeta) -> Vec<WebSeed> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for url in meta.url_list.iter().chain(meta.httpseeds.iter()) {
+    for url in &meta.url_list {
         if let Ok(url_str) = std::str::from_utf8(url) {
-            if seen.insert(url_str.to_string()) {
-                out.push(url_str.to_string());
+            if seen.insert((0u8, url_str.to_string())) {
+                out.push(WebSeed::GetRight(url_str.to_string()));
+            }
+        }
+    }
+    for url in &meta.httpseeds {
+        if let Ok(url_str) = std::str::from_utf8(url) {
+            if seen.insert((1u8, url_str.to_string())) {
+                out.push(WebSeed::Hoffman(url_str.to_string()));
             }
         }
     }
@@ -4676,98 +7649,160 @@ fn collect_web_seeds(meta: &torrent::TorrentMeta) -> Vec<String> {
 }
 
 #[cfg(feature = "webseed")]
+fn webseed_memory_budget_bytes(piece_len: u32) -> Option<usize> {
+    if piece_len == 0 || piece_len as u64 > torrent::MAX_PIECE_LENGTH {
+        return None;
+    }
+    let max_body = (piece_len as usize).checked_add(WEBSEED_HTTP_BODY_SLACK)?;
+    http::response_memory_budget(max_body)
+}
+
+#[cfg(feature = "webseed")]
+fn try_reserve_webseed_memory(
+    pieces: &Mutex<piece::PieceManager>,
+    index: u32,
+    piece_len: u32,
+    budgets: &piece::PieceBufferBudgets,
+) -> Option<piece::PieceBufferReservation> {
+    let reservation =
+        webseed_memory_budget_bytes(piece_len).and_then(|bytes| budgets.try_reserve(bytes));
+    if reservation.is_none() {
+        lock_or_recover(pieces).release_piece(WEBSEED_RESERVATION_ID, index);
+    }
+    reservation
+}
+
+#[cfg(feature = "webseed")]
 #[allow(clippy::too_many_arguments)]
 fn start_webseed_worker(
-    web_seeds: Vec<String>,
+    web_seeds: Vec<WebSeed>,
     pieces: Arc<Mutex<piece::PieceManager>>,
     storage: Arc<Mutex<storage::Storage>>,
     completed_log: Arc<Mutex<Vec<u32>>>,
     file_spans: Arc<Vec<FileSpan>>,
-    base_piece_length: u64,
+    getright_multi_file: bool,
+    _base_piece_length: u64,
+    info_hash: [u8; 20],
     limits: TransferLimits,
     downloaded: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
+    piece_buffer_budgets: piece::PieceBufferBudgets,
     ui_state: Option<Arc<Mutex<ui::UiState>>>,
     torrent_id: u64,
-) -> Option<thread::JoinHandle<()>> {
+) -> Result<Option<thread::JoinHandle<()>>, String> {
     if web_seeds.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(thread::spawn(move || loop {
-        if torrent_stop_requested(&stop_flag) {
-            break;
-        }
-        let (index, piece_len, expected) = {
-            let p = lock_or_recover(&pieces);
-            let index = match p.next_missing_piece() {
-                Some(index) => index,
-                None => break,
+    thread::Builder::new()
+        .name(format!("webseed-{torrent_id}"))
+        .spawn(move || loop {
+            if torrent_stop_requested(&stop_flag) {
+                break;
+            }
+            let (index, piece_start, piece_len, expected) = {
+                let mut p = lock_or_recover(&pieces);
+                let available = vec![u8::MAX; p.bitfield_len()];
+                let index =
+                    match p.reserve_piece_for_peer(WEBSEED_RESERVATION_ID, &available, false) {
+                        Some(index) => index,
+                        None => break,
+                    };
+                let length = match p.piece_length(index) {
+                    Some(length) => length,
+                    None => {
+                        p.release_piece(WEBSEED_RESERVATION_ID, index);
+                        break;
+                    }
+                };
+                let offset = match p.piece_offset(index) {
+                    Some(offset) => offset,
+                    None => {
+                        p.release_piece(WEBSEED_RESERVATION_ID, index);
+                        break;
+                    }
+                };
+                let expected = match p.piece_hash(index) {
+                    Some(hash) => hash.clone(),
+                    None => {
+                        p.release_piece(WEBSEED_RESERVATION_ID, index);
+                        break;
+                    }
+                };
+                (index, offset, length, expected)
             };
-            let length = match p.piece_length(index) {
-                Some(length) => length,
-                None => break,
-            };
-            let expected = match p.piece_hash(index) {
-                Some(hash) => hash.clone(),
-                None => break,
-            };
-            (index, length, expected)
-        };
 
-        let data = match fetch_piece_from_web_seeds(
-            &web_seeds,
-            &file_spans,
-            base_piece_length,
-            index,
-            piece_len,
-        ) {
-            Ok(data) => data,
-            Err(_) => {
+            let Some(memory_reservation) =
+                try_reserve_webseed_memory(&pieces, index, piece_len, &piece_buffer_budgets)
+            else {
+                // Shared memory pressure is routine backpressure. Give peer
+                // and other torrent workers a chance to release buffers.
+                sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, &stop_flag);
+                continue;
+            };
+            let data = match fetch_piece_from_web_seeds(
+                &web_seeds,
+                &file_spans,
+                getright_multi_file,
+                info_hash,
+                index,
+                piece_start,
+                piece_len,
+            ) {
+                Ok(data) => data,
+                Err(_) => {
+                    lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
+                    sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
+                    continue;
+                }
+            };
+            if !verify_piece_hash(&data, &expected) {
+                lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
                 sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
                 continue;
             }
-        };
-        if !verify_piece_hash(&data, &expected) {
-            sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
-            continue;
-        }
-        let offset = (index as u64).saturating_mul(base_piece_length);
-        {
-            let mut s = lock_or_recover(&storage);
-            if s.write_at(offset, &data).is_err() {
+            let write_ok = {
+                let mut s = lock_or_recover(&storage);
+                s.write_at(piece_start, &data).is_ok()
+            };
+            if !write_ok {
+                lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
                 continue;
             }
-        }
-        {
-            let mut p = lock_or_recover(&pieces);
-            if let Ok(true) = p.mark_piece_complete(index) {
-                SESSION_DOWNLOADED_BYTES.fetch_add(piece_len as u64, Ordering::SeqCst);
-                downloaded.fetch_add(piece_len as u64, Ordering::SeqCst);
-                limits.global_down.throttle(piece_len as usize);
-                limits.torrent_down.throttle(piece_len as usize);
+            drop(data);
+            drop(memory_reservation);
+            let was_new = {
+                let mut p = lock_or_recover(&pieces);
+                p.mark_piece_complete(index).unwrap_or(false)
+            };
+            if !was_new {
+                continue;
             }
-        }
-        if let Ok(mut log) = completed_log.lock() {
-            log.push(index);
-        }
-        let piece_start = (index as u64).saturating_mul(base_piece_length);
-        let piece_len_u64 = piece_len as u64;
-        let completed_pieces = {
-            let p = lock_or_recover(&pieces);
-            p.completed_pieces()
-        };
-        update_ui(&ui_state, |state| {
-            apply_piece_completion_ui(
-                state,
-                torrent_id,
-                completed_pieces,
-                &file_spans,
-                piece_start,
-                piece_len_u64,
-                true,
-            );
-        });
-    }))
+            SESSION_DOWNLOADED_BYTES.fetch_add(piece_len as u64, Ordering::SeqCst);
+            downloaded.fetch_add(piece_len as u64, Ordering::SeqCst);
+            limits.global_down.throttle(piece_len as usize);
+            limits.torrent_down.throttle(piece_len as usize);
+            if let Ok(mut log) = completed_log.lock() {
+                log.push(index);
+            }
+            let piece_len_u64 = piece_len as u64;
+            let completed_pieces = {
+                let p = lock_or_recover(&pieces);
+                p.completed_pieces()
+            };
+            update_ui(&ui_state, |state| {
+                apply_piece_completion_ui(
+                    state,
+                    torrent_id,
+                    completed_pieces,
+                    &file_spans,
+                    piece_start,
+                    piece_len_u64,
+                    true,
+                );
+            });
+        })
+        .map(Some)
+        .map_err(|err| format!("web seed worker could not start: {err}"))
 }
 
 #[cfg(not(feature = "webseed"))]
@@ -4783,14 +7818,17 @@ fn start_webseed_worker(
     _storage: Arc<Mutex<storage::Storage>>,
     _completed_log: Arc<Mutex<Vec<u32>>>,
     _file_spans: Arc<Vec<FileSpan>>,
+    _getright_multi_file: bool,
     _base_piece_length: u64,
+    _info_hash: [u8; 20],
     _limits: TransferLimits,
     _downloaded: Arc<AtomicU64>,
     _stop_flag: Arc<AtomicBool>,
+    _piece_buffer_budgets: piece::PieceBufferBudgets,
     _ui_state: Option<Arc<Mutex<ui::UiState>>>,
     _torrent_id: u64,
-) -> Option<thread::JoinHandle<()>> {
-    None
+) -> Result<Option<thread::JoinHandle<()>>, String> {
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4799,78 +7837,131 @@ fn start_resume_worker(
     info_hash: [u8; 20],
     base_piece_length: u64,
     pieces: Arc<Mutex<piece::PieceManager>>,
+    storage: Arc<Mutex<storage::Storage>>,
     file_priorities: Arc<Mutex<Vec<u8>>>,
     file_spans: Arc<Vec<FileSpan>>,
-    download_dir: PathBuf,
     downloaded: Arc<AtomicU64>,
     uploaded: Arc<AtomicU64>,
     peer_queue: Arc<Mutex<PeerQueue>>,
     stop_flag: Arc<AtomicBool>,
     file_renames: Arc<Mutex<HashMap<usize, String>>>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut last_save = Instant::now() - RESUME_SAVE_INTERVAL;
-        loop {
-            if torrent_stop_requested(&stop_flag) {
-                break;
-            }
-            let complete = {
-                let p = lock_or_recover(&pieces);
-                p.is_complete()
-            };
-            if last_save.elapsed() >= RESUME_SAVE_INTERVAL || complete {
-                let priorities = match file_priorities.lock() {
-                    Ok(priorities) => priorities.clone(),
-                    Err(_) => Vec::new(),
+    save_requested: Arc<AtomicBool>,
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name(format!("resume-{}", hex(&info_hash[..4])))
+        .spawn(move || {
+            let mut last_save = Instant::now() - RESUME_SAVE_INTERVAL;
+            let mut last_complete: Option<bool> = None;
+            loop {
+                let stopping = torrent_stop_requested(&stop_flag);
+                let complete = {
+                    let p = lock_or_recover(&pieces);
+                    p.is_complete()
                 };
-                let downloaded = downloaded.load(Ordering::SeqCst);
-                let uploaded = uploaded.load(Ordering::SeqCst);
-                let peers = peer_queue
-                    .lock()
-                    .map(|queue| queue.sample(256))
-                    .unwrap_or_default();
-                let renames: Vec<(usize, String)> = file_renames
-                    .lock()
-                    .map(|map| map.iter().map(|(k, v)| (*k, v.clone())).collect())
-                    .unwrap_or_default();
-                if let Ok(p) = pieces.lock() {
-                    let _ = save_resume_snapshot(
-                        &resume_path,
-                        info_hash,
-                        base_piece_length,
-                        &p,
-                        &priorities,
-                        &file_spans,
-                        &download_dir,
-                        downloaded,
-                        uploaded,
-                        peers,
-                        &renames,
-                    );
+                let requested = save_requested.swap(false, Ordering::AcqRel);
+                let completion_changed = last_complete.is_some_and(|last| last != complete);
+                if last_save.elapsed() >= RESUME_SAVE_INTERVAL
+                    || completion_changed
+                    || requested
+                    || stopping
+                {
+                    let priorities = lock_or_recover(&file_priorities).clone();
+                    let downloaded = downloaded.load(Ordering::SeqCst);
+                    let uploaded = uploaded.load(Ordering::SeqCst);
+                    let peers = lock_or_recover(&peer_queue).sample(256);
+                    let snapshot = {
+                        // Nested runtime locks always follow pieces -> storage -> renames.
+                        // This gives the saved bitfield and rename map the exact bytes and
+                        // filesystem paths that were made durable by the flush.
+                        let p = lock_or_recover(&pieces);
+                        let mut s = lock_or_recover(&storage);
+                        match s.flush() {
+                            Ok(()) => {
+                                let renames = lock_or_recover(&file_renames)
+                                    .iter()
+                                    .map(|(index, name)| (*index, name.clone()))
+                                    .collect::<Vec<_>>();
+                                Ok((
+                                    build_bitfield(&p),
+                                    collect_storage_file_stats(&s, &file_spans),
+                                    renames,
+                                    p.is_complete(),
+                                ))
+                            }
+                            Err(err) => Err(err.to_string()),
+                        }
+                    };
+                    match snapshot {
+                        Ok((bitfield, files, renames, snapshot_complete)) => {
+                            match save_resume_data(
+                                &resume_path,
+                                info_hash,
+                                base_piece_length,
+                                bitfield,
+                                &priorities,
+                                files,
+                                downloaded,
+                                uploaded,
+                                peers,
+                                &renames,
+                            ) {
+                                Ok(()) => {
+                                    last_save = Instant::now();
+                                    last_complete = Some(snapshot_complete);
+                                }
+                                Err(err) => {
+                                    log_warn!("resume save failed: {err}");
+                                    if !stopping {
+                                        save_requested.store(true, Ordering::Release);
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            log_warn!("resume flush failed: {err}");
+                            if !stopping {
+                                save_requested.store(true, Ordering::Release);
+                            }
+                        }
+                    }
                 }
-                last_save = Instant::now();
+                if stopping {
+                    break;
+                }
+                sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
             }
-            if complete {
-                break;
-            }
-            sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
-        }
-    })
+        })
+        .map_err(|err| format!("resume worker could not start: {err}"))
 }
 
 #[cfg(feature = "webseed")]
 fn fetch_piece_from_web_seeds(
-    web_seeds: &[String],
+    web_seeds: &[WebSeed],
     file_spans: &[FileSpan],
-    base_piece_length: u64,
+    getright_multi_file: bool,
+    info_hash: [u8; 20],
     index: u32,
+    piece_start: u64,
     piece_len: u32,
 ) -> Result<Vec<u8>, String> {
-    let piece_start = (index as u64).saturating_mul(base_piece_length);
     let piece_end = piece_start.saturating_add(piece_len as u64);
-    for base in web_seeds {
+    let piece_http_limit = (piece_len as usize)
+        .checked_add(WEBSEED_HTTP_BODY_SLACK)
+        .ok_or_else(|| "web seed piece length overflow".to_string())?;
+    for web_seed in web_seeds {
+        if let WebSeed::Hoffman(base) = web_seed {
+            let url = build_httpseed_url(base, info_hash, index);
+            if let Ok(data) = http::get_public(&url, piece_http_limit) {
+                if data.len() == piece_len as usize {
+                    return Ok(data);
+                }
+            }
+            continue;
+        }
+        let WebSeed::GetRight(base) = web_seed else {
+            unreachable!("all web seed variants handled")
+        };
         let mut out = Vec::with_capacity(piece_len as usize);
-        let is_multi = file_spans.len() > 1;
         let mut ok = true;
         for span in file_spans {
             let file_start = span.offset;
@@ -4880,22 +7971,30 @@ fn fetch_piece_from_web_seeds(
             if overlap_end <= overlap_start {
                 continue;
             }
+            if span.is_padding {
+                out.resize(
+                    out.len()
+                        .saturating_add((overlap_end - overlap_start) as usize),
+                    0,
+                );
+                continue;
+            }
             let range_start = overlap_start.saturating_sub(file_start);
             let range_end = overlap_end.saturating_sub(file_start).saturating_sub(1);
-            let url = build_webseed_url(base, &span.path, is_multi);
-            let data = match http::get_range(
-                &url,
-                range_start,
-                range_end,
-                (overlap_end - overlap_start) as usize + 1024,
-            ) {
+            let expected_len = (overlap_end - overlap_start) as usize;
+            let range_http_limit = expected_len
+                .checked_add(WEBSEED_HTTP_BODY_SLACK)
+                .ok_or_else(|| "web seed range length overflow".to_string())?;
+            let url = build_webseed_url(base, &span.web_path, getright_multi_file);
+            let data = match http::get_range_public(&url, range_start, range_end, range_http_limit)
+            {
                 Ok(data) => data,
                 Err(_) => {
                     ok = false;
                     break;
                 }
             };
-            if data.len() != (overlap_end - overlap_start) as usize {
+            if data.len() != expected_len {
                 ok = false;
                 break;
             }
@@ -4909,8 +8008,8 @@ fn fetch_piece_from_web_seeds(
 }
 
 #[cfg(feature = "webseed")]
-fn build_webseed_url(base: &str, path: &str, multi: bool) -> String {
-    if !multi {
+fn build_webseed_url(base: &str, path: &[u8], multi: bool) -> String {
+    if !multi && !base.ends_with('/') {
         return base.to_string();
     }
     let mut out = base.trim_end_matches('/').to_string();
@@ -4920,9 +8019,9 @@ fn build_webseed_url(base: &str, path: &str, multi: bool) -> String {
 }
 
 #[cfg(feature = "webseed")]
-fn percent_encode_path(path: &str) -> String {
+fn percent_encode_path(path: &[u8]) -> String {
     let mut out = String::with_capacity(path.len());
-    for &b in path.as_bytes() {
+    for &b in path {
         if is_unreserved(b) || b == b'/' {
             out.push(b as char);
         } else {
@@ -4930,6 +8029,20 @@ fn percent_encode_path(path: &str) -> String {
             out.push_str(&format!("{:02X}", b));
         }
     }
+    out
+}
+
+#[cfg(feature = "webseed")]
+fn build_httpseed_url(base: &str, info_hash: [u8; 20], piece: u32) -> String {
+    let mut out = base.to_string();
+    out.push(if base.contains('?') { '&' } else { '?' });
+    out.push_str("info_hash=");
+    for byte in info_hash {
+        out.push('%');
+        out.push_str(&format!("{byte:02X}"));
+    }
+    out.push_str("&piece=");
+    out.push_str(&piece.to_string());
     out
 }
 
@@ -4963,6 +8076,7 @@ fn apply_piece_to_files(
 #[allow(clippy::too_many_arguments)]
 fn peer_worker_loop(
     info_hash: [u8; 20],
+    hybrid_v2_info_hash: Option<[u8; 20]>,
     peer_id: [u8; 20],
     torrent_id: u64,
     peer_tags: &Arc<AtomicU64>,
@@ -4976,15 +8090,18 @@ fn peer_worker_loop(
     upload_requests_served: &Arc<AtomicU64>,
     file_spans: &Arc<Vec<FileSpan>>,
     base_piece_length: u64,
+    v2_hashes: &Arc<V2HashStore>,
     connect_cfg: ConnectionConfig,
     limits: TransferLimits,
     downloaded: &Arc<AtomicU64>,
     uploaded: &Arc<AtomicU64>,
     upload_manager: &Arc<UploadManager>,
+    peer_cancellations: &PeerCancellationRegistry,
     paused_flag: &Arc<AtomicBool>,
     stop_flag: &Arc<AtomicBool>,
     peer_slots: Arc<PeerSlots>,
     per_torrent_slots: Arc<PeerSlots>,
+    piece_buffer_budgets: piece::PieceBufferBudgets,
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
 ) {
     loop {
@@ -5022,6 +8139,7 @@ fn peer_worker_loop(
         let result = download_from_peer_concurrent(
             addr,
             info_hash,
+            hybrid_v2_info_hash,
             peer_id,
             torrent_id,
             peer_tag,
@@ -5032,6 +8150,7 @@ fn peer_worker_loop(
             allow_pex,
             file_spans,
             base_piece_length,
+            v2_hashes,
             &connect_cfg,
             &limits,
             downloaded,
@@ -5040,8 +8159,10 @@ fn peer_worker_loop(
             interested_peers,
             upload_requests_served,
             upload_manager,
+            peer_cancellations,
             paused_flag,
             stop_flag,
+            &piece_buffer_budgets,
             ui_state,
         );
 
@@ -5069,6 +8190,7 @@ struct ResumeStats {
     completed_bytes: u64,
 }
 
+#[derive(Debug)]
 struct ResumeData {
     info_hash: [u8; 20],
     piece_length: u64,
@@ -5081,6 +8203,7 @@ struct ResumeData {
     file_renames: Vec<(usize, String)>,
 }
 
+#[derive(Debug)]
 struct ResumeFileStat {
     length: u64,
     mtime: u64,
@@ -5091,7 +8214,6 @@ fn resume_from_storage(
     storage: &mut storage::Storage,
     base_piece_length: u64,
     file_spans: &[FileSpan],
-    download_dir: &Path,
     resume: Option<&ResumeData>,
 ) -> Result<ResumeStats, String> {
     let piece_count = pieces.piece_count();
@@ -5103,50 +8225,18 @@ fn resume_from_storage(
             && resume.bitfield.len() == pieces.bitfield_len()
             && resume.files.len() == file_spans.len()
         {
-            let mut needs_verify = vec![false; piece_count];
-            for (idx, span) in file_spans.iter().enumerate() {
-                let expected = &resume.files[idx];
-                let actual = file_stat(download_dir, span);
-                let changed = match actual {
-                    Some(actual) => {
-                        actual.length != expected.length || actual.mtime != expected.mtime
-                    }
-                    None => true,
-                };
-                if changed {
-                    let start_piece = span.offset / base_piece_length;
-                    let end_offset = span.offset.saturating_add(span.length).saturating_sub(1);
-                    let end_piece = end_offset / base_piece_length;
-                    for piece_index in start_piece..=end_piece {
-                        if let Some(slot) = needs_verify.get_mut(piece_index as usize) {
-                            *slot = true;
-                        }
-                    }
-                }
-            }
             let max_len = base_piece_length
                 .try_into()
                 .map_err(|_| "piece length too large".to_string())?;
             let mut buffer = vec![0u8; max_len];
-            for (index, needs_verify_piece) in needs_verify.iter().enumerate().take(piece_count) {
+            for index in 0..piece_count {
                 if !bitfield_has(&resume.bitfield, index) {
                     continue;
                 }
-                if *needs_verify_piece {
-                    if verify_piece(
-                        storage,
-                        pieces,
-                        index as u32,
-                        base_piece_length,
-                        &mut buffer,
-                    )? {
-                        continue;
-                    }
-                } else {
-                    pieces
-                        .mark_piece_complete(index as u32)
-                        .map_err(|err| format!("resume mark failed: {err}"))?;
-                }
+                // Length and modification time are only cache hints: they can
+                // survive bit rot or deliberate metadata restoration. Never
+                // advertise resumed data until its piece hash is verified.
+                let _ = verify_piece(storage, pieces, index as u32, &mut buffer)?;
             }
             return Ok(ResumeStats {
                 completed_bytes: pieces.completed_bytes(),
@@ -5154,13 +8244,14 @@ fn resume_from_storage(
         }
     }
 
-    full_recheck(pieces, storage, base_piece_length)
+    full_recheck(pieces, storage, base_piece_length, None)
 }
 
 fn full_recheck(
     pieces: &mut piece::PieceManager,
     storage: &mut storage::Storage,
     base_piece_length: u64,
+    stop_flag: Option<&AtomicBool>,
 ) -> Result<ResumeStats, String> {
     let piece_count = pieces.piece_count();
     let max_len = base_piece_length
@@ -5168,13 +8259,10 @@ fn full_recheck(
         .map_err(|_| "piece length too large".to_string())?;
     let mut buffer = vec![0u8; max_len];
     for index in 0..piece_count {
-        let _ = verify_piece(
-            storage,
-            pieces,
-            index as u32,
-            base_piece_length,
-            &mut buffer,
-        );
+        if stop_flag.is_some_and(torrent_stop_requested) {
+            break;
+        }
+        verify_piece(storage, pieces, index as u32, &mut buffer)?;
     }
     Ok(ResumeStats {
         completed_bytes: pieces.completed_bytes(),
@@ -5185,13 +8273,14 @@ fn verify_piece(
     storage: &mut storage::Storage,
     pieces: &mut piece::PieceManager,
     index: u32,
-    base_piece_length: u64,
     buffer: &mut [u8],
 ) -> Result<bool, String> {
     let length = pieces
         .piece_length(index)
         .ok_or_else(|| "missing piece length".to_string())? as usize;
-    let offset = (index as u64).saturating_mul(base_piece_length);
+    let offset = pieces
+        .piece_offset(index)
+        .ok_or_else(|| "missing piece offset".to_string())?;
     let target = &mut buffer[..length];
     if storage.read_at(offset, target).is_err() {
         return Ok(false);
@@ -5214,8 +8303,131 @@ fn resume_path(download_dir: &Path, info_hash: [u8; 20]) -> PathBuf {
     dir
 }
 
+fn relocate_resume_state(source: &Path, destination: &Path) -> Result<(), String> {
+    if source == destination {
+        return Ok(());
+    }
+    let data = match read_file_limited(source, MAX_RESUME_STATE_BYTES, true) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("read resume state: {err}")),
+    };
+    parse_resume_data(&data).map_err(|err| format!("validate resume state: {err}"))?;
+    write_atomic_file(destination, &data, "resume relocation", false, true)?;
+    remove_file_bound(source).map_err(|err| format!("remove old resume state: {err}"))?;
+    let _ = remove_file_bound(&sidecar_path(source, ".bak"));
+    Ok(())
+}
+
 fn session_path(download_dir: &Path) -> PathBuf {
     download_dir.join(".rustorrent").join("session.benc")
+}
+
+#[cfg(unix)]
+fn push_session_path(
+    dict: &mut Vec<(Vec<u8>, Value)>,
+    key: &[u8],
+    _wide_key: &[u8],
+    path: &Path,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    dict.push((
+        key.to_vec(),
+        Value::Bytes(path.as_os_str().as_bytes().to_vec()),
+    ));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn push_session_path(
+    dict: &mut Vec<(Vec<u8>, Value)>,
+    _key: &[u8],
+    wide_key: &[u8],
+    path: &Path,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut bytes = Vec::new();
+    for unit in path.as_os_str().encode_wide() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    dict.push((wide_key.to_vec(), Value::Bytes(bytes)));
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn push_session_path(
+    dict: &mut Vec<(Vec<u8>, Value)>,
+    key: &[u8],
+    _wide_key: &[u8],
+    path: &Path,
+) -> Result<(), String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| "session path is not valid UTF-8".to_string())?;
+    dict.push((key.to_vec(), Value::Bytes(value.as_bytes().to_vec())));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn decode_session_path(
+    items: &[(Vec<u8>, Value)],
+    key: &[u8],
+    _wide_key: &[u8],
+) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::ffi::OsStringExt;
+    match dict_get(items, key) {
+        Some(Value::Bytes(bytes)) if !bytes.is_empty() => Ok(Some(PathBuf::from(
+            std::ffi::OsString::from_vec(bytes.clone()),
+        ))),
+        None => Ok(None),
+        _ => Err("invalid session path".to_string()),
+    }
+}
+
+#[cfg(windows)]
+fn decode_session_path(
+    items: &[(Vec<u8>, Value)],
+    key: &[u8],
+    wide_key: &[u8],
+) -> Result<Option<PathBuf>, String> {
+    use std::os::windows::ffi::OsStringExt;
+    if let Some(value) = dict_get(items, wide_key) {
+        let Value::Bytes(bytes) = value else {
+            return Err("invalid wide session path".to_string());
+        };
+        if bytes.is_empty() || bytes.len() % 2 != 0 {
+            return Err("invalid wide session path".to_string());
+        }
+        let wide = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(&wide))));
+    }
+    match dict_get(items, key) {
+        Some(Value::Bytes(bytes)) if !bytes.is_empty() => String::from_utf8(bytes.clone())
+            .map(PathBuf::from)
+            .map(Some)
+            .map_err(|_| "invalid legacy session path".to_string()),
+        None => Ok(None),
+        _ => Err("invalid legacy session path".to_string()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn decode_session_path(
+    items: &[(Vec<u8>, Value)],
+    key: &[u8],
+    _wide_key: &[u8],
+) -> Result<Option<PathBuf>, String> {
+    match dict_get(items, key) {
+        Some(Value::Bytes(bytes)) if !bytes.is_empty() => String::from_utf8(bytes.clone())
+            .map(PathBuf::from)
+            .map(Some)
+            .map_err(|_| "invalid session path".to_string()),
+        None => Ok(None),
+        _ => Err("invalid session path".to_string()),
+    }
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -5229,17 +8441,96 @@ fn write_atomic_file(
     data: &[u8],
     label: &str,
     keep_backup: bool,
+    private: bool,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("{label} dir failed: {err}"))?;
+    #[cfg(any(unix, windows))]
+    if state_dir::is_state_file_path(path) {
+        let mode = if private { 0o600 } else { 0o644 };
+        return state_dir::write_atomic(path, data, keep_backup, mode, MAX_ATOMIC_BACKUP_BYTES)
+            .map_err(|err| format!("{label} state write failed: {err}"));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent != Path::new(".") {
+        if state_dir::is_state_file_path(path) {
+            let download_dir = parent
+                .parent()
+                .ok_or_else(|| format!("{label} state directory has no parent"))?;
+            ensure_private_state_directory(download_dir)?;
+        } else {
+            fs::create_dir_all(parent).map_err(|err| format!("{label} dir failed: {err}"))?;
+        }
     }
     if keep_backup && path.exists() {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|err| format!("{label} metadata failed: {err}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!("{label} target is not a regular file"));
+        }
         let backup_path = sidecar_path(path, ".bak");
-        let _ = fs::copy(path, &backup_path);
+        let existing = read_file_limited(path, MAX_ATOMIC_BACKUP_BYTES, true)
+            .map_err(|err| format!("{label} backup read failed: {err}"))?;
+        write_atomic_file(
+            &backup_path,
+            &existing,
+            &format!("{label} backup"),
+            false,
+            private,
+        )?;
     }
-    let tmp_path = sidecar_path(path, ".tmp");
-    fs::write(&tmp_path, data).map_err(|err| format!("{label} write failed: {err}"))?;
-    fs::rename(&tmp_path, path).map_err(|err| format!("{label} rename failed: {err}"))?;
+
+    let sequence = ATOMIC_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = sidecar_path(path, &format!(".tmp.{}.{}", std::process::id(), sequence));
+    let write_result = (|| -> Result<(), String> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(if private { 0o600 } else { 0o644 });
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut tmp = options
+            .open(&tmp_path)
+            .map_err(|err| format!("{label} temporary file failed: {err}"))?;
+        tmp.write_all(data)
+            .map_err(|err| format!("{label} write failed: {err}"))?;
+        tmp.sync_all()
+            .map_err(|err| format!("{label} sync failed: {err}"))?;
+        drop(tmp);
+        fs::rename(&tmp_path, path).map_err(|err| format!("{label} rename failed: {err}"))?;
+        finish_atomic_publish(sync_parent_directory(parent, label), label)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result?;
+    Ok(())
+}
+
+fn finish_atomic_publish(sync_result: Result<(), String>, label: &str) -> Result<(), String> {
+    // Once rename succeeds the new bytes are the visible logical state. A
+    // directory-fsync failure weakens crash durability, but reporting the save
+    // as uncommitted would make callers roll back memory or physical actions
+    // while the new journal is already on disk.
+    if let Err(err) = sync_result {
+        log_warn!("{label} published but parent directory sync failed: {err}");
+    }
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &Path, label: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| format!("{label} directory sync failed: {err}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (parent, label);
     Ok(())
 }
 
@@ -5252,6 +8543,11 @@ fn parse_session_entries(
         Value::List(items) => items,
         _ => return Err("invalid format".to_string()),
     };
+    if list.len() > MAX_SESSION_ENTRIES {
+        return Err(format!(
+            "session contains more than {MAX_SESSION_ENTRIES} entries"
+        ));
+    }
     let mut entries: HashMap<[u8; 20], SessionEntry> = HashMap::new();
     for item in list {
         let Value::Dict(items) = item else {
@@ -5266,24 +8562,100 @@ fn parse_session_entries(
             _ => continue,
         };
         let torrent_bytes = match dict_get(&items, b"torrent") {
-            Some(Value::Bytes(bytes)) if !bytes.is_empty() => bytes.clone(),
+            Some(Value::Bytes(bytes)) if !bytes.is_empty() && bytes.len() <= MAX_TORRENT_BYTES => {
+                bytes.clone()
+            }
+            Some(Value::Bytes(bytes)) if bytes.len() > MAX_TORRENT_BYTES => {
+                return Err("stored torrent exceeds the metainfo size limit".to_string());
+            }
             _ => continue,
         };
+        let parsed_torrent = torrent::parse_torrent(&torrent_bytes)
+            .map_err(|err| format!("invalid stored torrent: {err}"))?;
+        if parsed_torrent.info_hash != info_hash {
+            return Err("stored torrent info hash mismatch".to_string());
+        }
         let name = match dict_get(&items, b"name") {
             Some(Value::Bytes(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
             _ => String::new(),
         };
-        let download_dir = match dict_get(&items, b"download_dir") {
-            Some(Value::Bytes(bytes)) if !bytes.is_empty() => {
-                PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-            }
-            _ => root.to_path_buf(),
-        };
+        let download_dir = decode_session_path(&items, b"download_dir", b"download_dir_wide")?
+            .unwrap_or_else(|| root.to_path_buf());
         let preallocate = dict_get_int(&items, b"preallocate").unwrap_or(0) != 0;
         let label = match dict_get(&items, b"label") {
             Some(Value::Bytes(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
             _ => String::new(),
         };
+        let completion_state = match dict_get(&items, b"completion_state") {
+            Some(Value::Bytes(bytes)) => CompletionState::from_bytes(bytes)
+                .ok_or_else(|| "invalid session completion state".to_string())?,
+            None => CompletionState::None,
+            _ => return Err("invalid session completion state".to_string()),
+        };
+        let completion_move_dir =
+            decode_session_path(&items, b"completion_move_dir", b"completion_move_dir_wide")?;
+        if completion_state != CompletionState::Pending && completion_move_dir.is_some() {
+            return Err("completion move directory requires pending state".to_string());
+        }
+        let pending_delete = match dict_get_int(&items, b"pending_delete") {
+            None | Some(0) => false,
+            Some(1) => true,
+            _ => return Err("invalid session pending delete state".to_string()),
+        };
+        let mut file_renames = match dict_get(&items, b"file_renames") {
+            Some(Value::List(renames)) => renames
+                .iter()
+                .map(|rename| {
+                    let Value::Dict(values) = rename else {
+                        return Err("invalid session file rename".to_string());
+                    };
+                    let index = dict_get_int(values, b"index")
+                        .filter(|index| *index >= 0)
+                        .ok_or_else(|| "invalid session file rename index".to_string())?
+                        as usize;
+                    let target = match dict_get(values, b"name") {
+                        Some(Value::Bytes(bytes)) => String::from_utf8(bytes.clone())
+                            .map_err(|_| "invalid session file rename name".to_string())?,
+                        _ => return Err("invalid session file rename name".to_string()),
+                    };
+                    if !valid_renamed_file_name(&target) {
+                        return Err("invalid session file rename name".to_string());
+                    }
+                    Ok((index, target))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            None => Vec::new(),
+            _ => return Err("invalid session file renames".to_string()),
+        };
+        file_renames.sort_unstable_by_key(|(index, _)| *index);
+        if file_renames.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("duplicate session file rename index".to_string());
+        }
+        let pending_file_rename = match dict_get(&items, b"pending_file_rename") {
+            Some(Value::Dict(values)) => {
+                let index = dict_get_int(values, b"index")
+                    .filter(|index| *index >= 0)
+                    .ok_or_else(|| "invalid pending file rename index".to_string())?
+                    as usize;
+                let target = match dict_get(values, b"name") {
+                    Some(Value::Bytes(bytes)) => String::from_utf8(bytes.clone())
+                        .map_err(|_| "invalid pending file rename name".to_string())?,
+                    _ => return Err("invalid pending file rename name".to_string()),
+                };
+                if !valid_renamed_file_name(&target) {
+                    return Err("invalid pending file rename name".to_string());
+                }
+                Some(PendingFileRename { index, target })
+            }
+            None => None,
+            _ => return Err("invalid pending file rename".to_string()),
+        };
+        if pending_delete && pending_file_rename.is_some() {
+            return Err("session cannot delete while a file rename is pending".to_string());
+        }
+        if entries.contains_key(&info_hash) {
+            return Err("duplicate session info hash".to_string());
+        }
         entries.insert(
             info_hash,
             SessionEntry {
@@ -5293,6 +8665,11 @@ fn parse_session_entries(
                 download_dir,
                 preallocate,
                 label,
+                completion_state,
+                completion_move_dir,
+                pending_delete,
+                file_renames,
+                pending_file_rename,
             },
         );
     }
@@ -5303,39 +8680,59 @@ fn load_session_entries_with_recovery(
     path: &Path,
     root: &Path,
 ) -> Result<HashMap<[u8; 20], SessionEntry>, String> {
-    let data = match fs::read(path) {
+    let (primary_error, primary_missing) =
+        match read_file_limited(path, MAX_SESSION_STATE_BYTES, true) {
+            Ok(data) => match parse_session_entries(&data, root) {
+                Ok(entries) => return Ok(entries),
+                Err(err) => (err, false),
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                ("session file is missing".to_string(), true)
+            }
+            Err(err) => (format!("session read failed: {err}"), false),
+        };
+
+    let backup_path = sidecar_path(path, ".bak");
+    let backup_data = match read_file_limited(&backup_path, MAX_SESSION_STATE_BYTES, true) {
         Ok(data) => data,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(err) => return Err(format!("session read failed: {err}")),
-    };
-    match parse_session_entries(&data, root) {
-        Ok(entries) => Ok(entries),
-        Err(primary_err) => {
-            let backup_path = sidecar_path(path, ".bak");
-            let backup_data = match fs::read(&backup_path) {
-                Ok(data) => data,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    return Err(format!("session load failed: {primary_err}"));
-                }
-                Err(err) => {
-                    return Err(format!(
-                        "session load failed: {primary_err}; backup read failed: {err}"
-                    ));
-                }
-            };
-            let recovered = parse_session_entries(&backup_data, root).map_err(|backup_err| {
-                format!("session load failed: {primary_err}; backup invalid: {backup_err}")
-            })?;
-            let _ = write_atomic_file(path, &backup_data, "session restore", false);
-            log_warn!("session load recovered from backup");
-            Ok(recovered)
+        Err(err) if err.kind() == io::ErrorKind::NotFound && primary_missing => {
+            return Ok(HashMap::new());
         }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(format!("session load failed: {primary_error}"));
+        }
+        Err(err) => {
+            return Err(format!(
+                "session load failed: {primary_error}; backup read failed: {err}"
+            ));
+        }
+    };
+    let recovered = parse_session_entries(&backup_data, root).map_err(|backup_err| {
+        format!("session load failed: {primary_error}; backup invalid: {backup_err}")
+    })?;
+    if let Err(err) = write_atomic_file(path, &backup_data, "session restore", false, true) {
+        log_warn!("session backup loaded but primary restore failed: {err}");
     }
+    log_warn!("session load recovered from backup");
+    Ok(recovered)
 }
 
 fn save_session(path: &Path, entries: &HashMap<[u8; 20], SessionEntry>) -> Result<(), String> {
+    if entries.len() > MAX_SESSION_ENTRIES {
+        return Err(format!(
+            "session contains more than {MAX_SESSION_ENTRIES} entries"
+        ));
+    }
     let mut list = Vec::with_capacity(entries.len());
     for entry in entries.values() {
+        if entry.torrent_bytes.is_empty() || entry.torrent_bytes.len() > MAX_TORRENT_BYTES {
+            return Err("stored torrent exceeds the metainfo size limit".to_string());
+        }
+        let parsed_torrent = torrent::parse_torrent(&entry.torrent_bytes)
+            .map_err(|err| format!("invalid stored torrent: {err}"))?;
+        if parsed_torrent.info_hash != entry.info_hash {
+            return Err("stored torrent info hash mismatch".to_string());
+        }
         let mut dict = Vec::new();
         dict.push((
             b"info_hash".to_vec(),
@@ -5349,14 +8746,56 @@ fn save_session(path: &Path, entries: &HashMap<[u8; 20], SessionEntry>) -> Resul
             b"torrent".to_vec(),
             Value::Bytes(entry.torrent_bytes.clone()),
         ));
-        dict.push((
-            b"download_dir".to_vec(),
-            Value::Bytes(entry.download_dir.display().to_string().into_bytes()),
-        ));
+        push_session_path(
+            &mut dict,
+            b"download_dir",
+            b"download_dir_wide",
+            &entry.download_dir,
+        )?;
         dict.push((
             b"preallocate".to_vec(),
             Value::Int(if entry.preallocate { 1 } else { 0 }),
         ));
+        dict.push((
+            b"completion_state".to_vec(),
+            Value::Bytes(entry.completion_state.as_bytes().to_vec()),
+        ));
+        if let Some(move_dir) = entry.completion_move_dir.as_ref() {
+            push_session_path(
+                &mut dict,
+                b"completion_move_dir",
+                b"completion_move_dir_wide",
+                move_dir,
+            )?;
+        }
+        if entry.pending_delete {
+            dict.push((b"pending_delete".to_vec(), Value::Int(1)));
+        }
+        if !entry.file_renames.is_empty() {
+            let renames = entry
+                .file_renames
+                .iter()
+                .map(|(index, name)| {
+                    Value::Dict(vec![
+                        (b"index".to_vec(), Value::Int(*index as i64)),
+                        (b"name".to_vec(), Value::Bytes(name.as_bytes().to_vec())),
+                    ])
+                })
+                .collect();
+            dict.push((b"file_renames".to_vec(), Value::List(renames)));
+        }
+        if let Some(pending) = entry.pending_file_rename.as_ref() {
+            dict.push((
+                b"pending_file_rename".to_vec(),
+                Value::Dict(vec![
+                    (b"index".to_vec(), Value::Int(pending.index as i64)),
+                    (
+                        b"name".to_vec(),
+                        Value::Bytes(pending.target.as_bytes().to_vec()),
+                    ),
+                ]),
+            ));
+        }
         if !entry.label.is_empty() {
             dict.push((
                 b"label".to_vec(),
@@ -5366,12 +8805,18 @@ fn save_session(path: &Path, entries: &HashMap<[u8; 20], SessionEntry>) -> Resul
         list.push(Value::Dict(dict));
     }
     let value = Value::List(list);
+    bencode::validate_structure(&value)
+        .map_err(|err| format!("session state structure exceeds parser limits: {err}"))?;
     let data = bencode::encode(&value);
-    write_atomic_file(path, &data, "session", true)
+    if data.len() > MAX_SESSION_STATE_BYTES {
+        return Err("session state exceeds the size limit".to_string());
+    }
+    write_atomic_file(path, &data, "session", true, true)
 }
 
 fn load_resume_data(path: &Path) -> Result<ResumeData, String> {
-    let data = fs::read(path).map_err(|err| format!("resume read failed: {err}"))?;
+    let data = read_file_limited(path, MAX_RESUME_STATE_BYTES, true)
+        .map_err(|err| format!("resume read failed: {err}"))?;
     parse_resume_data(&data)
 }
 
@@ -5390,7 +8835,8 @@ fn parse_resume_data(data: &[u8]) -> Result<ResumeData, String> {
         _ => return Err("resume info hash missing".to_string()),
     };
     let piece_length = dict_get_int(&dict, b"piece_length")
-        .ok_or_else(|| "resume piece length missing".to_string())?;
+        .filter(|value| *value > 0 && (*value as u64) <= torrent::MAX_PIECE_LENGTH)
+        .ok_or_else(|| "resume piece length is invalid".to_string())? as u64;
     let bitfield = match dict_get(&dict, b"pieces") {
         Some(Value::Bytes(bytes)) => bytes.clone(),
         _ => return Err("resume pieces missing".to_string()),
@@ -5398,68 +8844,85 @@ fn parse_resume_data(data: &[u8]) -> Result<ResumeData, String> {
     let file_priorities = match dict_get(&dict, b"file_priority") {
         Some(Value::List(items)) => items
             .iter()
-            .filter_map(|item| match item {
-                Value::Int(value) if *value >= 0 => Some(*value as u8),
-                _ => None,
+            .map(|item| match item {
+                Value::Int(value) if (0..=piece::PRIORITY_HIGH as i64).contains(value) => {
+                    Ok(*value as u8)
+                }
+                _ => Err("resume file priority is invalid".to_string()),
             })
-            .collect(),
-        _ => Vec::new(),
+            .collect::<Result<Vec<_>, String>>()?,
+        None => Vec::new(),
+        Some(_) => return Err("resume file priorities are invalid".to_string()),
     };
     let files = match dict_get(&dict, b"files") {
         Some(Value::List(items)) => items
             .iter()
-            .filter_map(|item| match item {
-                Value::Dict(values) => {
-                    let length = dict_get_int(values, b"length")?;
-                    let mtime = dict_get_int(values, b"mtime").unwrap_or(0);
-                    Some(ResumeFileStat {
-                        length: length as u64,
-                        mtime: mtime as u64,
-                    })
-                }
-                _ => None,
+            .map(|item| {
+                let Value::Dict(values) = item else {
+                    return Err("resume file stat is invalid".to_string());
+                };
+                let length = dict_get_int(values, b"length")
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| "resume file length is invalid".to_string())?
+                    as u64;
+                let mtime = match dict_get(values, b"mtime") {
+                    Some(Value::Int(value)) if *value >= 0 => *value as u64,
+                    None => 0,
+                    _ => return Err("resume file mtime is invalid".to_string()),
+                };
+                Ok(ResumeFileStat { length, mtime })
             })
-            .collect(),
-        _ => Vec::new(),
+            .collect::<Result<Vec<_>, String>>()?,
+        None => Vec::new(),
+        Some(_) => return Err("resume file stats are invalid".to_string()),
     };
-    let downloaded = dict_get_int(&dict, b"downloaded")
-        .and_then(|value| if value >= 0 { Some(value as u64) } else { None })
-        .unwrap_or(0);
-    let uploaded = dict_get_int(&dict, b"uploaded")
-        .and_then(|value| if value >= 0 { Some(value as u64) } else { None })
-        .unwrap_or(0);
+    let downloaded = parse_resume_counter(&dict, b"downloaded", "downloaded")?;
+    let uploaded = parse_resume_counter(&dict, b"uploaded", "uploaded")?;
     let peers = match dict_get(&dict, b"peers") {
         Some(Value::List(items)) => items
             .iter()
-            .filter_map(|item| match item {
-                Value::Bytes(bytes) => String::from_utf8(bytes.clone())
-                    .ok()
-                    .and_then(|raw| raw.parse::<SocketAddr>().ok()),
-                _ => None,
+            .map(|item| match item {
+                Value::Bytes(bytes) => std::str::from_utf8(bytes)
+                    .map_err(|_| "resume peer address is invalid".to_string())?
+                    .parse::<SocketAddr>()
+                    .map_err(|_| "resume peer address is invalid".to_string()),
+                _ => Err("resume peer address is invalid".to_string()),
             })
-            .collect(),
-        _ => Vec::new(),
+            .collect::<Result<Vec<_>, String>>()?,
+        None => Vec::new(),
+        Some(_) => return Err("resume peer list is invalid".to_string()),
     };
-    let file_renames = match dict_get(&dict, b"file_renames") {
+    let mut file_renames = match dict_get(&dict, b"file_renames") {
         Some(Value::List(items)) => items
             .iter()
-            .filter_map(|item| match item {
-                Value::Dict(values) => {
-                    let idx = dict_get_int(values, b"index")?;
-                    let name = match dict_get(values, b"name") {
-                        Some(Value::Bytes(bytes)) => String::from_utf8(bytes.clone()).ok()?,
-                        _ => return None,
-                    };
-                    Some((idx as usize, name))
+            .map(|item| {
+                let Value::Dict(values) = item else {
+                    return Err("resume file rename is invalid".to_string());
+                };
+                let index = dict_get_int(values, b"index")
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| "resume file rename index is invalid".to_string())?;
+                let name = match dict_get(values, b"name") {
+                    Some(Value::Bytes(bytes)) => String::from_utf8(bytes.clone())
+                        .map_err(|_| "resume file rename name is invalid".to_string())?,
+                    _ => return Err("resume file rename name is invalid".to_string()),
+                };
+                if !valid_renamed_file_name(&name) {
+                    return Err("resume file rename name is invalid".to_string());
                 }
-                _ => None,
+                Ok((index, name))
             })
-            .collect(),
-        _ => Vec::new(),
+            .collect::<Result<Vec<_>, String>>()?,
+        None => Vec::new(),
+        Some(_) => return Err("resume file renames are invalid".to_string()),
     };
+    file_renames.sort_unstable_by_key(|(index, _)| *index);
+    if file_renames.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("duplicate resume file rename index".to_string());
+    }
     Ok(ResumeData {
         info_hash,
-        piece_length: piece_length as u64,
+        piece_length,
         bitfield,
         file_priorities,
         files,
@@ -5468,6 +8931,14 @@ fn parse_resume_data(data: &[u8]) -> Result<ResumeData, String> {
         peers,
         file_renames,
     })
+}
+
+fn parse_resume_counter(dict: &[(Vec<u8>, Value)], key: &[u8], label: &str) -> Result<u64, String> {
+    match dict_get(dict, key) {
+        Some(Value::Int(value)) if *value >= 0 => Ok(*value as u64),
+        None => Ok(0),
+        _ => Err(format!("resume {label} counter is invalid")),
+    }
 }
 
 fn load_resume_data_with_recovery(path: &Path) -> Option<ResumeData> {
@@ -5481,7 +8952,7 @@ fn load_resume_data_with_recovery(path: &Path) -> Option<ResumeData> {
     }
 
     let backup_path = sidecar_path(path, ".bak");
-    let backup_data = match fs::read(&backup_path) {
+    let backup_data = match read_file_limited(&backup_path, MAX_RESUME_STATE_BYTES, true) {
         Ok(data) => data,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
         Err(err) => {
@@ -5496,39 +8967,9 @@ fn load_resume_data_with_recovery(path: &Path) -> Option<ResumeData> {
             return None;
         }
     };
-    let _ = write_atomic_file(path, &backup_data, "resume restore", false);
+    let _ = write_atomic_file(path, &backup_data, "resume restore", false, true);
     log_warn!("resume load recovered from backup");
     Some(resume)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn save_resume_snapshot(
-    path: &Path,
-    info_hash: [u8; 20],
-    base_piece_length: u64,
-    pieces: &piece::PieceManager,
-    file_priorities: &[u8],
-    file_spans: &[FileSpan],
-    download_dir: &Path,
-    downloaded: u64,
-    uploaded: u64,
-    peers: Vec<SocketAddr>,
-    file_renames: &[(usize, String)],
-) -> Result<(), String> {
-    let bitfield = build_bitfield(pieces);
-    let files = collect_file_stats(file_spans, download_dir);
-    save_resume_data(
-        path,
-        info_hash,
-        base_piece_length,
-        bitfield,
-        file_priorities,
-        files,
-        downloaded,
-        uploaded,
-        peers,
-        file_renames,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5544,6 +8985,27 @@ fn save_resume_data(
     peers: Vec<SocketAddr>,
     file_renames: &[(usize, String)],
 ) -> Result<(), String> {
+    if base_piece_length == 0 || base_piece_length > torrent::MAX_PIECE_LENGTH {
+        return Err("resume piece length is invalid".to_string());
+    }
+    if file_priorities
+        .iter()
+        .any(|priority| *priority > piece::PRIORITY_HIGH)
+    {
+        return Err("resume file priority is invalid".to_string());
+    }
+    if files.iter().any(|stat| stat.length > i64::MAX as u64) {
+        return Err("resume file length is invalid".to_string());
+    }
+    let mut rename_indices = HashSet::with_capacity(file_renames.len());
+    if file_renames.iter().any(|(index, name)| {
+        !rename_indices.insert(*index)
+            || i64::try_from(*index).is_err()
+            || !valid_renamed_file_name(name)
+    }) {
+        return Err("resume file rename is invalid".to_string());
+    }
+
     let mut dict = Vec::new();
     dict.push((b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec())));
     dict.push((
@@ -5565,7 +9027,10 @@ fn save_resume_data(
         .map(|stat| {
             Value::Dict(vec![
                 (b"length".to_vec(), Value::Int(stat.length as i64)),
-                (b"mtime".to_vec(), Value::Int(stat.mtime as i64)),
+                (
+                    b"mtime".to_vec(),
+                    Value::Int(stat.mtime.min(i64::MAX as u64) as i64),
+                ),
             ])
         })
         .collect();
@@ -5587,30 +9052,42 @@ fn save_resume_data(
             .collect();
         dict.push((b"file_renames".to_vec(), Value::List(renames_list)));
     }
-    let data = bencode::encode(&Value::Dict(dict));
-    write_atomic_file(path, &data, "resume", true)
+    let value = Value::Dict(dict);
+    bencode::validate_structure(&value)
+        .map_err(|err| format!("resume state structure exceeds parser limits: {err}"))?;
+    let data = bencode::encode(&value);
+    if data.len() > MAX_RESUME_STATE_BYTES {
+        return Err("resume state exceeds the size limit".to_string());
+    }
+    write_atomic_file(path, &data, "resume", true, true)
 }
 
-fn collect_file_stats(spans: &[FileSpan], download_dir: &Path) -> Vec<ResumeFileStat> {
+fn collect_storage_file_stats(
+    storage: &storage::Storage,
+    spans: &[FileSpan],
+) -> Vec<ResumeFileStat> {
     spans
         .iter()
-        .map(|span| {
-            file_stat(download_dir, span).unwrap_or(ResumeFileStat {
-                length: span.length,
-                mtime: 0,
-            })
+        .enumerate()
+        .map(|(index, span)| {
+            storage
+                .file_path(index)
+                .and_then(file_stat_path)
+                .unwrap_or(ResumeFileStat {
+                    length: span.length,
+                    mtime: 0,
+                })
         })
         .collect()
 }
 
-fn file_stat(download_dir: &Path, span: &FileSpan) -> Option<ResumeFileStat> {
-    let path = download_dir.join(&span.path);
-    let meta = fs::metadata(&path).ok()?;
+fn file_stat_path(path: &Path) -> Option<ResumeFileStat> {
+    let meta = fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
         .unwrap_or(0);
     Some(ResumeFileStat {
         length: meta.len(),
@@ -6002,7 +9479,7 @@ fn parse_args() -> Result<Args, String> {
             let value = args_list
                 .get(idx + 1)
                 .ok_or_else(|| "missing value for --write-cache".to_string())?;
-            write_cache_bytes = parse_rate(value)? as usize;
+            write_cache_bytes = parse_size(value)?;
             idx += 2;
             continue;
         }
@@ -6039,8 +9516,8 @@ fn parse_args() -> Result<Args, String> {
             seed_ratio = value
                 .parse::<f64>()
                 .map_err(|_| "invalid value for --seed-ratio".to_string())?;
-            if seed_ratio < 0.0 {
-                return Err("seed ratio must be >= 0".to_string());
+            if !seed_ratio.is_finite() || seed_ratio < 0.0 {
+                return Err("seed ratio must be a finite value >= 0".to_string());
             }
             idx += 2;
             continue;
@@ -6052,6 +9529,9 @@ fn parse_args() -> Result<Args, String> {
             max_seed_time = value
                 .parse::<u64>()
                 .map_err(|_| "invalid value for --max-seed-time".to_string())?;
+            if max_seed_time.checked_mul(60).is_none() {
+                return Err("max seed time is too large".to_string());
+            }
             idx += 2;
             continue;
         }
@@ -6088,6 +9568,15 @@ fn parse_args() -> Result<Args, String> {
             let value = args_list
                 .get(idx + 1)
                 .ok_or_else(|| "missing value for --rss".to_string())?;
+            if rss_feeds.len() >= rss::MAX_RSS_FEEDS {
+                return Err("too many RSS feeds".to_string());
+            }
+            if value.len() > rss::MAX_RSS_TEXT_BYTES
+                || !valid_tracker_url(value)
+                || !(value.starts_with("http://") || value.starts_with("https://"))
+            {
+                return Err("RSS feed must be a valid HTTP or HTTPS URL".to_string());
+            }
             rss_feeds.push(value.clone());
             idx += 2;
             continue;
@@ -6097,6 +9586,17 @@ fn parse_args() -> Result<Args, String> {
                 .get(idx + 1)
                 .ok_or_else(|| "missing value for --rss-rule".to_string())?;
             let (feed_url, pattern) = parse_rss_rule_arg(value)?;
+            if rss_rules.len() >= rss::MAX_RSS_RULES {
+                return Err("too many RSS rules".to_string());
+            }
+            if pattern.len() > rss::MAX_RSS_PATTERN_BYTES
+                || feed_url.len() > rss::MAX_RSS_TEXT_BYTES
+                || (!feed_url.is_empty()
+                    && (!valid_tracker_url(feed_url)
+                        || !(feed_url.starts_with("http://") || feed_url.starts_with("https://"))))
+            {
+                return Err("invalid RSS rule URL or pattern".to_string());
+            }
             rss_rules.push((feed_url.to_string(), pattern.to_string()));
             idx += 2;
             continue;
@@ -6108,6 +9608,9 @@ fn parse_args() -> Result<Args, String> {
             rss_interval = value
                 .parse::<u64>()
                 .map_err(|_| "invalid value for --rss-interval".to_string())?;
+            if rss_interval == 0 {
+                return Err("rss interval must be > 0".to_string());
+            }
             idx += 2;
             continue;
         }
@@ -6127,11 +9630,16 @@ fn parse_args() -> Result<Args, String> {
             let down = parts[1]
                 .parse::<u64>()
                 .map_err(|_| "invalid throttle down rate".to_string())?
-                * 1024;
+                .checked_mul(1024)
+                .ok_or_else(|| "throttle down rate is too large".to_string())?;
             let up = parts[2]
                 .parse::<u64>()
                 .map_err(|_| "invalid throttle up rate".to_string())?
-                * 1024;
+                .checked_mul(1024)
+                .ok_or_else(|| "throttle up rate is too large".to_string())?;
+            if parts[0].trim().is_empty() {
+                return Err("throttle group name must not be empty".to_string());
+            }
             throttle_groups.push((parts[0].to_string(), down, up));
             idx += 2;
             continue;
@@ -6147,6 +9655,12 @@ fn parse_args() -> Result<Args, String> {
             let ratio = parts[1]
                 .parse::<f64>()
                 .map_err(|_| "invalid ratio-group ratio".to_string())?;
+            if !ratio.is_finite() || ratio < 0.0 {
+                return Err("ratio-group ratio must be a finite value >= 0".to_string());
+            }
+            if parts[0].trim().is_empty() {
+                return Err("ratio-group name must not be empty".to_string());
+            }
             let action = parts[2].to_string();
             if !matches!(action.as_str(), "stop" | "pause" | "none") {
                 return Err("ratio-group action must be stop, pause, or none".to_string());
@@ -6240,12 +9754,22 @@ fn parse_args() -> Result<Args, String> {
     if retry_interval == 0 {
         return Err("retry interval must be > 0".to_string());
     }
+    if port == 0 {
+        return Err("listen port must be > 0".to_string());
+    }
+    if rss_interval == 0 {
+        return Err("rss interval must be > 0".to_string());
+    }
 
     if daemon {
         ui = true;
         if log_path.is_none() {
             log_path = Some(download_dir.join("rustorrent.log"));
         }
+    }
+
+    if ui {
+        validate_ui_bind_addr(&ui_addr)?;
     }
 
     if torrent_path.is_none()
@@ -6261,6 +9785,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if max_peers_torrent == 0 {
         return Err("max peers per torrent must be > 0".to_string());
+    }
+    if max_peers_global == 0 {
+        return Err("max peers globally must be > 0".to_string());
     }
 
     Ok(Args {
@@ -6306,6 +9833,19 @@ fn parse_args() -> Result<Args, String> {
         ratio_groups,
         schedules,
     })
+}
+
+fn validate_ui_bind_addr(value: &str) -> Result<SocketAddr, String> {
+    let address = value
+        .parse::<SocketAddr>()
+        .map_err(|_| "web UI address must be a numeric IP address and port".to_string())?;
+    if !address.ip().is_loopback() {
+        return Err(
+            "web UI may only bind to a loopback address; use an authenticated tunnel for remote access"
+                .to_string(),
+        );
+    }
+    Ok(address)
 }
 
 fn parse_encryption_mode(value: &str) -> Result<EncryptionMode, String> {
@@ -6365,7 +9905,13 @@ fn parse_rate(value: &str) -> Result<u64, String> {
         .trim()
         .parse::<u64>()
         .map_err(|_| "invalid rate".to_string())?;
-    Ok(base.saturating_mul(multiplier))
+    base.checked_mul(multiplier)
+        .ok_or_else(|| "rate is too large".to_string())
+}
+
+fn parse_size(value: &str) -> Result<usize, String> {
+    usize::try_from(parse_rate(value)?)
+        .map_err(|_| "size is too large for this platform".to_string())
 }
 
 fn parse_rss_rule_arg(value: &str) -> Result<(&str, &str), String> {
@@ -6390,6 +9936,9 @@ fn parse_schedule_arg(value: &str) -> Result<(u64, &str), String> {
             .map_err(|_| "invalid schedule interval".to_string())?;
         if interval == 0 {
             return Err("schedule interval must be > 0".to_string());
+        }
+        if command.trim().is_empty() {
+            return Err("schedule command must not be empty".to_string());
         }
         Ok((interval, command))
     } else {
@@ -6502,7 +10051,10 @@ fn warn_invalid<T>(value: Option<T>, key: &str, raw: &str) -> Option<T> {
 }
 
 fn load_config_overrides(path: &Path) -> Result<ConfigOverrides, String> {
-    let text = fs::read_to_string(path).map_err(|err| format!("config read failed: {err}"))?;
+    let data = read_file_limited(path, MAX_CONFIG_BYTES, false)
+        .map_err(|err| format!("config read failed: {err}"))?;
+    let text =
+        std::str::from_utf8(&data).map_err(|_| "config read failed: invalid UTF-8".to_string())?;
     let mut cfg = ConfigOverrides::default();
     for (line_no, raw) in text.lines().enumerate() {
         let mut line = raw.trim();
@@ -6560,8 +10112,7 @@ fn load_config_overrides(path: &Path) -> Result<ConfigOverrides, String> {
                 cfg.torrent_upload_rate = warn_invalid(parse_rate(value).ok(), &key, value);
             }
             "write_cache" => {
-                cfg.write_cache_bytes =
-                    warn_invalid(parse_rate(value).ok(), &key, value).map(|v| v as usize);
+                cfg.write_cache_bytes = warn_invalid(parse_size(value).ok(), &key, value);
             }
             "geoip_db" | "geoip" => cfg.geoip_db = Some(PathBuf::from(value)),
             _ => return Err(format!("config line {} unknown key", line_no + 1)),
@@ -6627,7 +10178,7 @@ fn load_env_overrides() -> ConfigOverrides {
         cfg.torrent_upload_rate = parse_rate(&value).ok();
     }
     if let Ok(value) = env::var("RUSTORRENT_WRITE_CACHE") {
-        cfg.write_cache_bytes = parse_rate(&value).ok().map(|v| v as usize);
+        cfg.write_cache_bytes = parse_size(&value).ok();
     }
     cfg
 }
@@ -6649,10 +10200,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn verify_piece_hash(data: &[u8], expected: &piece::PieceHash) -> bool {
-    match expected {
-        piece::PieceHash::Sha1(h) => sha1::sha1(data) == *h,
-        piece::PieceHash::Sha256(h) => sha256::sha256(data) == *h,
-    }
+    expected.verify(data)
 }
 
 #[derive(Clone)]
@@ -6661,10 +10209,31 @@ struct TrackerSet {
     udp: Vec<String>,
 }
 
+fn tracker_set_has_usable_source(trackers: &TrackerSet, allow_udp: bool) -> bool {
+    !trackers.http.is_empty() || (allow_udp && !trackers.udp.is_empty())
+}
+
 struct TrackerAnnounceOutcome {
     tracker_url: String,
     is_udp: bool,
     response: Result<tracker::TrackerResponse, String>,
+}
+
+struct TrackerWorkerGuard;
+
+impl Drop for TrackerWorkerGuard {
+    fn drop(&mut self) {
+        ACTIVE_TRACKER_WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn try_acquire_tracker_worker() -> Option<TrackerWorkerGuard> {
+    ACTIVE_TRACKER_WORKERS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            (active < MAX_GLOBAL_TRACKER_WORKERS).then_some(active + 1)
+        })
+        .ok()
+        .map(|_| TrackerWorkerGuard)
 }
 
 fn collect_trackers(meta: &torrent::TorrentMeta) -> TrackerSet {
@@ -6672,7 +10241,10 @@ fn collect_trackers(meta: &torrent::TorrentMeta) -> TrackerSet {
     let mut udp = Vec::new();
     let mut seen = HashSet::new();
     let mut push = |url: &str| {
-        if !seen.insert(url.to_string()) {
+        if seen.len() >= MAX_TRACKERS_PER_TORRENT
+            || !valid_tracker_url(url)
+            || !seen.insert(url.to_string())
+        {
             return;
         }
         if url.starts_with("http://") || url.starts_with("https://") {
@@ -6696,23 +10268,63 @@ fn collect_trackers(meta: &torrent::TorrentMeta) -> TrackerSet {
         }
     }
 
-    if !meta.info.private {
-        // Add open public trackers as fallbacks
-        // These are well-known open trackers that don't rate-limit as aggressively
-        let open_trackers = [
-            "http://tracker.opentrackr.org:1337/announce",
-            "http://open.tracker.cl:1337/announce",
-            "http://tracker.openbittorrent.com:80/announce",
-            "http://exodus.desync.com:6969/announce",
-            "http://tracker.moeking.me:6969/announce",
-        ];
-
-        for tracker in open_trackers {
-            push(tracker);
-        }
-    }
-
     TrackerSet { http, udp }
+}
+
+fn valid_tracker_url(url: &str) -> bool {
+    valid_network_url(url, &["http://", "https://", "udp://"])
+}
+
+fn valid_network_url(url: &str, allowed_schemes: &[&str]) -> bool {
+    if url.is_empty()
+        || url.len() > MAX_TRACKER_URL_LEN
+        || url
+            .chars()
+            .any(|character| character.is_whitespace() || unsafe_log_character(character))
+    {
+        return false;
+    }
+    let rest = allowed_schemes
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    !authority.is_empty()
+        && !authority.contains(['@', '\\'])
+        && !authority.chars().any(unsafe_log_character)
+}
+
+fn unsafe_log_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
+
+fn safe_network_url_label(url: &str) -> String {
+    let Some((scheme, rest)) = ["http://", "https://", "udp://"]
+        .into_iter()
+        .find_map(|scheme| url.strip_prefix(scheme).map(|rest| (scheme, rest)))
+    else {
+        return "<invalid-url>".to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return "<invalid-url>".to_string();
+    }
+    format!(
+        "{scheme}{}",
+        tracker::sanitize_failure_reason(authority.as_bytes())
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6727,73 +10339,103 @@ fn spawn_tracker_announces(
     event: Option<&str>,
     numwant: u32,
     is_private: bool,
-    _wait_budget: Duration,
+    proxy_config: Option<proxy::ProxyConfig>,
+    wait_budget: Duration,
 ) -> (mpsc::Receiver<TrackerAnnounceOutcome>, usize) {
     let (tx, rx) = mpsc::channel::<TrackerAnnounceOutcome>();
     let event = event.map(str::to_string);
-    let mut pending = 0usize;
-
+    let mut tasks = VecDeque::new();
     for tracker_url in &trackers.http {
-        pending += 1;
-        let tx = tx.clone();
-        let tracker_url = tracker_url.clone();
-        let event = event.clone();
-        thread::Builder::new()
-            .stack_size(PEER_THREAD_STACK)
-            .spawn(move || {
-                let response = tracker::announce_with_private(
-                    &tracker_url,
-                    info_hash,
-                    peer_id,
-                    port,
-                    uploaded,
-                    downloaded,
-                    left,
-                    event.as_deref(),
-                    numwant,
-                    is_private,
-                )
-                .map_err(|err| err.to_string());
-                let _ = tx.send(TrackerAnnounceOutcome {
-                    tracker_url,
-                    is_udp: false,
-                    response,
-                });
-            })
-            .unwrap();
+        if tasks.len() >= MAX_TRACKERS_PER_TORRENT {
+            break;
+        }
+        if valid_tracker_url(tracker_url) {
+            tasks.push_back((tracker_url.clone(), false));
+        }
+    }
+    if proxy_config.is_none() {
+        for tracker_url in &trackers.udp {
+            if tasks.len() >= MAX_TRACKERS_PER_TORRENT {
+                break;
+            }
+            if valid_tracker_url(tracker_url) {
+                tasks.push_back((tracker_url.clone(), true));
+            }
+        }
     }
 
-    for tracker_url in &trackers.udp {
-        pending += 1;
+    let pending = tasks.len();
+    let worker_count = pending.min(MAX_TRACKER_WORKERS);
+    let tasks = Arc::new(Mutex::new(tasks));
+    let stop_at = Instant::now() + wait_budget;
+    let mut workers_started = 0usize;
+    for _ in 0..worker_count {
+        let Some(worker_guard) = try_acquire_tracker_worker() else {
+            break;
+        };
         let tx = tx.clone();
-        let tracker_url = tracker_url.clone();
+        let tasks = Arc::clone(&tasks);
         let event = event.clone();
-        thread::Builder::new()
+        let proxy_config = proxy_config.clone();
+        match thread::Builder::new()
             .stack_size(PEER_THREAD_STACK)
             .spawn(move || {
-                let response = udp_tracker::announce(
-                    &tracker_url,
-                    info_hash,
-                    peer_id,
-                    port,
-                    uploaded,
-                    downloaded,
-                    left,
-                    event.as_deref(),
-                    numwant,
-                )
-                .map_err(|err| err.to_string());
-                let _ = tx.send(TrackerAnnounceOutcome {
-                    tracker_url,
-                    is_udp: true,
-                    response,
-                });
-            })
-            .unwrap();
+                let _worker_guard = worker_guard;
+                loop {
+                    if Instant::now() >= stop_at {
+                        break;
+                    }
+                    let task = lock_or_recover(&tasks).pop_front();
+                    let Some((tracker_url, is_udp)) = task else {
+                        break;
+                    };
+                    let response = if is_udp {
+                        udp_tracker::announce_until(
+                            &tracker_url,
+                            info_hash,
+                            peer_id,
+                            port,
+                            uploaded,
+                            downloaded,
+                            left,
+                            event.as_deref(),
+                            numwant,
+                            stop_at,
+                        )
+                        .map_err(|err| err.to_string())
+                    } else {
+                        tracker::announce_with_private_until(
+                            &tracker_url,
+                            info_hash,
+                            peer_id,
+                            port,
+                            uploaded,
+                            downloaded,
+                            left,
+                            event.as_deref(),
+                            numwant,
+                            is_private,
+                            proxy_config.as_ref(),
+                            stop_at,
+                        )
+                        .map_err(|err| err.to_string())
+                    };
+                    let _ = tx.send(TrackerAnnounceOutcome {
+                        tracker_url,
+                        is_udp,
+                        response,
+                    });
+                }
+            }) {
+            Ok(_) => workers_started += 1,
+            Err(err) => {
+                log_warn!("tracker worker spawn failed: {err}");
+            }
+        }
     }
 
     drop(tx);
-    (rx, pending)
+    (rx, if workers_started == 0 { 0 } else { pending })
 }
 
 fn generate_peer_id() -> [u8; 20] {
@@ -6818,6 +10460,7 @@ fn generate_peer_id() -> [u8; 20] {
 fn download_from_peer_concurrent(
     addr: SocketAddr,
     info_hash: [u8; 20],
+    hybrid_v2_info_hash: Option<[u8; 20]>,
     peer_id: [u8; 20],
     torrent_id: u64,
     peer_tag: u64,
@@ -6827,7 +10470,8 @@ fn download_from_peer_concurrent(
     peer_queue: &Arc<Mutex<PeerQueue>>,
     allow_pex: bool,
     file_spans: &Arc<Vec<FileSpan>>,
-    base_piece_length: u64,
+    _base_piece_length: u64,
+    v2_hashes: &Arc<V2HashStore>,
     connect_cfg: &ConnectionConfig,
     limits: &TransferLimits,
     downloaded: &Arc<AtomicU64>,
@@ -6836,11 +10480,17 @@ fn download_from_peer_concurrent(
     interested_peers: &Arc<AtomicUsize>,
     upload_requests_served: &Arc<AtomicU64>,
     upload_manager: &Arc<UploadManager>,
+    peer_cancellations: &PeerCancellationRegistry,
     paused_flag: &Arc<AtomicBool>,
     stop_flag: &Arc<AtomicBool>,
+    piece_buffer_budgets: &piece::PieceBufferBudgets,
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
 ) -> Result<(), String> {
     let mut stream = connect_peer(addr, connect_cfg)?;
+    let cancellation = PeerCancellationGuard::new(peer_cancellations, peer_tag, &stream);
+    if torrent_stop_requested(stop_flag) {
+        return Err("torrent stopping".to_string());
+    }
     // Use a longer timeout for the handshake phase (peers may be slow to respond)
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -6850,9 +10500,15 @@ fn download_from_peer_concurrent(
         .map_err(|err| format!("write timeout failed: {err}"))?;
 
     let handshake = if connect_cfg.encryption == EncryptionMode::Require {
-        outbound_handshake(&mut stream, info_hash, peer_id, connect_cfg.encryption)?
+        outbound_handshake(
+            &mut stream,
+            info_hash,
+            hybrid_v2_info_hash,
+            peer_id,
+            connect_cfg.encryption,
+        )?
     } else {
-        match plaintext_handshake(&mut stream, info_hash, peer_id) {
+        match plaintext_handshake(&mut stream, info_hash, hybrid_v2_info_hash, peer_id) {
             Ok(handshake) => handshake,
             Err(err) if connect_cfg.encryption == EncryptionMode::Prefer => {
                 let _ = err;
@@ -6864,9 +10520,18 @@ fn download_from_peer_concurrent(
                 retry
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .map_err(|err| format!("write timeout failed: {err}"))?;
-                let handshake =
-                    outbound_handshake(&mut retry, info_hash, peer_id, EncryptionMode::Prefer)
-                        .map_err(|err| format!("handshake failed: {err}"))?;
+                cancellation.replace_stream(&retry);
+                if torrent_stop_requested(stop_flag) {
+                    return Err("torrent stopping".to_string());
+                }
+                let handshake = outbound_handshake(
+                    &mut retry,
+                    info_hash,
+                    hybrid_v2_info_hash,
+                    peer_id,
+                    EncryptionMode::Prefer,
+                )
+                .map_err(|err| format!("handshake failed: {err}"))?;
                 stream = retry;
                 handshake
             }
@@ -6965,6 +10630,8 @@ fn download_from_peer_concurrent(
         let log = lock_or_recover(completed_log);
         log.len()
     };
+    let mut hash_request_budget = HashRequestBudget::new();
+    let mut last_served_chunk: Option<(u32, u32, u32)> = None;
     let ban_peer = |reason: &str| {
         if let Ok(mut queue) = peer_queue.lock() {
             queue.ban(addr);
@@ -6978,6 +10645,50 @@ fn download_from_peer_concurrent(
             if torrent_stop_requested(stop_flag) {
                 cancel_pending(&mut stream, &pending)?;
                 return Ok(());
+            }
+            let obsolete_active = {
+                let p = lock_or_recover(pieces);
+                active_pieces
+                    .keys()
+                    .copied()
+                    .filter(|index| p.is_piece_complete(*index) || !p.is_piece_wanted(*index))
+                    .collect::<Vec<_>>()
+            };
+            if !obsolete_active.is_empty() {
+                let mut cancelled = Vec::new();
+                pending.retain(|entry| {
+                    if obsolete_active.contains(&entry.request.index) {
+                        cancelled.push(entry.request);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for request in cancelled {
+                    peer::write_message(
+                        &mut stream,
+                        &peer::Message::Cancel {
+                            index: request.index,
+                            begin: request.begin,
+                            length: request.length,
+                        },
+                    )
+                    .map_err(|err| format!("cancel obsolete piece failed: {err}"))?;
+                }
+                {
+                    let mut p = lock_or_recover(pieces);
+                    for index in &obsolete_active {
+                        if !p.is_piece_complete(*index) {
+                            let _ = p.reset_piece(*index);
+                        }
+                        p.release_piece(peer_tag, *index);
+                    }
+                }
+                let released = obsolete_active
+                    .into_iter()
+                    .filter_map(|index| active_pieces.remove(&index))
+                    .collect::<Vec<_>>();
+                drop(released);
             }
             const SEED_TO_SEED_IDLE_TICKS: u32 = 240; // 2 min for seeder-to-seeder
             let idle_limit = if seed_mode && !peer_interested {
@@ -6996,17 +10707,22 @@ fn download_from_peer_concurrent(
                 if let Some(since) = choke_since {
                     if since.elapsed() > Duration::from_secs(60) {
                         if !active_pieces.is_empty() {
-                            let mut p = lock_or_recover(pieces);
-                            for active in active_pieces.drain().map(|(_, piece)| piece) {
-                                if !active.is_complete() {
-                                    let _ = p.reset_piece(active.index());
+                            let mut released = Vec::new();
+                            {
+                                let mut p = lock_or_recover(pieces);
+                                for active in active_pieces.drain().map(|(_, piece)| piece) {
+                                    if !active.is_complete() {
+                                        let _ = p.reset_piece(active.index());
+                                    }
+                                    p.release_piece(peer_tag, active.index());
+                                    log_debug!(
+                                        "released stale piece {} from choked peer {addr}",
+                                        active.index()
+                                    );
+                                    released.push(active);
                                 }
-                                p.release_piece(peer_tag, active.index());
-                                log_debug!(
-                                    "released stale piece {} from choked peer {addr}",
-                                    active.index()
-                                );
                             }
+                            drop(released);
                         }
                         choke_since = None;
                     }
@@ -7035,10 +10751,18 @@ fn download_from_peer_concurrent(
                     pending.clear();
                 }
                 if !active_pieces.is_empty() {
-                    let mut p = lock_or_recover(pieces);
-                    for active in active_pieces.drain().map(|(_, piece)| piece) {
-                        p.release_piece(peer_tag, active.index());
-                    }
+                    let released = {
+                        let mut p = lock_or_recover(pieces);
+                        let released = active_pieces
+                            .drain()
+                            .map(|(_, piece)| piece)
+                            .collect::<Vec<_>>();
+                        for active in &released {
+                            p.release_piece(peer_tag, active.index());
+                        }
+                        released
+                    };
+                    drop(released);
                 }
                 let _ = peer::write_message(&mut stream, &peer::Message::NotInterested);
                 update_ui(ui_state, |state| {
@@ -7066,11 +10790,13 @@ fn download_from_peer_concurrent(
                 if paused && !pause_sent {
                     if !pending.is_empty() {
                         cancel_pending(&mut stream, &pending)?;
-                        let mut p = lock_or_recover(pieces);
-                        for entry in pending.drain(..) {
-                            p.mark_block_missing(entry.request.index, entry.request.begin)
-                                .map_err(|err| format!("block timeout: {err}"))?;
+                    }
+                    if !pending.is_empty() || !active_pieces.is_empty() {
+                        {
+                            let mut p = lock_or_recover(pieces);
+                            abandon_inflight(&mut p, &mut pending, &active_pieces);
                         }
+                        active_pieces.clear();
                     }
                     peer::write_message(&mut stream, &peer::Message::NotInterested)
                         .map_err(|err| format!("not-interested write failed: {err}"))?;
@@ -7136,6 +10862,9 @@ fn download_from_peer_concurrent(
                                 }
                             });
                             if let Some(index) = selected {
+                                if active_pieces.contains_key(&index) {
+                                    continue;
+                                }
                                 let length = {
                                     let p = lock_or_recover(pieces);
                                     p.piece_length(index)
@@ -7148,13 +10877,16 @@ fn download_from_peer_concurrent(
                                         return Err("invalid piece length".to_string());
                                     }
                                 };
-                                let buffer = match piece::PieceBuffer::new(index, length) {
-                                    Ok(buffer) => buffer,
-                                    Err(err) => {
-                                        let mut p = lock_or_recover(pieces);
-                                        p.release_piece(peer_tag, index);
-                                        return Err(format!("piece buffer error: {err}"));
-                                    }
+                                let buffer = match allocate_reserved_piece_buffer(
+                                    pieces,
+                                    peer_tag,
+                                    index,
+                                    length,
+                                    piece_buffer_budgets,
+                                ) {
+                                    Ok(Some(buffer)) => buffer,
+                                    Ok(None) => break,
+                                    Err(err) => return Err(err),
                                 };
                                 log_debug!("selected piece {index} from {addr}");
                                 active_pieces.insert(index, buffer);
@@ -7245,6 +10977,7 @@ fn download_from_peer_concurrent(
                 Ok(Some(message)) => {
                     log_debug!("peer msg: {}", message_summary(&message));
                     idle = 0;
+                    let immediately_after_served_chunk = last_served_chunk.take();
                     match message {
                         peer::Message::Extended { ext_id, payload } => {
                             if ext_id == 0 {
@@ -7266,20 +10999,11 @@ fn download_from_peer_concurrent(
                         }
                         peer::Message::Bitfield(bits) => {
                             let mut p = lock_or_recover(pieces);
-                            if let Some(existing) = bitfield.as_ref() {
-                                if existing.len() != bits.len() {
-                                    ban_peer("bitfield length mismatch");
-                                    return Err("bitfield length mismatch".to_string());
-                                }
-                                for idx in 0..p.piece_count() {
-                                    if bitfield_has(&bits, idx) && !bitfield_has(existing, idx) {
-                                        if let Err(err) = p.apply_have(idx as u32) {
-                                            ban_peer("invalid have in bitfield");
-                                            return Err(format!("have error: {err}"));
-                                        }
-                                    }
-                                }
-                            } else if let Err(err) = p.apply_peer_bitfield(&bits) {
+                            if bitfield.is_some() {
+                                ban_peer("duplicate bitfield");
+                                return Err("duplicate bitfield".to_string());
+                            }
+                            if let Err(err) = p.apply_peer_bitfield(&bits) {
                                 ban_peer("invalid bitfield");
                                 return Err(format!("bitfield error: {err}"));
                             }
@@ -7293,6 +11017,10 @@ fn download_from_peer_concurrent(
                             }
                             if let Some(bits) = bitfield.as_mut() {
                                 let idx = index as usize;
+                                if idx >= p.piece_count() {
+                                    ban_peer("invalid have index");
+                                    return Err("have index out of range".to_string());
+                                }
                                 if !bitfield_has(bits, idx) {
                                     if let Err(err) = p.apply_have(index) {
                                         ban_peer("invalid have");
@@ -7367,7 +11095,6 @@ fn download_from_peer_concurrent(
                                     &mut stream,
                                     pieces,
                                     storage,
-                                    base_piece_length,
                                     index,
                                     begin,
                                     length,
@@ -7380,6 +11107,7 @@ fn download_from_peer_concurrent(
                                     let _ = err;
                                     log_debug!("upload request rejected: {err}");
                                 } else {
+                                    last_served_chunk = Some((index, begin, length));
                                     last_sent = Instant::now();
                                     check_seed_ratio(uploaded, downloaded, stop_flag);
                                 }
@@ -7429,23 +11157,27 @@ fn download_from_peer_concurrent(
                                     pending.swap_remove(pos);
                                 }
                                 if complete {
-                                    let active = active_pieces
-                                        .remove(&index)
-                                        .ok_or_else(|| "active piece missing".to_string())?;
-                                    let expected = {
+                                    let (expected, piece_start) = {
                                         let p = lock_or_recover(pieces);
-                                        p.piece_hash(index)
+                                        let expected = p
+                                            .piece_hash(index)
                                             .ok_or_else(|| "missing piece hash".to_string())?
-                                            .clone()
+                                            .clone();
+                                        let offset = p
+                                            .piece_offset(index)
+                                            .ok_or_else(|| "missing piece offset".to_string())?;
+                                        (expected, offset)
                                     };
                                     if verify_piece_hash(active.data(), &expected) {
-                                        let offset =
-                                            (index as u64).saturating_mul(base_piece_length);
-                                        {
-                                            let mut s = lock_or_recover(storage);
-                                            s.write_at(offset, active.data())
-                                                .map_err(|err| format!("write failed: {err}"))?;
-                                        }
+                                        let active = persist_active_piece(
+                                            &mut active_pieces,
+                                            index,
+                                            |active| {
+                                                let mut s = lock_or_recover(storage);
+                                                s.write_at(piece_start, active.data())
+                                                    .map_err(|err| format!("write failed: {err}"))
+                                            },
+                                        )?;
                                         log_debug!(
                                             "piece complete: index={} bytes={} from {addr}",
                                             index,
@@ -7460,9 +11192,8 @@ fn download_from_peer_concurrent(
                                             p.release_piece(peer_tag, index);
                                             (p.completed_pieces(), was_new)
                                         };
-                                        let piece_start =
-                                            (index as u64).saturating_mul(base_piece_length);
                                         let piece_len = active.length() as u64;
+                                        drop(active);
                                         if was_new {
                                             if let Ok(mut log) = completed_log.lock() {
                                                 log.push(index);
@@ -7540,9 +11271,13 @@ fn download_from_peer_concurrent(
                                             });
                                         }
                                     } else {
+                                        let active = active_pieces
+                                            .remove(&index)
+                                            .ok_or_else(|| "active piece missing".to_string())?;
                                         log_warn!("piece hash mismatch: index={index}");
                                         ban_peer("piece hash mismatch");
                                         let piece_len = active.length() as u64;
+                                        drop(active);
                                         let _ = SESSION_DOWNLOADED_BYTES.fetch_update(
                                             Ordering::SeqCst,
                                             Ordering::SeqCst,
@@ -7569,15 +11304,35 @@ fn download_from_peer_concurrent(
                         }
                         peer::Message::HaveAll => {
                             // BEP 6: Peer has all pieces
-                            let p = lock_or_recover(pieces);
+                            let mut p = lock_or_recover(pieces);
+                            if bitfield.is_some() {
+                                ban_peer("duplicate bitfield state");
+                                return Err("duplicate bitfield state".to_string());
+                            }
                             let len = p.bitfield_len();
-                            bitfield = Some(vec![0xff; len]);
+                            let mut all = vec![0xff; len];
+                            if let Some(last) = all.last_mut() {
+                                let used = p.piece_count() % 8;
+                                if used != 0 {
+                                    *last = 0xff << (8 - used);
+                                }
+                            }
+                            p.apply_peer_bitfield(&all)
+                                .map_err(|err| format!("have-all error: {err}"))?;
+                            bitfield = Some(all);
                         }
                         peer::Message::HaveNone => {
                             // BEP 6: Peer has no pieces
-                            let p = lock_or_recover(pieces);
+                            let mut p = lock_or_recover(pieces);
+                            if bitfield.is_some() {
+                                ban_peer("duplicate bitfield state");
+                                return Err("duplicate bitfield state".to_string());
+                            }
                             let len = p.bitfield_len();
-                            bitfield = Some(vec![0; len]);
+                            let none = vec![0; len];
+                            p.apply_peer_bitfield(&none)
+                                .map_err(|err| format!("have-none error: {err}"))?;
+                            bitfield = Some(none);
                         }
                         peer::Message::SuggestPiece(_) => {
                             // BEP 6: Suggestion noted (no special handling)
@@ -7587,6 +11342,33 @@ fn download_from_peer_concurrent(
                         }
                         peer::Message::RejectRequest { .. } => {
                             // BEP 6: Peer rejected our request
+                        }
+                        peer::Message::HashRequest(request) => {
+                            let must_serve = immediately_after_served_chunk.is_some_and(
+                                |(index, begin, length)| {
+                                    let pieces = lock_or_recover(pieces);
+                                    v2_hashes.request_covers_chunk(
+                                        request, index, begin, length, &pieces,
+                                    )
+                                },
+                            );
+                            respond_v2_hash_request(
+                                &mut stream,
+                                V2HashResponseResources {
+                                    store: v2_hashes,
+                                    pieces,
+                                    storage,
+                                    limits,
+                                    stop_flag,
+                                },
+                                &mut hash_request_budget,
+                                must_serve,
+                                request,
+                            )?;
+                            last_sent = Instant::now();
+                        }
+                        peer::Message::Hashes { .. } | peer::Message::HashReject(_) => {
+                            return Err("unsolicited BEP 52 hash response".to_string());
                         }
                         _ => {}
                     }
@@ -7636,10 +11418,11 @@ fn download_from_peer_concurrent(
         }
     })();
 
-    if result.is_err() {
+    {
         let mut p = lock_or_recover(pieces);
         abandon_inflight(&mut p, &mut pending, &active_pieces);
     }
+    active_pieces.clear();
 
     if let Some(bits) = bitfield {
         let mut p = lock_or_recover(pieces);
@@ -7654,19 +11437,126 @@ fn download_from_peer_concurrent(
     result
 }
 
-fn bind_tcp_dual_stack(port: u16) -> Result<TcpListener, String> {
+fn bind_tcp_listeners(port: u16) -> Result<Vec<TcpListener>, String> {
     use std::net::Ipv6Addr;
+
     let v6_addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
     match TcpListener::bind(v6_addr) {
-        Ok(listener) => {
-            log_info!("listening on [::] (dual-stack) port {port}");
-            Ok(listener)
+        Ok(v6_listener) => {
+            let actual_port = v6_listener
+                .local_addr()
+                .map_err(|err| format!("inspect IPv6 listener: {err}"))?
+                .port();
+            let v6_only = ipv6_listener_is_v6_only(&v6_listener)
+                .map_err(|err| format!("determine IPv6 listener mode: {err}"))?;
+            if !v6_only {
+                log_info!("listening on [::] (dual-stack) port {actual_port}");
+                return Ok(vec![v6_listener]);
+            }
+
+            let v4_addr = SocketAddr::from(([0, 0, 0, 0], actual_port));
+            let v4_listener = TcpListener::bind(v4_addr).map_err(|err| {
+                format!(
+                    "IPv6 listener on port {actual_port} is IPv6-only and the IPv4 bind failed: {err}"
+                )
+            })?;
+            log_info!("listening on [::] and 0.0.0.0 port {actual_port}");
+            Ok(vec![v6_listener, v4_listener])
         }
-        Err(_) => {
+        Err(v6_error) => {
             let v4_addr = SocketAddr::from(([0, 0, 0, 0], port));
-            TcpListener::bind(v4_addr).map_err(|e| format!("bind port {port}: {e}"))
+            let v4_listener = TcpListener::bind(v4_addr).map_err(|v4_error| {
+                format!("bind port {port} failed for IPv6 ({v6_error}) and IPv4 ({v4_error})")
+            })?;
+            let actual_port = v4_listener
+                .local_addr()
+                .map_err(|err| format!("inspect IPv4 listener: {err}"))?
+                .port();
+            log_warn!(
+                "IPv6 listener unavailable ({v6_error}); listening on IPv4 port {actual_port}"
+            );
+            Ok(vec![v4_listener])
         }
     }
+}
+
+#[cfg(unix)]
+fn ipv6_listener_is_v6_only(listener: &TcpListener) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPV6_V6ONLY returned an unexpected value size",
+        ));
+    }
+    Ok(value != 0)
+}
+
+#[cfg(windows)]
+fn ipv6_listener_is_v6_only(listener: &TcpListener) -> io::Result<bool> {
+    use std::ffi::c_char;
+    use std::os::windows::io::AsRawSocket;
+
+    const IPPROTO_IPV6: i32 = 41;
+    const IPV6_V6ONLY: i32 = 27;
+    const SOCKET_ERROR: i32 = -1;
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn getsockopt(
+            socket: usize,
+            level: i32,
+            option_name: i32,
+            option_value: *mut c_char,
+            option_length: *mut i32,
+        ) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    let mut value = 0i32;
+    let mut length = std::mem::size_of::<i32>() as i32;
+    let result = unsafe {
+        getsockopt(
+            listener.as_raw_socket() as usize,
+            IPPROTO_IPV6,
+            IPV6_V6ONLY,
+            (&mut value as *mut i32).cast(),
+            &mut length,
+        )
+    };
+    if result == SOCKET_ERROR {
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if length as usize != std::mem::size_of::<i32>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPV6_V6ONLY returned an unexpected value size",
+        ));
+    }
+    Ok(value != 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ipv6_listener_is_v6_only(_listener: &TcpListener) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "IPV6_V6ONLY inspection is unsupported on this platform",
+    ))
 }
 
 fn connect_peer(addr: SocketAddr, connect_cfg: &ConnectionConfig) -> Result<PeerStream, String> {
@@ -7771,25 +11661,35 @@ fn connect_peer_with_timeout(
 
     attempts += 1;
     {
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let result = connect_tcp_stream(addr, tcp_timeout).map(|stream| {
-                let _ = stream.set_nodelay(true);
-                configure_keepalive(&stream);
-                PeerStream::tcp(stream)
-            });
-            let _ = tx.send(result);
-        });
+        let result_tx = tx.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("tcp-connect".to_string())
+            .spawn(move || {
+                let result = connect_tcp_stream(addr, tcp_timeout).map(|stream| {
+                    let _ = stream.set_nodelay(true);
+                    configure_keepalive(&stream);
+                    PeerStream::tcp(stream)
+                });
+                let _ = result_tx.send(result);
+            })
+        {
+            let _ = tx.send(Err(format!("TCP connect worker could not start: {err}")));
+        }
     }
 
     if let Some(connector) = connect_cfg.utp.as_ref() {
         attempts += 1;
-        let tx = tx.clone();
+        let result_tx = tx.clone();
         let connector = connector.clone();
-        thread::spawn(move || {
-            let result = connector.connect(addr).map(PeerStream::utp);
-            let _ = tx.send(result);
-        });
+        if let Err(err) = thread::Builder::new()
+            .name("utp-connect".to_string())
+            .spawn(move || {
+                let result = connector.connect(addr).map(PeerStream::utp);
+                let _ = result_tx.send(result);
+            })
+        {
+            let _ = tx.send(Err(format!("uTP connect worker could not start: {err}")));
+        }
     }
 
     drop(tx);
@@ -7817,13 +11717,16 @@ fn connect_peer_with_timeout(
 fn outbound_handshake(
     stream: &mut PeerStream,
     info_hash: [u8; 20],
+    hybrid_v2_info_hash: Option<[u8; 20]>,
     peer_id: [u8; 20],
     encryption: EncryptionMode,
 ) -> Result<peer::Handshake, String> {
     match encryption {
-        EncryptionMode::Disable => plaintext_handshake(stream, info_hash, peer_id),
+        EncryptionMode::Disable => {
+            plaintext_handshake(stream, info_hash, hybrid_v2_info_hash, peer_id)
+        }
         EncryptionMode::Prefer | EncryptionMode::Require => {
-            mse_outbound_handshake(stream, info_hash, peer_id, encryption)
+            mse_outbound_handshake(stream, info_hash, hybrid_v2_info_hash, peer_id, encryption)
         }
     }
 }
@@ -7831,26 +11734,37 @@ fn outbound_handshake(
 fn plaintext_handshake(
     stream: &mut PeerStream,
     info_hash: [u8; 20],
+    hybrid_v2_info_hash: Option<[u8; 20]>,
     peer_id: [u8; 20],
 ) -> Result<peer::Handshake, String> {
-    peer::write_handshake(stream, info_hash, peer_id, true)
-        .map_err(|err| format!("handshake write failed: {err}"))?;
+    peer::write_handshake_with_hybrid_upgrade(
+        stream,
+        info_hash,
+        peer_id,
+        true,
+        hybrid_v2_info_hash.is_some(),
+    )
+    .map_err(|err| format!("handshake write failed: {err}"))?;
     let handshake =
         peer::read_handshake(stream).map_err(|err| format!("handshake read failed: {err}"))?;
-    if handshake.info_hash != info_hash {
-        return Err("peer returned wrong info hash".to_string());
-    }
+    validate_outbound_handshake_hash(&handshake, info_hash, hybrid_v2_info_hash)?;
     Ok(handshake)
 }
 
 fn mse_outbound_handshake(
     stream: &mut PeerStream,
     info_hash: [u8; 20],
+    hybrid_v2_info_hash: Option<[u8; 20]>,
     peer_id: [u8; 20],
     encryption: EncryptionMode,
 ) -> Result<peer::Handshake, String> {
     let allow_plain = encryption != EncryptionMode::Require;
-    let handshake_bytes = peer::build_handshake(info_hash, peer_id, true);
+    let handshake_bytes = peer::build_handshake_with_hybrid_upgrade(
+        info_hash,
+        peer_id,
+        true,
+        hybrid_v2_info_hash.is_some(),
+    );
     let (crypto, cipher, buffered) =
         mse::initiate(stream, info_hash, allow_plain, &handshake_bytes)?;
     if matches!(crypto, mse::CryptoMode::Plaintext) && encryption == EncryptionMode::Require {
@@ -7865,10 +11779,20 @@ fn mse_outbound_handshake(
     // Peer's BT handshake is the first thing in the encrypted payload stream
     let handshake =
         peer::read_handshake(stream).map_err(|err| format!("mse handshake read: {err}"))?;
-    if handshake.info_hash != info_hash {
-        return Err("peer returned wrong info hash".to_string());
-    }
+    validate_outbound_handshake_hash(&handshake, info_hash, hybrid_v2_info_hash)?;
     Ok(handshake)
+}
+
+fn validate_outbound_handshake_hash(
+    handshake: &peer::Handshake,
+    info_hash: [u8; 20],
+    hybrid_v2_info_hash: Option<[u8; 20]>,
+) -> Result<(), String> {
+    if handshake.info_hash == info_hash || hybrid_v2_info_hash == Some(handshake.info_hash) {
+        Ok(())
+    } else {
+        Err("peer returned wrong info hash".to_string())
+    }
 }
 
 fn inbound_handshake(
@@ -7886,7 +11810,8 @@ fn inbound_handshake(
         }
         let handshake = read_handshake_with_first(stream, first[0])?;
         let context = find_context(registry, handshake.info_hash)?;
-        peer::write_handshake(stream, context.info_hash, context.peer_id, true)
+        let response_info_hash = inbound_handshake_response_hash(&context, &handshake);
+        peer::write_handshake(stream, response_info_hash, context.peer_id, true)
             .map_err(|err| err.to_string())?;
         return Ok((handshake, context));
     }
@@ -7894,7 +11819,7 @@ fn inbound_handshake(
         return Err("encryption disabled".to_string());
     }
     let info_hashes = list_info_hashes(registry)?;
-    let (crypto, cipher, info_hash, peer_ia) = mse::accept(
+    let (crypto, cipher, info_hash, peer_ia, buffered) = mse::accept(
         stream,
         &info_hashes,
         first[0],
@@ -7906,16 +11831,33 @@ fn inbound_handshake(
     {
         return Err("peer selected plaintext".to_string());
     }
+    if !buffered.is_empty() {
+        stream.prepend_read_buffer(buffered);
+    }
     let handshake = peer::parse_handshake(&peer_ia).map_err(|err| err.to_string())?;
     if handshake.info_hash != info_hash {
         return Err("peer returned wrong info hash".to_string());
     }
     let context = find_context(registry, info_hash)?;
-    let response = peer::build_handshake(context.info_hash, context.peer_id, true);
+    let response_info_hash = inbound_handshake_response_hash(&context, &handshake);
+    let response = peer::build_handshake(response_info_hash, context.peer_id, true);
     stream
         .write_all(&response)
         .map_err(|err| format!("mse response write: {err}"))?;
     Ok((handshake, context))
+}
+
+fn inbound_handshake_response_hash(
+    context: &TorrentContext,
+    handshake: &peer::Handshake,
+) -> [u8; 20] {
+    if handshake.info_hash == context.info_hash && handshake.supports_hybrid_v2_upgrade() {
+        context.hybrid_v2_info_hash.unwrap_or(context.info_hash)
+    } else {
+        // Direct v2 connections (and ordinary v1 connections) must be echoed
+        // with the exact swarm identifier the initiator supplied.
+        handshake.info_hash
+    }
 }
 
 fn read_handshake_with_first(
@@ -7937,7 +11879,16 @@ fn list_info_hashes(registry: &SessionRegistry) -> Result<Vec<[u8; 20]>, String>
     if guard.is_empty() {
         return Err("no torrents available".to_string());
     }
-    Ok(guard.keys().copied().collect())
+    let mut info_hashes = Vec::with_capacity(guard.len().saturating_mul(2));
+    for context in guard.values() {
+        info_hashes.push(context.info_hash);
+        if let Some(info_hash) = context.hybrid_v2_info_hash {
+            info_hashes.push(info_hash);
+        }
+    }
+    info_hashes.sort_unstable();
+    info_hashes.dedup();
+    Ok(info_hashes)
 }
 
 fn find_context(
@@ -7950,6 +11901,12 @@ fn find_context(
     guard
         .get(&info_hash)
         .cloned()
+        .or_else(|| {
+            guard
+                .values()
+                .find(|context| context.hybrid_v2_info_hash == Some(info_hash))
+                .cloned()
+        })
         .ok_or_else(|| "unknown info hash".to_string())
 }
 
@@ -7967,8 +11924,8 @@ fn set_torrent_label(
 ) -> Result<(), String> {
     let context =
         find_context_by_id(registry, torrent_id).ok_or_else(|| "torrent not found".to_string())?;
+    session_store.set_label(context.info_hash, label)?;
     *lock_or_recover(&context.label) = label.to_string();
-    session_store.set_label(context.info_hash, label);
     update_ui(ui_state, |state| {
         update_torrent_entry(state, torrent_id, |torrent| {
             torrent.label = label.to_string();
@@ -7985,17 +11942,29 @@ fn add_torrent_tracker(
 ) -> Result<(), String> {
     let context =
         find_context_by_id(registry, torrent_id).ok_or_else(|| "torrent not found".to_string())?;
+    if !valid_tracker_url(url) {
+        return Err("invalid tracker URL".to_string());
+    }
     let mut trackers = lock_or_recover(&context.trackers);
+    if trackers.http.len() + trackers.udp.len() >= MAX_TRACKERS_PER_TORRENT
+        && !trackers
+            .http
+            .iter()
+            .chain(&trackers.udp)
+            .any(|item| item == url)
+    {
+        return Err(format!(
+            "tracker limit reached ({MAX_TRACKERS_PER_TORRENT})"
+        ));
+    }
     if url.starts_with("udp://") {
-        if !trackers.udp.contains(&url.to_string()) {
+        if !trackers.udp.iter().any(|item| item == url) {
             trackers.udp.push(url.to_string());
         }
-    } else if url.starts_with("http://") || url.starts_with("https://") {
-        if !trackers.http.contains(&url.to_string()) {
-            trackers.http.push(url.to_string());
-        }
-    } else {
-        return Err("invalid tracker URL scheme".to_string());
+    } else if (url.starts_with("http://") || url.starts_with("https://"))
+        && !trackers.http.iter().any(|item| item == url)
+    {
+        trackers.http.push(url.to_string());
     }
     let all: Vec<String> = trackers
         .http
@@ -8045,8 +12014,15 @@ fn recheck_torrent(
 ) -> Result<(), String> {
     let context =
         find_context_by_id(registry, torrent_id).ok_or_else(|| "torrent not found".to_string())?;
+    context
+        .rechecking
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "recheck already in progress".to_string())?;
     let pieces_arc = Arc::clone(&context.pieces);
     let storage_arc = Arc::clone(&context.storage);
+    let rechecking = Arc::clone(&context.rechecking);
+    let save_requested = Arc::clone(&context.resume_save_requested);
+    let stop_flag = Arc::clone(&context.stop_requested);
     let base_piece_length = context.base_piece_length;
     let ui_clone = ui_state.clone();
     update_ui(ui_state, |state| {
@@ -8055,37 +12031,80 @@ fn recheck_torrent(
             torrent.status = "checking".to_string();
         });
     });
-    thread::spawn(move || {
-        {
-            let mut p = lock_or_recover(&pieces_arc);
-            p.reset_verified();
-        }
-        {
-            let mut p = lock_or_recover(&pieces_arc);
-            let mut s = lock_or_recover(&storage_arc);
-            let _ = full_recheck(&mut p, &mut s, base_piece_length);
-        }
-        let (completed, total, completed_bytes) = {
-            let p = lock_or_recover(&pieces_arc);
-            (p.completed_pieces(), p.piece_count(), p.completed_bytes())
-        };
-        let status = if completed == total {
-            "seeding"
-        } else {
-            "downloading"
-        };
-        update_ui(&ui_clone, |state| {
-            state.status = status.to_string();
-            state.completed_pieces = completed;
-            state.completed_bytes = completed_bytes;
+    let spawn_result = thread::Builder::new()
+        .name(format!("recheck-{torrent_id}"))
+        .spawn(move || {
+            struct RecheckGuard(Arc<AtomicBool>);
+            impl Drop for RecheckGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = RecheckGuard(rechecking);
+            let result = {
+                // Acquire both locks before resetting so resume saves and peer
+                // workers can never observe a transient all-missing bitfield.
+                let mut p = lock_or_recover(&pieces_arc);
+                let mut s = lock_or_recover(&storage_arc);
+                p.reset_verified();
+                full_recheck(&mut p, &mut s, base_piece_length, Some(&stop_flag))
+                    .map(|_| (p.completed_pieces(), p.piece_count(), p.completed_bytes()))
+            };
+            match result {
+                Ok((completed, total, completed_bytes)) => {
+                    save_requested.store(true, Ordering::Release);
+                    let status = if stop_flag.load(Ordering::SeqCst) {
+                        "stopping"
+                    } else if completed == total {
+                        "seeding"
+                    } else {
+                        "downloading"
+                    };
+                    update_ui(&ui_clone, |state| {
+                        if state.current_id == Some(torrent_id) {
+                            state.status = status.to_string();
+                            state.completed_pieces = completed;
+                            state.completed_bytes = completed_bytes;
+                        }
+                        update_torrent_entry(state, torrent_id, |torrent| {
+                            torrent.status = status.to_string();
+                            torrent.completed_pieces = completed;
+                            torrent.completed_bytes = completed_bytes;
+                            torrent.last_error.clear();
+                        });
+                    });
+                    log_info!("recheck complete: {completed}/{total} pieces valid");
+                }
+                Err(err) => {
+                    log_warn!("recheck failed: {err}");
+                    update_ui(&ui_clone, |state| {
+                        if state.current_id == Some(torrent_id) {
+                            state.status = "error".to_string();
+                            state.last_error = err.clone();
+                        }
+                        update_torrent_entry(state, torrent_id, |torrent| {
+                            torrent.status = "error".to_string();
+                            torrent.last_error = err.clone();
+                        });
+                    });
+                }
+            }
+        });
+    if let Err(err) = spawn_result {
+        context.rechecking.store(false, Ordering::Release);
+        let message = format!("recheck worker could not start: {err}");
+        update_ui(ui_state, |state| {
+            if state.current_id == Some(torrent_id) {
+                state.status = "error".to_string();
+                state.last_error = message.clone();
+            }
             update_torrent_entry(state, torrent_id, |torrent| {
-                torrent.status = status.to_string();
-                torrent.completed_pieces = completed;
-                torrent.completed_bytes = completed_bytes;
+                torrent.status = "error".to_string();
+                torrent.last_error = message.clone();
             });
         });
-        log_info!("recheck complete: {completed}/{total} pieces valid");
-    });
+        return Err(message);
+    }
     Ok(())
 }
 
@@ -8135,6 +12154,22 @@ fn message_summary(message: &peer::Message) -> String {
             format!("reject index={index} begin={begin} length={length}")
         }
         peer::Message::AllowedFast(index) => format!("allowed-fast index={index}"),
+        peer::Message::HashRequest(request) => format!(
+            "hash-request base={} index={} length={} proof={}",
+            request.base_layer, request.index, request.length, request.proof_layers
+        ),
+        peer::Message::Hashes { request, hashes } => format!(
+            "hashes base={} index={} length={} proof={} hashes={}",
+            request.base_layer,
+            request.index,
+            request.length,
+            request.proof_layers,
+            hashes.len()
+        ),
+        peer::Message::HashReject(request) => format!(
+            "hash-reject base={} index={} length={} proof={}",
+            request.base_layer, request.index, request.length, request.proof_layers
+        ),
     }
 }
 
@@ -8198,7 +12233,9 @@ fn record_peer_result(queue: &mut PeerQueue, addr: SocketAddr, result: &Result<(
 }
 
 fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
-    let byte = bitfield[index / 8];
+    let Some(byte) = bitfield.get(index / 8).copied() else {
+        return false;
+    };
     let offset = index % 8;
     let mask = 0x80 >> offset;
     (byte & mask) != 0
@@ -8343,10 +12380,21 @@ fn send_completed_updates<W: Write>(
     Ok(())
 }
 
-fn register_session(registry: &SessionRegistry, context: Arc<TorrentContext>) {
-    if let Ok(mut guard) = registry.lock() {
-        guard.insert(context.info_hash, context);
+fn register_session(
+    registry: &SessionRegistry,
+    context: Arc<TorrentContext>,
+) -> Result<(), String> {
+    let mut guard = registry
+        .lock()
+        .map_err(|_| "torrent registry lock failed".to_string())?;
+    if let Some(existing) = guard.get(&context.info_hash) {
+        if existing.id != context.id {
+            return Err("torrent is already active".to_string());
+        }
+        return Ok(());
     }
+    guard.insert(context.info_hash, context);
+    Ok(())
 }
 
 fn unregister_session(registry: &SessionRegistry, info_hash: [u8; 20], torrent_id: u64) {
@@ -8365,66 +12413,96 @@ fn start_utp_listener(
     listener: utp::UtpListener,
     registry: SessionRegistry,
     inbound: InboundConfig,
-) {
-    thread::spawn(move || loop {
-        if shutdown_requested() {
-            break;
-        }
-        if let Some(stream) = listener.try_accept() {
-            if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
-                let registry = Arc::clone(&registry);
-                let inbound = inbound.clone();
-                thread::Builder::new()
-                    .stack_size(PEER_THREAD_STACK)
-                    .spawn(move || {
-                        let _slot_guard = slot_guard;
-                        handle_incoming_peer(PeerStream::utp(stream), registry, inbound);
-                    })
-                    .ok();
-            } else {
-                log_debug!("dropping inbound uTP peer: handler capacity reached");
-            }
-        } else {
-            sleep_with_shutdown(Duration::from_millis(20));
-        }
-    });
-}
-
-fn start_inbound_listener(port: u16, registry: SessionRegistry, inbound: InboundConfig) {
-    thread::spawn(move || {
-        let listener = match bind_tcp_dual_stack(port) {
-            Ok(listener) => listener,
-            Err(err) => {
-                log_warn!("inbound listener failed: {err}");
-                return;
-            }
-        };
-        for stream in listener.incoming() {
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("utp-listener".to_string())
+        .spawn(move || loop {
             if shutdown_requested() {
                 break;
             }
-            match stream {
-                Ok(stream) => {
-                    if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
-                        let registry = Arc::clone(&registry);
-                        let inbound = inbound.clone();
-                        thread::Builder::new()
-                            .stack_size(PEER_THREAD_STACK)
-                            .spawn(move || {
-                                let _slot_guard = slot_guard;
-                                handle_incoming_peer(PeerStream::tcp(stream), registry, inbound);
-                            })
-                            .ok();
-                    } else {
-                        log_debug!("dropping inbound TCP peer: handler capacity reached");
+            if let Some(stream) = listener.try_accept() {
+                if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
+                    let registry = Arc::clone(&registry);
+                    let inbound = inbound.clone();
+                    if let Err(err) = thread::Builder::new()
+                        .name("inbound-utp-peer".to_string())
+                        .stack_size(PEER_THREAD_STACK)
+                        .spawn(move || {
+                            let _slot_guard = slot_guard;
+                            handle_incoming_peer(PeerStream::utp(stream), registry, inbound);
+                        })
+                    {
+                        log_warn!("inbound uTP peer worker could not start: {err}");
+                    }
+                } else {
+                    log_debug!("dropping inbound uTP peer: handler capacity reached");
+                }
+            } else {
+                sleep_with_shutdown(Duration::from_millis(20));
+            }
+        })
+        .map_err(|err| format!("listener worker could not start: {err}"))
+}
+
+fn start_inbound_listener(
+    port: u16,
+    registry: SessionRegistry,
+    inbound: InboundConfig,
+) -> Result<thread::JoinHandle<()>, String> {
+    let listeners = bind_tcp_listeners(port)?;
+    for listener in &listeners {
+        listener
+            .set_nonblocking(true)
+            .map_err(|err| format!("set listener nonblocking: {err}"))?;
+    }
+    thread::Builder::new()
+        .name("tcp-listener".to_string())
+        .spawn(move || loop {
+            if shutdown_requested() {
+                break;
+            }
+            let mut accepted_connection = false;
+            let mut accept_failed = false;
+            for listener in &listeners {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted_connection = true;
+                        if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
+                            let registry = Arc::clone(&registry);
+                            let inbound = inbound.clone();
+                            if let Err(err) = thread::Builder::new()
+                                .name("inbound-tcp-peer".to_string())
+                                .stack_size(PEER_THREAD_STACK)
+                                .spawn(move || {
+                                    let _slot_guard = slot_guard;
+                                    handle_incoming_peer(
+                                        PeerStream::tcp(stream),
+                                        registry,
+                                        inbound,
+                                    );
+                                })
+                            {
+                                log_warn!("inbound TCP peer worker could not start: {err}");
+                            }
+                        } else {
+                            log_debug!("dropping inbound TCP peer: handler capacity reached");
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(err) => {
+                        accept_failed = true;
+                        log_warn!("inbound accept failed: {err}");
                     }
                 }
-                Err(err) => {
-                    log_warn!("inbound accept failed: {err}");
-                }
             }
-        }
-    });
+            if accept_failed {
+                sleep_with_shutdown(Duration::from_millis(100));
+            } else if !accepted_connection {
+                sleep_with_shutdown(Duration::from_millis(20));
+            }
+        })
+        .map_err(|err| format!("listener worker could not start: {err}"))
 }
 
 fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbound: InboundConfig) {
@@ -8465,6 +12543,10 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         return;
     }
     let peer_tag = context.peer_tags.fetch_add(1, Ordering::SeqCst);
+    let _cancellation = PeerCancellationGuard::new(&context.peer_cancellations, peer_tag, &stream);
+    if torrent_stop_requested(&context.stop_requested) {
+        return;
+    }
     context.upload_manager.register(peer_tag);
     PEER_CONNECTED.fetch_add(1, Ordering::SeqCst);
     context.active_peers.fetch_add(1, Ordering::SeqCst);
@@ -8478,6 +12560,8 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         let log = lock_or_recover(&context.completed_log);
         log.len()
     };
+    let mut hash_request_budget = HashRequestBudget::new();
+    let mut last_served_chunk: Option<(u32, u32, u32)> = None;
 
     let (local_bitfield, have_pieces) = {
         let p = lock_or_recover(&context.pieces);
@@ -8557,6 +12641,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         match reader.read_message(&mut stream) {
             Ok(Some(message)) => {
                 idle = 0;
+                let immediately_after_served_chunk = last_served_chunk.take();
                 match message {
                     peer::Message::Interested => {
                         set_peer_interest(&context.interested_peers, &mut peer_interested, true);
@@ -8585,7 +12670,6 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                                 &mut stream,
                                 &context.pieces,
                                 &context.storage,
-                                context.base_piece_length,
                                 index,
                                 begin,
                                 length,
@@ -8598,6 +12682,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                                 let _ = err;
                                 log_debug!("inbound upload rejected: {err}");
                             } else {
+                                last_served_chunk = Some((index, begin, length));
                                 last_sent = Instant::now();
                                 check_seed_ratio(
                                     &context.uploaded,
@@ -8616,6 +12701,38 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
                     }
                     peer::Message::HaveNone => {
                         // BEP 6: Peer has no pieces
+                    }
+                    peer::Message::HashRequest(request) => {
+                        let must_serve =
+                            immediately_after_served_chunk.is_some_and(|(index, begin, length)| {
+                                let pieces = lock_or_recover(&context.pieces);
+                                context
+                                    .v2_hashes
+                                    .request_covers_chunk(request, index, begin, length, &pieces)
+                            });
+                        if respond_v2_hash_request(
+                            &mut stream,
+                            V2HashResponseResources {
+                                store: &context.v2_hashes,
+                                pieces: &context.pieces,
+                                storage: &context.storage,
+                                limits: &context.limits,
+                                stop_flag: &context.stop_requested,
+                            },
+                            &mut hash_request_budget,
+                            must_serve,
+                            request,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                        last_sent = Instant::now();
+                    }
+                    peer::Message::Hashes { .. } | peer::Message::HashReject(_) => {
+                        // We do not originate BEP 52 hash requests, so a
+                        // response cannot correlate with any pending request.
+                        break;
                     }
                     _ => {}
                 }
@@ -8642,7 +12759,6 @@ fn handle_upload_request<W: Write>(
     stream: &mut W,
     pieces: &Arc<Mutex<piece::PieceManager>>,
     storage: &Arc<Mutex<storage::Storage>>,
-    base_piece_length: u64,
     index: u32,
     begin: u32,
     length: u32,
@@ -8656,13 +12772,18 @@ fn handle_upload_request<W: Write>(
         return Err("invalid request length".to_string());
     }
 
-    let piece_len = {
+    let (piece_len, piece_start) = {
         let p = lock_or_recover(pieces);
         if !p.is_piece_complete(index) {
             return Err("requested piece not available".to_string());
         }
-        p.piece_length(index)
-            .ok_or_else(|| "missing piece length".to_string())?
+        let length = p
+            .piece_length(index)
+            .ok_or_else(|| "missing piece length".to_string())?;
+        let offset = p
+            .piece_offset(index)
+            .ok_or_else(|| "missing piece offset".to_string())?;
+        (length, offset)
     };
 
     let end = begin
@@ -8672,9 +12793,7 @@ fn handle_upload_request<W: Write>(
         return Err("request out of bounds".to_string());
     }
 
-    let offset = (index as u64)
-        .saturating_mul(base_piece_length)
-        .saturating_add(begin as u64);
+    let offset = piece_start.saturating_add(begin as u64);
     let mut buf = vec![0u8; length as usize];
     {
         let mut s = lock_or_recover(storage);
@@ -8802,6 +12921,7 @@ fn execute_schedule_command(
         }
         log_info!("schedule: checked seed ratios");
     } else {
+        let command = tracker::sanitize_failure_reason(command.as_bytes());
         log_warn!("schedule: unknown command '{command}'");
     }
 }
@@ -8812,6 +12932,10 @@ fn rss_add_feed(url: &str, interval: u64, download_dir: &Path) -> Result<(), Str
     if state.feeds.iter().any(|f| f.url == url) {
         return Err("feed already exists".to_string());
     }
+    if state.feeds.len() >= rss::MAX_RSS_FEEDS || url.len() > rss::MAX_RSS_TEXT_BYTES {
+        return Err("RSS feed limit exceeded".to_string());
+    }
+    let previous = state.feeds.clone();
     state.feeds.push(rss::RssFeed {
         url: url.to_string(),
         title: String::new(),
@@ -8820,22 +12944,29 @@ fn rss_add_feed(url: &str, interval: u64, download_dir: &Path) -> Result<(), Str
         poll_interval_secs: if interval > 0 { interval } else { 900 },
     });
     let rss_path = download_dir.join(".rustorrent").join("rss.benc");
-    rss::save_rss_state(&rss_path, &state)?;
-    log_info!("rss added feed: {url}");
+    if let Err(err) = rss::save_rss_state(&rss_path, &state) {
+        state.feeds = previous;
+        return Err(err);
+    }
+    log_info!("rss added feed: {}", safe_network_url_label(url));
     Ok(())
 }
 
 fn rss_remove_feed(url: &str, download_dir: &Path) -> Result<(), String> {
     let lock = RSS_STATE.get().ok_or("rss not initialized")?;
     let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    let previous = state.feeds.clone();
     let before = state.feeds.len();
     state.feeds.retain(|f| f.url != url);
     if state.feeds.len() == before {
         return Err("feed not found".to_string());
     }
     let rss_path = download_dir.join(".rustorrent").join("rss.benc");
-    rss::save_rss_state(&rss_path, &state)?;
-    log_info!("rss removed feed: {url}");
+    if let Err(err) = rss::save_rss_state(&rss_path, &state) {
+        state.feeds = previous;
+        return Err(err);
+    }
+    log_info!("rss removed feed: {}", safe_network_url_label(url));
     Ok(())
 }
 
@@ -8847,28 +12978,50 @@ fn rss_add_rule(
 ) -> Result<(), String> {
     let lock = RSS_STATE.get().ok_or("rss not initialized")?;
     let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    if state.rules.len() >= rss::MAX_RSS_RULES
+        || name.len() > rss::MAX_RSS_TEXT_BYTES
+        || feed_url.len() > rss::MAX_RSS_TEXT_BYTES
+        || pattern.len() > rss::MAX_RSS_PATTERN_BYTES
+    {
+        return Err("RSS rule limit exceeded".to_string());
+    }
+    let previous = state.rules.clone();
     state.rules.push(rss::RssRule {
         name: name.to_string(),
         feed_url: feed_url.to_string(),
         pattern: pattern.to_string(),
     });
     let rss_path = download_dir.join(".rustorrent").join("rss.benc");
-    rss::save_rss_state(&rss_path, &state)?;
-    log_info!("rss added rule: {name} (pattern: {pattern})");
+    if let Err(err) = rss::save_rss_state(&rss_path, &state) {
+        state.rules = previous;
+        return Err(err);
+    }
+    log_info!(
+        "rss added rule: {} (pattern: {})",
+        tracker::sanitize_failure_reason(name.as_bytes()),
+        tracker::sanitize_failure_reason(pattern.as_bytes())
+    );
     Ok(())
 }
 
 fn rss_remove_rule(name: &str, download_dir: &Path) -> Result<(), String> {
     let lock = RSS_STATE.get().ok_or("rss not initialized")?;
     let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    let previous = state.rules.clone();
     let before = state.rules.len();
     state.rules.retain(|r| r.name != name);
     if state.rules.len() == before {
         return Err("rule not found".to_string());
     }
     let rss_path = download_dir.join(".rustorrent").join("rss.benc");
-    rss::save_rss_state(&rss_path, &state)?;
-    log_info!("rss removed rule: {name}");
+    if let Err(err) = rss::save_rss_state(&rss_path, &state) {
+        state.rules = previous;
+        return Err(err);
+    }
+    log_info!(
+        "rss removed rule: {}",
+        tracker::sanitize_failure_reason(name.as_bytes())
+    );
     Ok(())
 }
 
@@ -8877,6 +13030,9 @@ fn schedule_rss_polls(
     poll_tx: &mpsc::Sender<RssPollResult>,
     inflight: &mut HashSet<String>,
 ) {
+    if args.proxy.is_some() {
+        return;
+    }
     let rss_lock = match RSS_STATE.get() {
         Some(lock) => lock,
         None => return,
@@ -8889,6 +13045,9 @@ fn schedule_rss_polls(
     let now = rss::now_secs();
     let mut due_urls = Vec::new();
     for feed in &mut state.feeds {
+        if inflight.len() >= MAX_RSS_POLL_WORKERS {
+            break;
+        }
         let interval = feed.poll_interval_secs.max(1);
         if now < feed.last_poll.saturating_add(interval) || inflight.contains(&feed.url) {
             continue;
@@ -8905,13 +13064,25 @@ fn schedule_rss_polls(
 
     for url in due_urls {
         let tx = poll_tx.clone();
-        thread::spawn(move || {
-            let parsed = match http::get(&url, 2 * 1024 * 1024) {
-                Ok(bytes) => rss::parse_feed(&bytes),
-                Err(err) => Err(err.to_string()),
-            };
-            let _ = tx.send(RssPollResult { url, parsed });
-        });
+        let failed_url = url.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("rss-poll".to_string())
+            .spawn(move || {
+                let parsed = match http::get_public(&url, 2 * 1024 * 1024) {
+                    Ok(bytes) => rss::parse_feed(&bytes),
+                    Err(err) => Err(err.to_string()),
+                };
+                let _ = tx.send(RssPollResult { url, parsed });
+            })
+        {
+            inflight.remove(&failed_url);
+            if let Ok(mut state) = rss_lock.lock() {
+                if let Some(feed) = state.feeds.iter_mut().find(|feed| feed.url == failed_url) {
+                    feed.last_poll = 0;
+                }
+            }
+            log_warn!("RSS poll worker could not start: {err}");
+        }
     }
 }
 
@@ -8925,6 +13096,9 @@ fn drain_rss_poll_results(
     next_id: &mut u64,
     poll_inflight: &mut HashSet<String>,
     download_inflight: &mut HashSet<String>,
+    registry: &SessionRegistry,
+    session_store: &SessionStore,
+    in_flight: &InFlightTorrents,
 ) {
     while let Ok(result) = poll_rx.try_recv() {
         poll_inflight.remove(&result.url);
@@ -8943,6 +13117,7 @@ fn drain_rss_poll_results(
         };
 
         let mut download_jobs: Vec<(String, String, String)> = Vec::new();
+        let mut scheduled_keys = HashSet::new();
         let mut should_save = false;
         match result.parsed {
             Ok((title, items)) => {
@@ -8951,21 +13126,34 @@ fn drain_rss_poll_results(
                 }
                 let matches =
                     rss::match_rules(&items, &state.rules, &state.seen_guids, &result.url);
-                let mut new_guids = Vec::new();
-                for (item, rule) in &matches {
-                    if download_inflight.contains(&item.guid) {
+                let download_slots =
+                    MAX_RSS_DOWNLOAD_WORKERS.saturating_sub(download_inflight.len());
+                let mut threaded_downloads = 0usize;
+                for (item, rule) in matches.iter().take(MAX_RSS_MATCHES_PER_POLL) {
+                    let seen_key = rss::seen_key(&result.url, &item.guid);
+                    if download_inflight.contains(&seen_key)
+                        || !scheduled_keys.insert(seen_key.clone())
+                    {
                         continue;
                     }
-                    log_info!("rss match: '{}' (rule: '{}')", item.title, rule.name);
-                    new_guids.push(item.guid.clone());
-                    download_jobs.push((item.guid.clone(), item.link.clone(), item.title.clone()));
+                    if !rss::is_magnet_link(&item.link) {
+                        if threaded_downloads >= download_slots {
+                            continue;
+                        }
+                        threaded_downloads += 1;
+                    }
+                    log_info!(
+                        "rss match: '{}' (rule: '{}')",
+                        tracker::sanitize_failure_reason(item.title.as_bytes()),
+                        tracker::sanitize_failure_reason(rule.name.as_bytes())
+                    );
+                    download_jobs.push((seen_key, item.link.clone(), item.title.clone()));
                 }
-                state.seen_guids.extend(new_guids);
                 state.feeds[feed_idx].items = items;
                 should_save = true;
             }
             Err(err) => {
-                log_warn!("rss poll {}: {err}", result.url);
+                log_warn!("rss poll {}: {err}", safe_network_url_label(&result.url));
             }
         }
         if should_save {
@@ -8974,8 +13162,8 @@ fn drain_rss_poll_results(
         }
         drop(state);
 
-        for (guid, url, title) in download_jobs {
-            if url.starts_with("magnet:?") {
+        for (seen_key, url, title) in download_jobs {
+            if rss::is_magnet_link(&url) {
                 let request = TorrentRequest {
                     id: *next_id,
                     source: TorrentSource::Magnet(url.clone()),
@@ -8983,28 +13171,55 @@ fn drain_rss_poll_results(
                     preallocate: args.preallocate,
                     initial_label: String::new(),
                 };
-                *next_id = next_id.saturating_add(1);
-                enqueue_request_with_label(queue, ui_state, request, format!("rss: {title}"));
-                log_info!("rss queued magnet: {title}");
+                let queued = enqueue_request_if_new(
+                    registry,
+                    queue,
+                    session_store,
+                    in_flight,
+                    ui_state,
+                    request,
+                    Some(format!("rss: {title}")),
+                );
+                if queued {
+                    *next_id = next_id.saturating_add(1);
+                }
+                if let Err(err) = record_rss_seen(&args.download_dir, seen_key) {
+                    log_warn!("rss save after queueing magnet: {err}");
+                }
+                if queued {
+                    log_info!(
+                        "rss queued magnet: {}",
+                        tracker::sanitize_failure_reason(title.as_bytes())
+                    );
+                }
                 continue;
             }
-            if !download_inflight.insert(guid.clone()) {
+            if !download_inflight.insert(seen_key.clone()) {
                 continue;
             }
             let tx = download_tx.clone();
-            thread::spawn(move || {
-                let data = http::get(&url, 10 * 1024 * 1024).map_err(|err| err.to_string());
-                let _ = tx.send(RssDownloadResult {
-                    guid,
-                    url,
-                    title,
-                    data,
-                });
-            });
+            let failed_key = seen_key.clone();
+            if let Err(err) = thread::Builder::new()
+                .name("rss-download".to_string())
+                .spawn(move || {
+                    let data =
+                        http::get_public(&url, MAX_TORRENT_BYTES).map_err(|err| err.to_string());
+                    let _ = tx.send(RssDownloadResult {
+                        seen_key,
+                        url,
+                        title,
+                        data,
+                    });
+                })
+            {
+                download_inflight.remove(&failed_key);
+                log_warn!("RSS download worker could not start: {err}");
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_rss_download_results(
     args: &Args,
     download_rx: &mpsc::Receiver<RssDownloadResult>,
@@ -9012,11 +13227,21 @@ fn drain_rss_download_results(
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
     next_id: &mut u64,
     download_inflight: &mut HashSet<String>,
+    registry: &SessionRegistry,
+    session_store: &SessionStore,
+    in_flight: &InFlightTorrents,
 ) {
     while let Ok(result) = download_rx.try_recv() {
-        download_inflight.remove(&result.guid);
+        download_inflight.remove(&result.seen_key);
         match result.data {
             Ok(data) => {
+                if let Err(err) = torrent::parse_torrent(&data) {
+                    log_warn!(
+                        "rss download {} returned invalid torrent metadata: {err}",
+                        safe_network_url_label(&result.url)
+                    );
+                    continue;
+                }
                 let request = TorrentRequest {
                     id: *next_id,
                     source: TorrentSource::Bytes(data),
@@ -9024,20 +13249,49 @@ fn drain_rss_download_results(
                     preallocate: args.preallocate,
                     initial_label: String::new(),
                 };
-                *next_id = next_id.saturating_add(1);
-                enqueue_request_with_label(
+                let queued = enqueue_request_if_new(
+                    registry,
                     queue,
+                    session_store,
+                    in_flight,
                     ui_state,
                     request,
-                    format!("rss: {}", result.title),
+                    Some(format!("rss: {}", result.title)),
                 );
-                log_info!("rss queued torrent: {}", result.title);
+                if queued {
+                    *next_id = next_id.saturating_add(1);
+                }
+                if let Err(err) = record_rss_seen(&args.download_dir, result.seen_key) {
+                    log_warn!("rss save after queueing torrent: {err}");
+                }
+                if queued {
+                    log_info!(
+                        "rss queued torrent: {}",
+                        tracker::sanitize_failure_reason(result.title.as_bytes())
+                    );
+                }
             }
             Err(err) => {
-                log_warn!("rss download {}: {err}", result.url);
+                log_warn!(
+                    "rss download {}: {err}",
+                    safe_network_url_label(&result.url)
+                );
             }
         }
     }
+}
+
+fn record_rss_seen(download_dir: &Path, seen_key: String) -> Result<(), String> {
+    let lock = RSS_STATE.get().ok_or("rss not initialized")?;
+    let mut state = lock.lock().map_err(|_| "rss lock failed".to_string())?;
+    let previous = state.seen_guids.clone();
+    rss::remember_seen(&mut state.seen_guids, seen_key);
+    let rss_path = download_dir.join(".rustorrent").join("rss.benc");
+    if let Err(err) = rss::save_rss_state(&rss_path, &state) {
+        state.seen_guids = previous;
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn cancel_pending<W: Write>(stream: &mut W, pending: &[PendingRequest]) -> Result<(), String> {
@@ -9078,6 +13332,43 @@ fn abandon_inflight(
     for entry in pending.drain(..) {
         let _ = pieces.mark_block_missing(entry.request.index, entry.request.begin);
     }
+}
+
+fn allocate_reserved_piece_buffer(
+    pieces: &Mutex<piece::PieceManager>,
+    peer_tag: u64,
+    index: u32,
+    length: u32,
+    budgets: &piece::PieceBufferBudgets,
+) -> Result<Option<piece::PieceBuffer>, String> {
+    match piece::PieceBuffer::try_new(index, length, budgets) {
+        Ok(Some(buffer)) => Ok(Some(buffer)),
+        Ok(None) => {
+            lock_or_recover(pieces).release_piece(peer_tag, index);
+            Ok(None)
+        }
+        Err(err) => {
+            lock_or_recover(pieces).release_piece(peer_tag, index);
+            Err(format!("piece buffer error: {err}"))
+        }
+    }
+}
+
+fn persist_active_piece<F>(
+    active_pieces: &mut HashMap<u32, piece::PieceBuffer>,
+    index: u32,
+    persist: F,
+) -> Result<piece::PieceBuffer, String>
+where
+    F: FnOnce(&piece::PieceBuffer) -> Result<(), String>,
+{
+    let active = active_pieces
+        .get(&index)
+        .ok_or_else(|| "active piece missing".to_string())?;
+    persist(active)?;
+    active_pieces
+        .remove(&index)
+        .ok_or_else(|| "active piece missing".to_string())
 }
 
 fn update_ui<F>(state: &Option<Arc<Mutex<ui::UiState>>>, update: F)
@@ -9494,6 +13785,13 @@ mod parsing_tests {
     }
 
     #[test]
+    fn query_pairs_preserve_utf8() {
+        let pairs = parse_query_pairs("dn=Espa%C3%B1a+%F0%9F%9A%80&raw=café");
+        assert_eq!(pairs[0].1, "España 🚀");
+        assert_eq!(pairs[1].1, "café");
+    }
+
+    #[test]
     fn info_hash_parsing_supports_hex_and_base32() {
         let hex = "00112233445566778899aabbccddeeff00112233";
         let parsed_hex = parse_info_hash(hex).unwrap();
@@ -9513,16 +13811,35 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
 &tr=http%3A%2F%2Ftracker.example%2Fannounce\
 &ws=http%3A%2F%2Fseed.example%2Ffile\
 &xs=http%3A%2F%2Fmirror.example%2Fmeta.torrent\
-&x.pe=127.0.0.1:6881";
+&x.pe=8.8.8.8:6881";
         let parsed = parse_magnet(link).unwrap();
         assert_eq!(
             parsed.info_hash,
             parse_info_hash("00112233445566778899aabbccddeeff00112233").unwrap()
         );
+        assert_eq!(parsed.info_hash_v1, Some(parsed.info_hash));
         assert_eq!(parsed.trackers, vec!["http://tracker.example/announce"]);
         assert_eq!(parsed.web_seeds, vec!["http://seed.example/file"]);
         assert_eq!(parsed.sources, vec!["http://mirror.example/meta.torrent"]);
-        assert_eq!(parsed.peers, vec!["127.0.0.1:6881".parse().unwrap()]);
+        assert_eq!(parsed.peers, vec!["8.8.8.8:6881".parse().unwrap()]);
+    }
+
+    #[test]
+    fn magnet_parser_rejects_explicit_peers_outside_public_scope() {
+        let link = "\
+magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
+&x.pe=127.0.0.1:6881\
+&x.pe=10.0.0.1:6881\
+&x.pe=169.254.1.1:6881\
+&x.pe=192.0.0.1:6881\
+&x.pe=[::ffff:192.168.1.1]:6881\
+&x.pe=[fc00::1]:6881\
+&x.pe=[fe80::1]:6881\
+&x.pe=8.8.8.8:0\
+&x.pe=[::ffff:8.8.8.8]:6881";
+
+        let parsed = parse_magnet(link).unwrap();
+        assert_eq!(parsed.peers, vec!["8.8.8.8:6881".parse().unwrap()]);
     }
 
     #[test]
@@ -9532,6 +13849,60 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
             Err(err) => err,
         };
         assert!(err.contains("missing info hash"));
+    }
+
+    #[test]
+    fn magnet_parser_preserves_v2_hash_and_rejects_conflicts() {
+        let digest = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let parsed = parse_magnet(&format!("magnet:?xt=urn:btmh:1220{digest}")).unwrap();
+        let expected = decode_hex_32(digest).unwrap();
+        assert_eq!(parsed.info_hash_v1, None);
+        assert_eq!(parsed.info_hash_v2, Some(expected));
+        assert_eq!(parsed.info_hash, expected[..20]);
+
+        let conflicting = format!(
+            "magnet:?xt=urn:btih:{}&xt=urn:btih:{}",
+            "00".repeat(20),
+            "11".repeat(20)
+        );
+        assert!(parse_magnet(&conflicting)
+            .unwrap_err()
+            .contains("conflicting v1"));
+    }
+
+    #[test]
+    fn metadata_validation_checks_every_exact_topic() {
+        let info = b"d6:lengthi5e4:name4:test12:piece lengthi5e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let expected = ExpectedInfoHashes {
+            v1: Some(sha1::sha1(info)),
+            v2: Some(sha256::sha256(info)),
+        };
+        assert!(validate_info_hashes(info, expected).is_ok());
+
+        let mut wrong_v2 = expected;
+        wrong_v2.v2 = Some([7u8; 32]);
+        assert!(validate_info_hashes(info, wrong_v2)
+            .unwrap_err()
+            .contains("SHA-256"));
+
+        let torrent_data = wrap_torrent_with_info(info, &[], &[]);
+        assert!(validate_magnet_torrent(
+            &torrent_data,
+            ExpectedInfoHashes {
+                v1: Some(sha1::sha1(info)),
+                v2: None,
+            }
+        )
+        .is_ok());
+        assert!(validate_magnet_torrent(
+            &torrent_data,
+            ExpectedInfoHashes {
+                v1: Some([9u8; 20]),
+                v2: None,
+            }
+        )
+        .unwrap_err()
+        .contains("SHA-1"));
     }
 
     #[test]
@@ -9554,6 +13925,21 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
 
         assert!(parse_metadata_message(b"d5:piecei0ee").is_err());
         assert!(parse_metadata_message(b"d8:msg_typei1ee").is_err());
+        assert!(parse_metadata_message(b"d8:msg_typei1e5:piecei0eehello").is_err());
+        let oversized = format!(
+            "d8:msg_typei1e5:piecei0e10:total_sizei{}ee",
+            MAX_TORRENT_BYTES + 1
+        );
+        assert!(parse_metadata_message(oversized.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn metadata_size_and_piece_bounds_are_enforced() {
+        let oversized = format!("d13:metadata_sizei{}ee", MAX_TORRENT_BYTES + 1);
+        assert!(parse_extended_handshake(oversized.as_bytes()).is_err());
+        assert_eq!(expected_metadata_piece_len(16_385, 0), Some(16_384));
+        assert_eq!(expected_metadata_piece_len(16_385, 1), Some(1));
+        assert_eq!(expected_metadata_piece_len(16_385, 2), None);
     }
 
     #[test]
@@ -9572,6 +13958,91 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
         assert_eq!(meta.url_list, vec![b"http://seed.example/file".to_vec()]);
         assert_eq!(meta.info.total_length(), 5);
     }
+
+    #[cfg(feature = "webseed")]
+    #[test]
+    fn webseed_urls_follow_bep17_and_bep19_semantics() {
+        assert_eq!(
+            build_webseed_url("https://seed.example/files/", b"na me.bin", false),
+            "https://seed.example/files/na%20me.bin"
+        );
+        assert_eq!(
+            build_webseed_url("https://seed.example/exact.bin", b"ignored.bin", false),
+            "https://seed.example/exact.bin"
+        );
+        assert_eq!(
+            build_webseed_url("https://seed.example/root", b"bundle/a.bin", true),
+            "https://seed.example/root/bundle/a.bin"
+        );
+
+        let info_hash = [0xabu8; 20];
+        let hoffman = build_httpseed_url("https://seed.example/script?token=x", info_hash, 7);
+        assert!(hoffman.starts_with("https://seed.example/script?token=x&info_hash="));
+        assert!(hoffman.ends_with("&piece=7"));
+        assert_eq!(hoffman.matches("%AB").count(), 20);
+
+        let info = b"d6:lengthi5e4:name4:test12:piece lengthi5e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let mut meta = torrent::parse_torrent(&wrap_torrent_with_info(info, &[], &[])).unwrap();
+        meta.url_list = vec![b"https://seed.example/data/".to_vec()];
+        meta.httpseeds = vec![b"https://seed.example/script".to_vec()];
+        assert_eq!(
+            collect_web_seeds(&meta),
+            vec![
+                WebSeed::GetRight("https://seed.example/data/".to_string()),
+                WebSeed::Hoffman("https://seed.example/script".to_string()),
+            ]
+        );
+
+        meta.info.length = None;
+        meta.info.files = vec![torrent::FileInfo {
+            length: 5,
+            path: vec![b".pad".to_vec(), b"5".to_vec()],
+            attr: b"p".to_vec(),
+        }];
+        let spans = build_file_spans(&meta).unwrap();
+        assert!(spans[0].is_padding);
+    }
+
+    #[cfg(feature = "webseed")]
+    #[test]
+    fn webseed_payload_memory_is_bounded_and_denial_releases_piece() {
+        let max_charge = webseed_memory_budget_bytes(torrent::MAX_PIECE_LENGTH as u32).unwrap();
+        assert!(max_charge <= MAX_TORRENT_PIECE_BUFFER_BYTES);
+
+        let global = Arc::new(piece::PieceBufferBudget::new(max_charge));
+        let torrent_budget = Arc::new(piece::PieceBufferBudget::new(max_charge));
+        let budgets =
+            piece::PieceBufferBudgets::new(Arc::clone(&global), Arc::clone(&torrent_budget));
+        let reservation = budgets.try_reserve(max_charge).unwrap();
+        assert_eq!(global.used(), max_charge);
+        assert_eq!(torrent_budget.used(), max_charge);
+        assert!(budgets.try_reserve(1).is_none());
+        drop(reservation);
+        assert_eq!(global.used(), 0);
+        assert_eq!(torrent_budget.used(), 0);
+
+        let info = b"d6:lengthi5e4:name4:test12:piece lengthi5e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let meta = torrent::parse_torrent(&wrap_torrent_with_info(info, &[], &[])).unwrap();
+        let pieces = Mutex::new(piece::PieceManager::new(&meta).unwrap());
+        let selected = lock_or_recover(&pieces)
+            .reserve_piece_for_peer(WEBSEED_RESERVATION_ID, &[0x80], false)
+            .unwrap();
+        let denied = piece::PieceBufferBudgets::new(
+            Arc::new(piece::PieceBufferBudget::new(0)),
+            Arc::new(piece::PieceBufferBudget::new(0)),
+        );
+        assert!(try_reserve_webseed_memory(
+            &pieces,
+            selected,
+            meta.info.piece_length as u32,
+            &denied,
+        )
+        .is_none());
+        assert_eq!(
+            lock_or_recover(&pieces).reserve_piece_for_peer(2, &[0x80], false),
+            Some(selected)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9588,6 +14059,10 @@ mod core_helpers_tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("rustorrent-main-test-{label}-{nanos}"))
+    }
+
+    fn empty_in_flight() -> InFlightTorrents {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     fn tracker_meta(private: bool) -> torrent::TorrentMeta {
@@ -9620,22 +14095,371 @@ mod core_helpers_tests {
         wrap_torrent_with_info(info, &[], &[])
     }
 
+    fn single_torrent_bytes(name: &[u8], piece_byte: u8) -> Vec<u8> {
+        bencode::encode(&Value::Dict(vec![(
+            b"info".to_vec(),
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(1)),
+                (b"name".to_vec(), Value::Bytes(name.to_vec())),
+                (b"piece length".to_vec(), Value::Int(16)),
+                (b"pieces".to_vec(), Value::Bytes(vec![piece_byte; 20])),
+            ]),
+        )]))
+    }
+
+    fn multifile_torrent_bytes(name: &[u8], piece_byte: u8) -> Vec<u8> {
+        bencode::encode(&Value::Dict(vec![(
+            b"info".to_vec(),
+            Value::Dict(vec![
+                (
+                    b"files".to_vec(),
+                    Value::List(vec![Value::Dict(vec![
+                        (b"length".to_vec(), Value::Int(1)),
+                        (
+                            b"path".to_vec(),
+                            Value::List(vec![Value::Bytes(b"file.bin".to_vec())]),
+                        ),
+                    ])]),
+                ),
+                (b"name".to_vec(), Value::Bytes(name.to_vec())),
+                (b"piece length".to_vec(), Value::Int(16)),
+                (b"pieces".to_vec(), Value::Bytes(vec![piece_byte; 20])),
+            ]),
+        )]))
+    }
+
+    fn claim_test_torrent(
+        store: &SessionStore,
+        torrent_bytes: Vec<u8>,
+        download_dir: &Path,
+    ) -> Result<[u8; 20], String> {
+        let meta = torrent::parse_torrent(&torrent_bytes).map_err(|err| err.to_string())?;
+        let _operation = store.lock_operation();
+        store.upsert_with_storage_claim(
+            meta.info_hash,
+            String::from_utf8_lossy(&meta.info.name).into_owned(),
+            torrent_bytes,
+            download_dir,
+            false,
+            &[],
+        )?;
+        Ok(meta.info_hash)
+    }
+
+    fn v2_test_meta(data: &[u8], piece_length: u32) -> torrent::TorrentMeta {
+        let block_count = data.len().div_ceil(piece::BLOCK_LEN as usize);
+        let file_tree_length = block_count.next_power_of_two() * piece::BLOCK_LEN as usize;
+        let piece_hashes = data
+            .chunks(piece_length as usize)
+            .map(|chunk| {
+                let tree_length = if data.len() <= piece_length as usize {
+                    file_tree_length as u32
+                } else {
+                    piece_length
+                };
+                sha256::merkle_piece_root(chunk, tree_length).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pieces_root = if data.len() <= piece_length as usize {
+            piece_hashes[0]
+        } else {
+            sha256::merkle_root_from_piece_layer(&piece_hashes, piece_length).unwrap()
+        };
+        torrent::TorrentMeta {
+            announce: None,
+            announce_list: Vec::new(),
+            url_list: Vec::new(),
+            httpseeds: Vec::new(),
+            info_hash: [1u8; 20],
+            info_hash_v2: Some([1u8; 32]),
+            piece_layers: if data.len() > piece_length as usize {
+                vec![(pieces_root.to_vec(), piece_hashes)]
+            } else {
+                Vec::new()
+            },
+            meta_version: 2,
+            info: torrent::InfoDict {
+                name: b"bundle".to_vec(),
+                piece_length: piece_length as u64,
+                pieces: Vec::new(),
+                length: None,
+                files: Vec::new(),
+                private: false,
+                file_tree: vec![torrent::FileTreeEntry {
+                    path: vec![b"file.bin".to_vec()],
+                    length: data.len() as u64,
+                    pieces_root: Some(pieces_root),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn v2_leaf_hashes_are_served_from_verified_small_file_data() {
+        let data = vec![b'x'; piece::BLOCK_LEN as usize + 17];
+        let meta = v2_test_meta(&data, 32 * 1024);
+        let request = peer::HashRequest {
+            pieces_root: meta.info.file_tree[0].pieces_root.unwrap(),
+            base_layer: 0,
+            index: 0,
+            length: 2,
+            proof_layers: 1,
+        };
+        let root = temp_path("v2-hashes");
+        fs::create_dir_all(&root).unwrap();
+        let mut storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        storage.write_at(0, &data).unwrap();
+        let mut pieces = piece::PieceManager::new(&meta).unwrap();
+        pieces.mark_piece_complete(0).unwrap();
+        let store = V2HashStore::new(&meta).unwrap();
+
+        let hashes = store
+            .leaf_hashes_for(request, &pieces, &mut storage)
+            .unwrap();
+        assert_eq!(
+            hashes,
+            vec![
+                sha256::sha256(&data[..piece::BLOCK_LEN as usize]),
+                sha256::sha256(&data[piece::BLOCK_LEN as usize..]),
+            ]
+        );
+
+        pieces.reset_piece(0).unwrap();
+        assert!(store
+            .leaf_hashes_for(request, &pieces, &mut storage)
+            .is_none());
+        drop(storage);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v2_hash_budget_defers_and_charges_mandatory_requests() {
+        let now = Instant::now();
+        let next_window = now.checked_add(HASH_REQUEST_WINDOW).unwrap();
+        let mut count_budget = HashRequestBudget::new_at(now);
+        for _ in 0..MAX_HASH_REQUESTS_PER_WINDOW {
+            assert_eq!(
+                count_budget.reserve_at(0, false, now),
+                HashBudgetDecision::ServeAfter(Duration::ZERO)
+            );
+        }
+        assert_eq!(
+            count_budget.reserve_at(0, false, now),
+            HashBudgetDecision::Reject
+        );
+        assert_eq!(
+            count_budget.reserve_at(MAX_HASH_DISK_BYTES_PER_WINDOW, true, now),
+            HashBudgetDecision::ServeAfter(HASH_REQUEST_WINDOW)
+        );
+        assert_eq!(count_budget.window_started, next_window);
+        assert_eq!(count_budget.requests, 1);
+        assert_eq!(count_budget.disk_bytes, MAX_HASH_DISK_BYTES_PER_WINDOW);
+
+        let mut byte_budget = HashRequestBudget::new_at(now);
+        assert_eq!(
+            byte_budget.reserve_at(MAX_HASH_DISK_BYTES_PER_WINDOW, false, now),
+            HashBudgetDecision::ServeAfter(Duration::ZERO)
+        );
+        assert_eq!(
+            byte_budget.reserve_at(1, false, now),
+            HashBudgetDecision::Reject
+        );
+        assert_eq!(
+            byte_budget.reserve_at(1, true, now),
+            HashBudgetDecision::ServeAfter(HASH_REQUEST_WINDOW)
+        );
+        assert_eq!(byte_budget.window_started, next_window);
+        assert_eq!(byte_budget.requests, 1);
+        assert_eq!(byte_budget.disk_bytes, 1);
+    }
+
+    #[test]
+    fn v2_hash_response_payload_charge_includes_header_and_hashes() {
+        let request = peer::HashRequest {
+            pieces_root: [7; 32],
+            base_layer: 0,
+            index: 3,
+            length: 2,
+            proof_layers: 1,
+        };
+        assert_eq!(
+            hash_response_payload_bytes(&peer::Message::HashReject(request)),
+            HASH_MESSAGE_FIXED_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            hash_response_payload_bytes(&peer::Message::Hashes {
+                request,
+                hashes: vec![[1; 32], [2; 32]],
+            }),
+            HASH_MESSAGE_FIXED_PAYLOAD_BYTES + 64
+        );
+    }
+
+    #[test]
+    fn padding_spans_never_keep_a_piece_wanted() {
+        let spans = vec![
+            FileSpan {
+                path: "bundle/a".to_string(),
+                web_path: b"bundle/a".to_vec(),
+                is_padding: false,
+                offset: 0,
+                length: 3,
+            },
+            FileSpan {
+                path: "bundle/.pad/13".to_string(),
+                web_path: b"bundle/.pad/13".to_vec(),
+                is_padding: true,
+                offset: 3,
+                length: 13,
+            },
+            FileSpan {
+                path: "bundle/b".to_string(),
+                web_path: b"bundle/b".to_vec(),
+                is_padding: false,
+                offset: 16,
+                length: 5,
+            },
+        ];
+        assert_eq!(
+            compute_piece_priorities(
+                &spans,
+                &[
+                    piece::PRIORITY_SKIP,
+                    piece::PRIORITY_HIGH,
+                    piece::PRIORITY_NORMAL,
+                ],
+                16,
+                2,
+            ),
+            vec![piece::PRIORITY_SKIP, piece::PRIORITY_NORMAL]
+        );
+    }
+
+    #[cfg(feature = "webseed")]
+    #[test]
+    fn getright_layout_does_not_infer_multi_file_from_span_count() {
+        let mut one_entry_multi = tracker_meta(false);
+        one_entry_multi.info.length = None;
+        one_entry_multi.info.files = vec![torrent::FileInfo {
+            length: 16,
+            path: vec![b"only.bin".to_vec()],
+            attr: Vec::new(),
+        }];
+        assert!(is_getright_multi_file(&one_entry_multi));
+        let spans = build_file_spans(&one_entry_multi).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            build_webseed_url(
+                "https://seed.example/root",
+                &spans[0].web_path,
+                is_getright_multi_file(&one_entry_multi),
+            ),
+            "https://seed.example/root/t/only.bin"
+        );
+
+        let v2_single = v2_test_meta(b"small", 16 * 1024);
+        assert!(!is_getright_multi_file(&v2_single));
+        assert_eq!(
+            build_file_spans(&v2_single).unwrap()[0].web_path,
+            b"file.bin"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_serializes_concurrent_reservations() {
+        let limiter = RateLimiter::new(100);
+        let now = Instant::now();
+
+        assert_eq!(limiter.reserve_delay(100, 100, now), Duration::ZERO);
+        assert_eq!(limiter.reserve_delay(100, 100, now), Duration::from_secs(1));
+        assert_eq!(limiter.reserve_delay(100, 100, now), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn session_lock_rejects_a_second_owner() {
+        let root = temp_path("session-lock");
+        fs::create_dir_all(&root).unwrap();
+
+        let first = acquire_session_lock(&root).unwrap();
+        let second = acquire_session_lock(&root);
+        assert!(second.is_err());
+
+        drop(first);
+        assert!(acquire_session_lock(&root).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_state_directory_lock_survives_legacy_lock_replacement() {
+        let root = temp_path("session-lock-replaced");
+        fs::create_dir_all(&root).unwrap();
+
+        let first = acquire_session_lock(&root).unwrap();
+        fs::remove_file(root.join(".rustorrent.lock")).unwrap();
+        assert!(acquire_session_lock(&root).is_err());
+
+        drop(first);
+        assert!(acquire_session_lock(&root).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pid_file_guard_only_removes_its_own_pid() {
+        let root = temp_path("pid-guard");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rustorrent.pid");
+        let pid = std::process::id();
+        fs::write(&path, format!("{pid}\n")).unwrap();
+        drop(PidFileGuard {
+            path: path.clone(),
+            pid,
+        });
+        assert!(!path.exists());
+
+        fs::write(&path, format!("{}\n", pid.wrapping_add(1))).unwrap();
+        drop(PidFileGuard {
+            path: path.clone(),
+            pid,
+        });
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_lock_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("session-lock-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.txt");
+        fs::write(&target, b"do-not-touch").unwrap();
+        symlink(&target, root.join(".rustorrent.lock")).unwrap();
+
+        assert!(acquire_session_lock(&root).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"do-not-touch");
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn make_test_context(id: u64, root: &Path) -> Arc<TorrentContext> {
         let torrent_bytes = test_torrent_bytes();
         let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
-        let file_spans = Arc::new(build_file_spans(&meta));
+        let file_spans = Arc::new(build_file_spans(&meta).unwrap());
         let file_priorities = Arc::new(Mutex::new(vec![piece::PRIORITY_NORMAL; file_spans.len()]));
         Arc::new(TorrentContext {
             id,
             info_hash: meta.info_hash,
+            hybrid_v2_info_hash: None,
             peer_id: [9u8; 20],
-            download_dir: root.to_path_buf(),
             pieces: Arc::new(Mutex::new(piece::PieceManager::new(&meta).unwrap())),
             storage: Arc::new(Mutex::new(
                 storage::Storage::new(&meta, root, storage::StorageOptions::default()).unwrap(),
             )),
             completed_log: Arc::new(Mutex::new(Vec::new())),
             base_piece_length: meta.info.piece_length,
+            v2_hashes: Arc::new(V2HashStore::new(&meta).unwrap()),
             file_spans,
             file_priorities,
             limits: TransferLimits {
@@ -9651,14 +14475,646 @@ mod core_helpers_tests {
             upload_requests_served: Arc::new(AtomicU64::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             stop_requested: Arc::new(AtomicBool::new(false)),
+            allow_completion_reentry: Arc::new(AtomicBool::new(true)),
+            rechecking: Arc::new(AtomicBool::new(false)),
+            resume_save_requested: Arc::new(AtomicBool::new(false)),
+            delete_data_requested: Arc::new(AtomicBool::new(false)),
+            archive_requested: Arc::new(AtomicBool::new(false)),
+            teardown_failed: Arc::new(AtomicBool::new(false)),
             upload_manager: Arc::new(UploadManager::new(UPLOAD_SLOTS)),
             peer_tags: Arc::new(AtomicU64::new(1)),
+            peer_cancellations: Arc::new(Mutex::new(HashMap::new())),
             label: Arc::new(Mutex::new(String::new())),
             trackers: Arc::new(Mutex::new(collect_trackers(&meta))),
             throttle_group: Arc::new(Mutex::new(None)),
             ratio_group: Arc::new(Mutex::new(None)),
             file_renames: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    #[test]
+    fn in_flight_reservation_closes_the_queue_to_registry_duplicate_window() {
+        let root = temp_path("in-flight-dedup");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let session_store = SessionStore::load(&root).unwrap();
+        let in_flight: InFlightTorrents = Arc::new(Mutex::new(HashMap::new()));
+        let reservation = InFlightTorrentGuard::acquire(&in_flight, info_hash, 1).unwrap();
+        let mut queue = VecDeque::new();
+        let duplicate = TorrentRequest {
+            id: 2,
+            source: TorrentSource::Bytes(torrent_bytes.clone()),
+            download_dir: root.join("different-destination"),
+            preallocate: false,
+            initial_label: String::new(),
+        };
+
+        assert!(is_duplicate_torrent(
+            &registry,
+            &queue,
+            &session_store,
+            &in_flight,
+            info_hash,
+        ));
+        assert!(!enqueue_request_if_new(
+            &registry,
+            &mut queue,
+            &session_store,
+            &in_flight,
+            &None,
+            duplicate.clone(),
+            None,
+        ));
+        assert!(queue.is_empty());
+
+        drop(reservation);
+        assert!(enqueue_request_if_new(
+            &registry,
+            &mut queue,
+            &session_store,
+            &in_flight,
+            &None,
+            duplicate,
+            None,
+        ));
+        assert_eq!(queue.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_request_is_frozen_when_it_enters_the_queue() {
+        let root = temp_path("freeze-request-source");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_path = root.join("queued.torrent");
+        let torrent_bytes = test_torrent_bytes();
+        fs::write(&torrent_path, &torrent_bytes).unwrap();
+        let expected = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let request = TorrentRequest {
+            id: 1,
+            source: TorrentSource::Path(torrent_path.display().to_string()),
+            download_dir: root.clone(),
+            preallocate: false,
+            initial_label: String::new(),
+        };
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let session_store = SessionStore::load(&root).unwrap();
+        let in_flight = empty_in_flight();
+        let mut queue = VecDeque::new();
+
+        assert!(enqueue_request_if_new(
+            &registry,
+            &mut queue,
+            &session_store,
+            &in_flight,
+            &None,
+            request,
+            None,
+        ));
+        fs::write(&torrent_path, b"malformed replacement").unwrap();
+        assert_eq!(info_hash_for_source(&queue[0].source).unwrap(), expected);
+        assert!(matches!(queue[0].source, TorrentSource::Bytes(_)));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loading_torrent_cannot_enter_offline_stop_delete_or_archive_paths() {
+        let root = temp_path("loading-lifecycle-guard");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
+        session_store
+            .upsert(
+                meta.info_hash,
+                "loading".to_string(),
+                torrent_bytes,
+                &root,
+                false,
+            )
+            .unwrap();
+        let in_flight: InFlightTorrents =
+            Arc::new(Mutex::new(HashMap::from([(meta.info_hash, 9)])));
+        let mut queue = VecDeque::new();
+
+        assert!(
+            stop_torrent(&registry, &None, &mut queue, 9, &session_store, &in_flight,).is_err()
+        );
+        assert!(delete_torrent(
+            &registry,
+            &None,
+            &mut queue,
+            9,
+            true,
+            &session_store,
+            &in_flight,
+        )
+        .is_err());
+        assert!(
+            archive_torrent(&registry, &None, &mut queue, 9, &session_store, &in_flight,).is_err()
+        );
+        assert!(session_store.contains(meta.info_hash));
+        assert!(!session_store.get(meta.info_hash).unwrap().pending_delete);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_collision_preserves_the_original_worker_context() {
+        let root = temp_path("registry-collision");
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let first = make_test_context(1, &first_root);
+        let second = make_test_context(2, &second_root);
+        assert_eq!(first.info_hash, second.info_hash);
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        register_session(&registry, Arc::clone(&first)).unwrap();
+        assert!(register_session(&registry, Arc::clone(&second)).is_err());
+        let registered = find_context(&registry, first.info_hash).unwrap();
+        assert_eq!(registered.id, first.id);
+        assert!(Arc::ptr_eq(&registered, &first));
+
+        drop(registered);
+        drop(registry);
+        drop(first);
+        drop(second);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn torrent_resource_drain_is_bounded_and_fail_closed() {
+        let root = temp_path("resource-drain-deadline");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(39, &root);
+        let storage = Arc::clone(&context.storage);
+        let retained_storage = Arc::clone(&storage);
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+
+        let started = Instant::now();
+        let err = wait_for_torrent_resources_or_retain(
+            &registry,
+            &context,
+            &storage,
+            "test teardown",
+            Instant::now() + Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(context.teardown_failed.load(Ordering::Acquire));
+        assert!(find_context_by_id(&registry, context.id)
+            .is_some_and(|retained| Arc::ptr_eq(&retained, &context)));
+
+        unregister_session(&registry, context.info_hash, context.id);
+        drop(retained_storage);
+        wait_for_torrent_resources(
+            &context,
+            &storage,
+            "test teardown",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        drop(storage);
+        drop(context);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hybrid_handshake_upgrade_uses_and_accepts_the_exact_v2_swarm_id() {
+        let root = temp_path("hybrid-handshake-upgrade");
+        fs::create_dir_all(&root).unwrap();
+        let mut context = make_test_context(40, &root);
+        let v1 = context.info_hash;
+        let v2 = [0xabu8; 20];
+        Arc::get_mut(&mut context).unwrap().hybrid_v2_info_hash = Some(v2);
+
+        let upgraded_request = peer::parse_handshake(&peer::build_handshake_with_hybrid_upgrade(
+            v1, [7u8; 20], true, true,
+        ))
+        .unwrap();
+        assert_eq!(
+            inbound_handshake_response_hash(&context, &upgraded_request),
+            v2
+        );
+        validate_outbound_handshake_hash(
+            &peer::parse_handshake(&peer::build_handshake(v2, [8u8; 20], true)).unwrap(),
+            v1,
+            Some(v2),
+        )
+        .unwrap();
+
+        let legacy_request =
+            peer::parse_handshake(&peer::build_handshake(v1, [7u8; 20], true)).unwrap();
+        assert_eq!(
+            inbound_handshake_response_hash(&context, &legacy_request),
+            v1
+        );
+
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        register_session(&registry, Arc::clone(&context)).unwrap();
+        assert_eq!(find_context(&registry, v2).unwrap().id, context.id);
+        let mut expected_hashes = vec![v1, v2];
+        expected_hashes.sort_unstable();
+        assert_eq!(list_info_hashes(&registry).unwrap(), expected_hashes);
+
+        let wrong =
+            peer::parse_handshake(&peer::build_handshake([3u8; 20], [8u8; 20], true)).unwrap();
+        assert!(validate_outbound_handshake_hash(&wrong, v1, Some(v2)).is_err());
+
+        drop(registry);
+        drop(context);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recheck_rejects_a_concurrent_second_run() {
+        SHUTDOWN.store(false, Ordering::SeqCst);
+        let root = temp_path("recheck-serialized");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(41, &root);
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        register_session(&registry, Arc::clone(&context)).unwrap();
+
+        let storage_guard = context.storage.lock().unwrap();
+        recheck_torrent(&registry, &None, context.id).unwrap();
+        assert!(recheck_torrent(&registry, &None, context.id).is_err());
+        drop(storage_guard);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while context.rechecking.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!context.rechecking.load(Ordering::Acquire));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_data_delete_is_deferred_until_workers_stop() {
+        let root = temp_path("delete-active-deferred");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(42, &root);
+        let data_path = lock_or_recover(&context.storage)
+            .file_path(0)
+            .unwrap()
+            .to_path_buf();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        register_session(&registry, Arc::clone(&context)).unwrap();
+        let session_store = Arc::new(SessionStore {
+            path: root.join("session.benc"),
+            entries: Mutex::new(HashMap::new()),
+            operations: Mutex::new(()),
+        });
+        session_store
+            .upsert(
+                context.info_hash,
+                "test".to_string(),
+                test_torrent_bytes(),
+                &root,
+                false,
+            )
+            .unwrap();
+        let mut queue = VecDeque::new();
+
+        delete_torrent(
+            &registry,
+            &None,
+            &mut queue,
+            context.id,
+            true,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .unwrap();
+
+        assert!(context.stop_requested.load(Ordering::SeqCst));
+        assert!(context.delete_data_requested.load(Ordering::Acquire));
+        assert!(data_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_archive_retains_claim_registry_and_ui_until_storage_closes() {
+        let root = temp_path("archive-active-deferred");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(43, &root);
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        register_session(&registry, Arc::clone(&context)).unwrap();
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
+        session_store
+            .upsert(
+                context.info_hash,
+                "test".to_string(),
+                test_torrent_bytes(),
+                &root,
+                false,
+            )
+            .unwrap();
+        let ui = Some(Arc::new(Mutex::new(ui::UiState {
+            torrents: vec![ui::UiTorrent {
+                id: context.id,
+                info_hash: hex(&context.info_hash),
+                ..ui::UiTorrent::default()
+            }],
+            ..ui::UiState::default()
+        })));
+        let mut queue = VecDeque::new();
+
+        archive_torrent(
+            &registry,
+            &ui,
+            &mut queue,
+            context.id,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .unwrap();
+
+        assert!(context.stop_requested.load(Ordering::SeqCst));
+        assert!(context.archive_requested.load(Ordering::Acquire));
+        assert!(session_store.contains(context.info_hash));
+        assert!(find_context_by_id(&registry, context.id).is_some());
+        assert_eq!(lock_or_recover(ui.as_ref().unwrap()).torrents.len(), 1);
+
+        unregister_session(&registry, context.info_hash, context.id);
+        drop(context);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_uses_exact_renamed_storage_paths() {
+        let root = temp_path("resume-renamed-path");
+        fs::create_dir_all(&root).unwrap();
+        let payload = [0u8; 16];
+        let torrent_bytes = bencode::encode(&Value::Dict(vec![(
+            b"info".to_vec(),
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(payload.len() as i64)),
+                (b"name".to_vec(), Value::Bytes(b"test".to_vec())),
+                (b"piece length".to_vec(), Value::Int(16)),
+                (
+                    b"pieces".to_vec(),
+                    Value::Bytes(sha1::sha1(&payload).to_vec()),
+                ),
+            ]),
+        )]));
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let spans = build_file_spans(&meta).unwrap();
+        let mut storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        storage.write_at(0, &payload).unwrap();
+        storage.flush().unwrap();
+        let old_path = storage.file_path(0).unwrap().to_path_buf();
+        let renamed_path = old_path.with_file_name("renamed.bin");
+        storage.rename_file(0, &old_path, &renamed_path).unwrap();
+        let files = collect_storage_file_stats(&storage, &spans);
+        assert_eq!(files[0].length, 16);
+        assert!(files[0].mtime > 1_000_000_000_000);
+
+        let resume = ResumeData {
+            info_hash: meta.info_hash,
+            piece_length: meta.info.piece_length,
+            bitfield: vec![0x80],
+            file_priorities: vec![piece::PRIORITY_NORMAL],
+            files,
+            downloaded: 16,
+            uploaded: 0,
+            peers: Vec::new(),
+            file_renames: vec![(0, "renamed.bin".to_string())],
+        };
+        let mut pieces = piece::PieceManager::new(&meta).unwrap();
+        let stats = resume_from_storage(
+            &mut pieces,
+            &mut storage,
+            meta.info.piece_length,
+            &spans,
+            Some(&resume),
+        )
+        .unwrap();
+        assert_eq!(stats.completed_bytes, 16);
+        assert!(pieces.is_complete());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_rehashes_claimed_pieces_even_when_file_stats_match() {
+        let root = temp_path("resume-rehashes-claimed");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let spans = build_file_spans(&meta).unwrap();
+        let mut storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        storage.write_at(0, &[1u8; 16]).unwrap();
+        storage.flush().unwrap();
+        let resume = ResumeData {
+            info_hash: meta.info_hash,
+            piece_length: meta.info.piece_length,
+            bitfield: vec![0x80],
+            file_priorities: vec![piece::PRIORITY_NORMAL],
+            files: collect_storage_file_stats(&storage, &spans),
+            downloaded: 16,
+            uploaded: 0,
+            peers: Vec::new(),
+            file_renames: Vec::new(),
+        };
+        let mut pieces = piece::PieceManager::new(&meta).unwrap();
+
+        let stats = resume_from_storage(
+            &mut pieces,
+            &mut storage,
+            meta.info.piece_length,
+            &spans,
+            Some(&resume),
+        )
+        .unwrap();
+
+        assert_eq!(stats.completed_bytes, 0);
+        assert!(!pieces.is_complete());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inactive_delete_paths_apply_persisted_file_renames() {
+        let root = temp_path("delete-saved-rename");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let spans = build_file_spans(&meta).unwrap();
+        let mut storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        storage.write_at(0, &[0u8; 16]).unwrap();
+        storage.flush().unwrap();
+        let old_path = storage.file_path(0).unwrap().to_path_buf();
+        let renamed_path = old_path.with_file_name("saved-name.bin");
+        storage.rename_file(0, &old_path, &renamed_path).unwrap();
+        let files = collect_storage_file_stats(&storage, &spans);
+        drop(storage);
+        save_resume_data(
+            &resume_path(&root, meta.info_hash),
+            meta.info_hash,
+            meta.info.piece_length,
+            vec![0x80],
+            &[piece::PRIORITY_NORMAL],
+            files,
+            16,
+            0,
+            Vec::new(),
+            &[(0, "saved-name.bin".to_string())],
+        )
+        .unwrap();
+        let request = TorrentRequest {
+            id: 43,
+            source: TorrentSource::Bytes(torrent_bytes),
+            download_dir: root.clone(),
+            preallocate: false,
+            initial_label: String::new(),
+        };
+        let (_, _, paths) =
+            delete_info_from_request(&request, &[(0, "saved-name.bin".to_string())]).unwrap();
+        assert_eq!(paths, vec![renamed_path]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queued_delete_imports_legacy_resume_renames_before_tombstone() {
+        let root = temp_path("queued-delete-legacy-rename");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let spans = build_file_spans(&meta).unwrap();
+        let mut storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        storage.write_at(0, &[0u8; 16]).unwrap();
+        let old_path = storage.file_path(0).unwrap().to_path_buf();
+        let renamed_path = old_path.with_file_name("queued-renamed.bin");
+        storage.rename_file(0, &old_path, &renamed_path).unwrap();
+        let files = collect_storage_file_stats(&storage, &spans);
+        drop(storage);
+        save_resume_data(
+            &resume_path(&root, meta.info_hash),
+            meta.info_hash,
+            meta.info.piece_length,
+            vec![0x80],
+            &[piece::PRIORITY_NORMAL],
+            files,
+            16,
+            0,
+            Vec::new(),
+            &[(0, "queued-renamed.bin".to_string())],
+        )
+        .unwrap();
+        let mut queue = VecDeque::from([TorrentRequest {
+            id: 44,
+            source: TorrentSource::Bytes(torrent_bytes),
+            download_dir: root.clone(),
+            preallocate: false,
+            initial_label: String::new(),
+        }]);
+        let ui_state = Some(Arc::new(Mutex::new(ui::UiState {
+            torrents: vec![ui::UiTorrent {
+                id: 44,
+                info_hash: hex(&meta.info_hash),
+                ..ui::UiTorrent::default()
+            }],
+            ..ui::UiState::default()
+        })));
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let store = Arc::new(SessionStore::load(&root).unwrap());
+
+        delete_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            44,
+            true,
+            &store,
+            &empty_in_flight(),
+        )
+        .unwrap();
+
+        assert!(queue.is_empty());
+        assert!(!renamed_path.exists());
+        assert!(!store.contains(meta.info_hash));
+        assert!(lock_or_recover(ui_state.as_ref().unwrap())
+            .torrents
+            .is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inactive_delete_imports_legacy_resume_renames_before_tombstone() {
+        let root = temp_path("inactive-delete-legacy-rename");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let spans = build_file_spans(&meta).unwrap();
+        let mut storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        storage.write_at(0, &[0u8; 16]).unwrap();
+        let old_path = storage.file_path(0).unwrap().to_path_buf();
+        let renamed_path = old_path.with_file_name("inactive-renamed.bin");
+        storage.rename_file(0, &old_path, &renamed_path).unwrap();
+        let files = collect_storage_file_stats(&storage, &spans);
+        drop(storage);
+        save_resume_data(
+            &resume_path(&root, meta.info_hash),
+            meta.info_hash,
+            meta.info.piece_length,
+            vec![0x80],
+            &[piece::PRIORITY_NORMAL],
+            files,
+            16,
+            0,
+            Vec::new(),
+            &[(0, "inactive-renamed.bin".to_string())],
+        )
+        .unwrap();
+        let store = Arc::new(SessionStore::load(&root).unwrap());
+        store
+            .upsert(
+                meta.info_hash,
+                "test".to_string(),
+                torrent_bytes,
+                &root,
+                false,
+            )
+            .unwrap();
+        let ui_state = Some(Arc::new(Mutex::new(ui::UiState {
+            torrents: vec![ui::UiTorrent {
+                id: 45,
+                info_hash: hex(&meta.info_hash),
+                ..ui::UiTorrent::default()
+            }],
+            ..ui::UiState::default()
+        })));
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let mut queue = VecDeque::new();
+
+        delete_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            45,
+            true,
+            &store,
+            &empty_in_flight(),
+        )
+        .unwrap();
+
+        assert!(!renamed_path.exists());
+        assert!(!store.contains(meta.info_hash));
+        assert!(lock_or_recover(ui_state.as_ref().unwrap())
+            .torrents
+            .is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -9684,7 +15140,6 @@ mod core_helpers_tests {
             &mut out,
             &context.pieces,
             &context.storage,
-            context.base_piece_length,
             0,
             0,
             block.len() as u32,
@@ -9789,6 +15244,49 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn failed_piece_persistence_keeps_buffer_for_recovery() {
+        let mut active_pieces = HashMap::new();
+        let mut active = piece::PieceBuffer::new(0, 16).unwrap();
+        active.add_block(0, b"abcdefghijklmnop").unwrap();
+        active_pieces.insert(0, active);
+
+        let error = persist_active_piece(&mut active_pieces, 0, |_| {
+            Err("simulated storage failure".to_string())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "simulated storage failure");
+        assert!(active_pieces.contains_key(&0));
+    }
+
+    #[test]
+    fn saturated_piece_buffer_budget_releases_the_piece_reservation() {
+        let meta = torrent::parse_torrent(&test_torrent_bytes()).unwrap();
+        let pieces = Mutex::new(piece::PieceManager::new(&meta).unwrap());
+        let selected = lock_or_recover(&pieces)
+            .reserve_piece_for_peer(1, &[0x80], false)
+            .unwrap();
+        let budgets = piece::PieceBufferBudgets::new(
+            Arc::new(piece::PieceBufferBudget::new(0)),
+            Arc::new(piece::PieceBufferBudget::new(0)),
+        );
+
+        assert!(allocate_reserved_piece_buffer(
+            &pieces,
+            1,
+            selected,
+            meta.info.piece_length as u32,
+            &budgets,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            lock_or_recover(&pieces).reserve_piece_for_peer(2, &[0x80], false),
+            Some(selected)
+        );
+    }
+
+    #[test]
     fn parse_rate_and_encryption_mode_cover_common_variants() {
         assert_eq!(parse_rate("0").unwrap(), 0);
         assert_eq!(parse_rate("10k").unwrap(), 10 * 1024);
@@ -9797,6 +15295,7 @@ mod core_helpers_tests {
         assert_eq!(parse_rate(" unlimited ").unwrap(), 0);
         assert!(parse_rate("1x").is_err());
         assert!(parse_rate("").is_err());
+        assert!(parse_rate(&format!("{}g", u64::MAX)).is_err());
 
         assert_eq!(
             parse_encryption_mode("disable").unwrap(),
@@ -9811,6 +15310,112 @@ mod core_helpers_tests {
             EncryptionMode::Require
         );
         assert!(parse_encryption_mode("unknown").is_err());
+    }
+
+    #[test]
+    fn create_torrent_streams_files_across_piece_boundaries() {
+        let root = temp_path("create-streaming");
+        let source = root.join("source");
+        let output = root.join("created.torrent");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.bin"), b"abc").unwrap();
+        fs::write(source.join("b.bin"), b"def").unwrap();
+
+        create_torrent(&source, "https://tracker.example/announce", &output, 4).unwrap();
+
+        let meta = torrent::parse_torrent(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(meta.info.total_length(), 6);
+        assert_eq!(meta.info.files.len(), 2);
+        assert_eq!(
+            meta.info.pieces,
+            vec![sha1::sha1(b"abcd"), sha1::sha1(b"ef")]
+        );
+        assert!(create_torrent(&source, "https://tracker.example/announce", &output, 0,).is_err());
+        assert!(create_torrent(
+            &source,
+            "https://tracker.example/announce\r\nInjected: yes",
+            &output,
+            4,
+        )
+        .is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_torrent_refuses_output_inside_source_tree() {
+        let root = temp_path("create-output-inside-source");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload.bin"), b"payload").unwrap();
+        let output = source.join("nested").join("created.torrent");
+
+        let error =
+            create_torrent(&source, "https://tracker.example/announce", &output, 4).unwrap_err();
+
+        assert!(error.contains("outside the source directory"));
+        assert!(!output.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_completed_refuses_to_overwrite_existing_data() {
+        let root = temp_path("move-existing");
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        let source = source_dir.join("payload.bin");
+        let torrent_path = root.join("payload.torrent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&destination_dir).unwrap();
+        fs::write(&source, b"new-data").unwrap();
+        fs::write(destination_dir.join("payload.bin"), b"existing-data").unwrap();
+        create_torrent(
+            &source,
+            "https://tracker.example/announce",
+            &torrent_path,
+            4,
+        )
+        .unwrap();
+        let meta = torrent::parse_torrent(&fs::read(torrent_path).unwrap()).unwrap();
+
+        assert!(move_completed_files(&meta, &source_dir, &destination_dir, None).is_err());
+        assert_eq!(fs::read(source).unwrap(), b"new-data");
+        assert_eq!(
+            fs::read(destination_dir.join("payload.bin")).unwrap(),
+            b"existing-data"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_completed_preserves_a_single_file_rename() {
+        let root = temp_path("move-renamed-single");
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        let source = source_dir.join("payload.bin");
+        let renamed = source_dir.join("custom-name.bin");
+        let torrent_path = root.join("payload.torrent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(&source, b"payload").unwrap();
+        create_torrent(
+            &source,
+            "https://tracker.example/announce",
+            &torrent_path,
+            4,
+        )
+        .unwrap();
+        let meta = torrent::parse_torrent(&fs::read(torrent_path).unwrap()).unwrap();
+        fs::rename(&source, &renamed).unwrap();
+
+        let _ = move_completed_files(&meta, &source_dir, &destination_dir, Some(&renamed)).unwrap();
+        assert_eq!(
+            fs::read(destination_dir.join("custom-name.bin")).unwrap(),
+            b"payload"
+        );
+        assert!(!destination_dir.join("payload.bin").exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -9841,6 +15446,58 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn web_ui_bind_is_loopback_only() {
+        assert!(validate_ui_bind_addr("127.0.0.1:8080").is_ok());
+        assert!(validate_ui_bind_addr("[::1]:8080").is_ok());
+        assert!(validate_ui_bind_addr("0.0.0.0:8080").is_err());
+        assert!(validate_ui_bind_addr("192.168.1.10:8080").is_err());
+        assert!(validate_ui_bind_addr("localhost:8080").is_err());
+    }
+
+    #[test]
+    fn peer_listener_is_reachable_over_every_available_ip_family() {
+        fn assert_reachable(listeners: &[TcpListener], address: SocketAddr) {
+            let _client = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+                .unwrap_or_else(|err| panic!("connect to {address}: {err}"));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                for listener in listeners {
+                    match listener.accept() {
+                        Ok(_) => return,
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(err) => panic!("accept from {address}: {err}"),
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "listener did not accept {address}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let listeners = bind_tcp_listeners(0).unwrap();
+        for listener in &listeners {
+            listener.set_nonblocking(true).unwrap();
+        }
+        let port = listeners[0].local_addr().unwrap().port();
+        assert_reachable(
+            &listeners,
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        );
+
+        let ipv6_probe = TcpListener::bind(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)));
+        if ipv6_probe.is_ok() {
+            drop(ipv6_probe);
+            assert_reachable(
+                &listeners,
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            );
+        }
+    }
+
+    #[test]
     fn parse_bool_value_handles_truthy_and_falsy_inputs() {
         assert_eq!(parse_bool_value("true"), Some(true));
         assert_eq!(parse_bool_value("YES"), Some(true));
@@ -9867,9 +15524,187 @@ mod core_helpers_tests {
         assert!(public_trackers
             .udp
             .contains(&"udp://tracker.local:6969/announce".to_string()));
-        assert!(public_trackers
+        assert_eq!(public_trackers.http.len(), 1);
+        assert_eq!(public_trackers.udp.len(), 1);
+        assert!(tracker_set_has_usable_source(&public_trackers, false));
+
+        let udp_only = TrackerSet {
+            http: Vec::new(),
+            udp: vec!["udp://tracker.local:6969/announce".to_string()],
+        };
+        assert!(tracker_set_has_usable_source(&udp_only, true));
+        assert!(!tracker_set_has_usable_source(&udp_only, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_log_rejects_links_and_repairs_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = temp_path("private-log");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("rustorrent.log");
+        fs::write(&log, b"existing").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let file = open_private_log_file(&log).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        drop(file);
+
+        let symlink_path = root.join("symlink.log");
+        symlink(&log, &symlink_path).unwrap();
+        assert!(open_private_log_file(&symlink_path).is_err());
+
+        let hardlink_path = root.join("hardlink.log");
+        fs::hard_link(&log, &hardlink_path).unwrap();
+        assert!(open_private_log_file(&hardlink_path).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_directory_rejects_links_and_repairs_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = temp_path("private-state");
+        fs::create_dir_all(root.join(".rustorrent")).unwrap();
+        fs::set_permissions(root.join(".rustorrent"), fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_state_directory(&root).unwrap();
+        assert_eq!(
+            fs::metadata(root.join(".rustorrent"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let linked_root = temp_path("linked-state");
+        let outside = temp_path("linked-state-outside");
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, linked_root.join(".rustorrent")).unwrap();
+        assert!(ensure_private_state_directory(&linked_root).is_err());
+        assert!(write_atomic_file(
+            &linked_root.join(".rustorrent").join("session.benc"),
+            b"state",
+            "session",
+            false,
+            true,
+        )
+        .is_err());
+        assert!(!outside.join("session.benc").exists());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(linked_root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn bounded_file_reads_reject_oversized_and_non_regular_inputs() {
+        let root = temp_path("bounded-read");
+        fs::create_dir_all(&root).unwrap();
+        let oversized = root.join("oversized.state");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len((MAX_RESUME_STATE_BYTES + 1) as u64).unwrap();
+        drop(file);
+
+        let error = read_file_limited(&oversized, MAX_RESUME_STATE_BYTES, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(read_file_limited(&root, MAX_RESUME_STATE_BYTES, true).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_parser_enforces_entry_and_embedded_torrent_limits() {
+        let root = temp_path("session-limits");
+        let too_many = bencode::encode(&Value::List(vec![Value::Int(0); MAX_SESSION_ENTRIES + 1]));
+        assert!(parse_session_entries(&too_many, &root)
+            .err()
+            .expect("entry count must be rejected")
+            .contains("entries"));
+
+        let oversized_entry = bencode::encode(&Value::List(vec![Value::Dict(vec![
+            (b"info_hash".to_vec(), Value::Bytes(vec![1; 20])),
+            (
+                b"torrent".to_vec(),
+                Value::Bytes(vec![0; MAX_TORRENT_BYTES + 1]),
+            ),
+        ])]));
+        assert!(parse_session_entries(&oversized_entry, &root)
+            .err()
+            .expect("oversized torrent must be rejected")
+            .contains("metainfo size limit"));
+    }
+
+    #[test]
+    fn collect_trackers_caps_untrusted_metainfo_entries() {
+        let mut meta = tracker_meta(true);
+        meta.announce_list = (0..(MAX_TRACKERS_PER_TORRENT + 20))
+            .map(|idx| vec![format!("http://tracker{idx}.example/announce").into_bytes()])
+            .collect();
+        meta.announce =
+            Some(format!("http://example/{}", "x".repeat(MAX_TRACKER_URL_LEN + 1)).into_bytes());
+        let trackers = collect_trackers(&meta);
+        assert_eq!(
+            trackers.http.len() + trackers.udp.len(),
+            MAX_TRACKERS_PER_TORRENT
+        );
+        assert!(trackers
             .http
-            .contains(&"http://tracker.opentrackr.org:1337/announce".to_string()));
+            .iter()
+            .all(|url| url.len() <= MAX_TRACKER_URL_LEN));
+        assert!(!valid_tracker_url(
+            "http://tracker.example/announce\r\nX: y"
+        ));
+    }
+
+    #[test]
+    fn network_url_validation_and_labels_reject_log_injection_and_hide_secrets() {
+        let tracker = "https://tracker.example:8443/private-passkey/announce?token=secret";
+        assert_eq!(
+            safe_network_url_label(tracker),
+            "https://tracker.example:8443"
+        );
+        assert!(valid_tracker_url(tracker));
+        assert!(valid_magnet_http_url("https://mirror.example/meta.torrent"));
+        for hostile in [
+            "https://mirror.example/meta\nforged",
+            "https://mirror.example/\u{202e}spoof",
+            "https://mirror.example/\u{2066}spoof",
+        ] {
+            assert!(!valid_magnet_http_url(hostile));
+            assert!(!valid_tracker_url(hostile));
+        }
+        assert!(!safe_network_url_label("https://user@tracker.example/secret").contains("user"));
+    }
+
+    #[test]
+    fn proxy_mode_centrally_suppresses_udp_tracker_tasks() {
+        let trackers = TrackerSet {
+            http: Vec::new(),
+            udp: vec!["udp://tracker.example:6969/announce".to_string()],
+        };
+        let (_, pending) = spawn_tracker_announces(
+            &trackers,
+            [1u8; 20],
+            [2u8; 20],
+            6881,
+            0,
+            0,
+            1,
+            Some("started"),
+            50,
+            false,
+            Some(proxy::ProxyConfig::Socks5 {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            }),
+            Duration::from_secs(1),
+        );
+        assert_eq!(pending, 0);
     }
 
     #[test]
@@ -9904,19 +15739,40 @@ mod core_helpers_tests {
         let outside = parent.join("outside-keep.bin");
         fs::write(&outside, b"y").unwrap();
 
-        delete_torrent_data(
-            Some(&root),
+        assert!(delete_storage_paths(
+            &root,
             &[
-                "sub/file.bin".to_string(),
-                "../outside-keep.bin".to_string(),
-                "/absolute/path.bin".to_string(),
+                inside.clone(),
+                outside.clone(),
+                PathBuf::from("/absolute/path.bin"),
             ],
-        );
+        )
+        .is_err());
 
         assert!(!inside.exists());
         assert!(outside.exists());
         let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_torrent_data_does_not_follow_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("delete-symlink-root");
+        let outside = temp_path("delete-symlink-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("keep.bin");
+        fs::write(&outside_file, b"keep").unwrap();
+        symlink(&outside, root.join("linked")).unwrap();
+
+        assert!(delete_storage_paths(&root, &[root.join("linked/keep.bin")]).is_err());
+
+        assert!(outside_file.exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]
@@ -9966,6 +15822,149 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn resume_parser_rejects_malformed_numeric_and_collection_entries() {
+        fn base_resume_dict() -> Vec<(Vec<u8>, Value)> {
+            vec![
+                (b"downloaded".to_vec(), Value::Int(0)),
+                (b"file_priority".to_vec(), Value::List(Vec::new())),
+                (b"files".to_vec(), Value::List(Vec::new())),
+                (b"info_hash".to_vec(), Value::Bytes(vec![1; 20])),
+                (b"peers".to_vec(), Value::List(Vec::new())),
+                (b"piece_length".to_vec(), Value::Int(16_384)),
+                (b"pieces".to_vec(), Value::Bytes(Vec::new())),
+                (b"uploaded".to_vec(), Value::Int(0)),
+            ]
+        }
+
+        fn assert_rejected(key: &[u8], replacement: Value, expected: &str) {
+            let mut dict = base_resume_dict();
+            let value = dict
+                .iter_mut()
+                .find(|(candidate, _)| candidate.as_slice() == key)
+                .map(|(_, value)| value)
+                .unwrap();
+            *value = replacement;
+            let error = parse_resume_data(&bencode::encode(&Value::Dict(dict))).unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        assert_rejected(b"piece_length", Value::Int(-1), "piece length");
+        assert_rejected(
+            b"file_priority",
+            Value::List(vec![Value::Int(piece::PRIORITY_HIGH as i64 + 1)]),
+            "priority",
+        );
+        assert_rejected(
+            b"files",
+            Value::List(vec![Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(-1)),
+                (b"mtime".to_vec(), Value::Int(0)),
+            ])]),
+            "length",
+        );
+        assert_rejected(
+            b"peers",
+            Value::List(vec![Value::Bytes(b"not-an-address".to_vec())]),
+            "peer address",
+        );
+        assert_rejected(b"downloaded", Value::Int(-1), "downloaded counter");
+
+        let mut dict = base_resume_dict();
+        dict.push((
+            b"file_renames".to_vec(),
+            Value::List(vec![Value::Dict(vec![
+                (b"index".to_vec(), Value::Int(-1)),
+                (b"name".to_vec(), Value::Bytes(b"renamed.bin".to_vec())),
+            ])]),
+        ));
+        assert!(parse_resume_data(&bencode::encode(&Value::Dict(dict)))
+            .unwrap_err()
+            .contains("rename index"));
+
+        let path = temp_path("resume-invalid-save").join("state.resume");
+        assert!(save_resume_data(
+            &path,
+            [1; 20],
+            16_384,
+            Vec::new(),
+            &[piece::PRIORITY_HIGH + 1],
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            &[],
+        )
+        .unwrap_err()
+        .contains("priority"));
+        assert!(save_resume_data(
+            &path,
+            [1; 20],
+            16_384,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            &[(0, "../escape".to_string())],
+        )
+        .unwrap_err()
+        .contains("rename"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn resume_save_roundtrips_at_the_parser_structure_limit() {
+        let root = temp_path("resume-structure-limit");
+        let path = root.join("state.resume");
+        // The resume dictionary contributes 19 values including its keys and
+        // container values. Each rename contributes a dictionary, two keys,
+        // and two scalar values.
+        let rename_count = (bencode::MAX_VALUES - 19) / 5;
+        let mut renames = (0..rename_count)
+            .map(|index| (index, "x".to_string()))
+            .collect::<Vec<_>>();
+
+        save_resume_data(
+            &path,
+            [8u8; 20],
+            16_384,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            &renames,
+        )
+        .unwrap();
+        let loaded = load_resume_data(&path).unwrap();
+        assert_eq!(loaded.file_renames.len(), rename_count);
+
+        renames.push((rename_count, "x".to_string()));
+        let error = save_resume_data(
+            &path,
+            [8u8; 20],
+            16_384,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+            &renames,
+        )
+        .unwrap_err();
+        assert!(error.contains("structure exceeds parser limits"));
+        assert_eq!(
+            load_resume_data(&path).unwrap().file_renames.len(),
+            rename_count
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resume_load_recovers_from_backup_when_primary_is_corrupt() {
         let path = temp_path("resume-recover").join("state.resume");
         let info_hash = [4u8; 20];
@@ -10005,15 +16004,22 @@ mod core_helpers_tests {
     fn session_save_writes_bencode_file() {
         let path = temp_path("session").join("session.benc");
         let mut entries = HashMap::new();
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
         entries.insert(
-            [3u8; 20],
+            info_hash,
             SessionEntry {
-                info_hash: [3u8; 20],
+                info_hash,
                 name: "demo".to_string(),
-                torrent_bytes: b"torrent-data".to_vec(),
+                torrent_bytes,
                 download_dir: PathBuf::from("/tmp/downloads"),
                 preallocate: true,
                 label: String::new(),
+                completion_state: CompletionState::None,
+                completion_move_dir: None,
+                pending_delete: false,
+                file_renames: Vec::new(),
+                pending_file_rename: None,
             },
         );
         save_session(&path, &entries).unwrap();
@@ -10032,20 +16038,97 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn session_save_roundtrips_near_the_parser_structure_limit() {
+        let root = temp_path("session-structure-limit");
+        let path = session_path(&root);
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        // The outer list and entry dictionary plus seven key/value pairs use
+        // 16 values. Each persisted rename uses five more values.
+        let rename_count = (bencode::MAX_VALUES - 16) / 5;
+        let entry = SessionEntry {
+            info_hash,
+            name: "demo".to_string(),
+            torrent_bytes,
+            download_dir: root.clone(),
+            preallocate: false,
+            label: String::new(),
+            completion_state: CompletionState::None,
+            completion_move_dir: None,
+            pending_delete: false,
+            file_renames: (0..rename_count)
+                .map(|index| (index, "x".to_string()))
+                .collect(),
+            pending_file_rename: None,
+        };
+        let mut entries = HashMap::from([(info_hash, entry)]);
+
+        save_session(&path, &entries).unwrap();
+        let loaded = SessionStore::load(&root).unwrap();
+        assert_eq!(
+            loaded.get(info_hash).unwrap().file_renames.len(),
+            rename_count
+        );
+
+        entries
+            .get_mut(&info_hash)
+            .unwrap()
+            .file_renames
+            .push((rename_count, "x".to_string()));
+        let error = save_session(&path, &entries).unwrap_err();
+        assert!(error.contains("structure exceeds parser limits"));
+        assert_eq!(
+            SessionStore::load(&root)
+                .unwrap()
+                .get(info_hash)
+                .unwrap()
+                .file_renames
+                .len(),
+            rename_count
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_load_fails_closed_when_primary_and_backup_are_invalid() {
+        let root = temp_path("session-fail-closed");
+        ensure_private_state_directory(&root).unwrap();
+        let path = session_path(&root);
+        fs::write(&path, b"invalid primary").unwrap();
+        fs::write(sidecar_path(&path, ".bak"), b"invalid backup").unwrap();
+
+        let error = match SessionStore::load(&root) {
+            Ok(_) => panic!("invalid durable session state must not be ignored"),
+            Err(error) => error,
+        };
+        assert!(error.contains("cannot load session state"));
+        assert!(error.contains("backup invalid"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn session_load_recovers_from_backup_when_primary_is_corrupt() {
         let root = temp_path("session-recover");
         let path = session_path(&root);
         let mut entries = HashMap::new();
-        let info_hash = [5u8; 20];
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
         entries.insert(
             info_hash,
             SessionEntry {
                 info_hash,
                 name: "demo".to_string(),
-                torrent_bytes: b"torrent-data".to_vec(),
+                torrent_bytes,
                 download_dir: root.clone(),
                 preallocate: false,
                 label: String::new(),
+                completion_state: CompletionState::None,
+                completion_move_dir: None,
+                pending_delete: false,
+                file_renames: Vec::new(),
+                pending_file_rename: None,
             },
         );
         save_session(&path, &entries).unwrap();
@@ -10053,12 +16136,695 @@ mod core_helpers_tests {
         fs::copy(&path, &backup_path).unwrap();
         fs::write(&path, b"corrupt").unwrap();
 
-        let store = SessionStore::load(&root);
+        let store = Arc::new(SessionStore::load(&root).unwrap());
         assert!(store.contains(info_hash));
         let loaded_bytes = fs::read(&path).unwrap();
         assert!(bencode::parse(&loaded_bytes).is_ok());
 
+        fs::remove_file(&path).unwrap();
+        let missing_primary_store = SessionStore::load(&root).unwrap();
+        assert!(missing_primary_store.contains(info_hash));
+
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn completion_actions_require_a_real_transition() {
+        assert_eq!(
+            completion_action(CompletionState::None, true, true, false),
+            CompletionAction::MarkDone
+        );
+        assert_eq!(
+            completion_action(CompletionState::None, false, true, false),
+            CompletionAction::RunScript
+        );
+        assert_eq!(
+            completion_action(CompletionState::None, false, true, true),
+            CompletionAction::Move
+        );
+        assert_eq!(
+            completion_action(CompletionState::Pending, true, true, true),
+            CompletionAction::Move
+        );
+        assert_eq!(
+            completion_action(CompletionState::Done, false, true, true),
+            CompletionAction::None
+        );
+        assert_eq!(
+            completion_action(CompletionState::None, false, false, true),
+            CompletionAction::None
+        );
+    }
+
+    #[test]
+    fn durable_claims_reject_same_single_path_and_keep_tombstones_owned() {
+        let root = temp_path("storage-claim-single");
+        let payload = root.join("payload");
+        let store = SessionStore::load(&root).unwrap();
+        let first =
+            claim_test_torrent(&store, single_torrent_bytes(b"same.bin", b'a'), &payload).unwrap();
+
+        assert!(
+            claim_test_torrent(&store, single_torrent_bytes(b"same.bin", b'b'), &payload,)
+                .unwrap_err()
+                .contains("conflicts with torrent")
+        );
+        claim_test_torrent(&store, single_torrent_bytes(b"sibling.bin", b'c'), &payload).unwrap();
+
+        {
+            let _operation = store.lock_operation();
+            store.begin_delete(first).unwrap();
+        }
+        assert!(
+            claim_test_torrent(&store, single_torrent_bytes(b"same.bin", b'd'), &payload,).is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_claims_reject_tree_and_file_tree_overlaps() {
+        let root = temp_path("storage-claim-tree");
+        let payload = root.join("payload");
+        let store = SessionStore::load(&root).unwrap();
+        claim_test_torrent(&store, multifile_torrent_bytes(b"bundle", b'a'), &payload).unwrap();
+
+        assert!(
+            claim_test_torrent(&store, multifile_torrent_bytes(b"bundle", b'b'), &payload,)
+                .is_err()
+        );
+        assert!(claim_test_torrent(
+            &store,
+            single_torrent_bytes(b"inside.bin", b'c'),
+            &payload.join("bundle"),
+        )
+        .is_err());
+        claim_test_torrent(&store, multifile_torrent_bytes(b"sibling", b'd'), &payload).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rename_and_completion_destinations_are_reserved_before_mutation() {
+        let root = temp_path("storage-claim-transitions");
+        let payload = root.join("payload");
+        let destination = root.join("completed");
+        let store = SessionStore::load(&root).unwrap();
+        let rename_source =
+            claim_test_torrent(&store, single_torrent_bytes(b"source.bin", b'a'), &payload)
+                .unwrap();
+        claim_test_torrent(
+            &store,
+            single_torrent_bytes(b"reserved.bin", b'b'),
+            &payload,
+        )
+        .unwrap();
+        let move_source =
+            claim_test_torrent(&store, single_torrent_bytes(b"move.bin", b'c'), &payload).unwrap();
+        claim_test_torrent(
+            &store,
+            single_torrent_bytes(b"move.bin", b'd'),
+            &destination,
+        )
+        .unwrap();
+
+        {
+            let _operation = store.lock_operation();
+            assert!(store
+                .begin_file_rename(rename_source, 0, "reserved.bin")
+                .is_err());
+            assert!(store
+                .get(rename_source)
+                .unwrap()
+                .pending_file_rename
+                .is_none());
+        }
+        {
+            let _operation = store.lock_operation();
+            assert!(store
+                .begin_completion(move_source, Some(&destination))
+                .is_err());
+            assert_eq!(
+                store.get(move_source).unwrap().completion_state,
+                CompletionState::None
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_upsert_preserves_label_and_completion_state() {
+        let root = temp_path("session-upsert-preserve");
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(
+                info_hash,
+                "old".to_string(),
+                torrent_bytes.clone(),
+                &root,
+                false,
+            )
+            .unwrap();
+        store.set_label(info_hash, "linux").unwrap();
+        let intended_move = root.join("completed");
+        assert!(store
+            .begin_completion(info_hash, Some(&intended_move))
+            .unwrap());
+
+        let new_dir = root.join("new-dir");
+        store
+            .upsert(info_hash, "new".to_string(), torrent_bytes, &new_dir, true)
+            .unwrap();
+
+        let entry = store.get(info_hash).unwrap();
+        assert_eq!(entry.name, "new");
+        assert_eq!(entry.label, "linux");
+        assert_eq!(entry.completion_state, CompletionState::Pending);
+        assert_eq!(entry.completion_move_dir, Some(intended_move.clone()));
+        assert_eq!(entry.download_dir, new_dir);
+        let reloaded = SessionStore::load(&root).unwrap().get(info_hash).unwrap();
+        assert_eq!(reloaded.label, "linux");
+        assert_eq!(reloaded.completion_state, CompletionState::Pending);
+        assert_eq!(reloaded.completion_move_dir, Some(intended_move));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_tombstone_and_rename_journal_survive_upsert_roundtrip() {
+        let root = temp_path("session-delete-roundtrip");
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(
+                info_hash,
+                "old".to_string(),
+                torrent_bytes.clone(),
+                &root,
+                false,
+            )
+            .unwrap();
+        store
+            .import_file_renames_if_empty(info_hash, &[(0, "committed.bin".to_string())])
+            .unwrap();
+        store
+            .begin_file_rename(info_hash, 0, "pending.bin")
+            .unwrap();
+
+        // A pending rename must be resolved before deletion can begin.
+        assert!(store.begin_delete(info_hash).is_err());
+        let pending = PendingFileRename {
+            index: 0,
+            target: "pending.bin".to_string(),
+        };
+        store.cancel_file_rename(info_hash, &pending).unwrap();
+        store.begin_delete(info_hash).unwrap();
+        store
+            .upsert(
+                info_hash,
+                "new".to_string(),
+                torrent_bytes,
+                &root.join("new"),
+                true,
+            )
+            .unwrap();
+
+        let entry = SessionStore::load(&root).unwrap().get(info_hash).unwrap();
+        assert!(entry.pending_delete);
+        assert_eq!(entry.file_renames, vec![(0, "committed.bin".to_string())]);
+        assert_eq!(entry.name, "new");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn begin_delete_rolls_back_memory_when_save_fails() {
+        let root = temp_path("session-delete-save-failure");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session-target-is-directory");
+        fs::create_dir(&path).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let entry = SessionEntry {
+            info_hash,
+            name: "demo".to_string(),
+            torrent_bytes,
+            download_dir: root.clone(),
+            preallocate: false,
+            label: String::new(),
+            completion_state: CompletionState::None,
+            completion_move_dir: None,
+            pending_delete: false,
+            file_renames: Vec::new(),
+            pending_file_rename: None,
+        };
+        let store = SessionStore {
+            path,
+            entries: Mutex::new(HashMap::from([(info_hash, entry)])),
+            operations: Mutex::new(()),
+        };
+
+        assert!(store.begin_delete(info_hash).is_err());
+        assert!(!store.get(info_hash).unwrap().pending_delete);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_publish_directory_sync_failure_is_not_reported_as_rollback_safe() {
+        assert!(finish_atomic_publish(
+            Err("simulated directory sync failure".to_string()),
+            "test journal",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn startup_retries_tombstone_without_queueing_it() {
+        let root = temp_path("startup-delete-retry");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        let data_path = storage.file_path(0).unwrap().to_path_buf();
+        drop(storage);
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(
+                meta.info_hash,
+                "test".to_string(),
+                torrent_bytes,
+                &root,
+                false,
+            )
+            .unwrap();
+        store.begin_delete(meta.info_hash).unwrap();
+        let mut queue = VecDeque::new();
+        let ui = Some(Arc::new(Mutex::new(ui::UiState::default())));
+        let mut next_id = 1;
+
+        restore_session_entries(&store, &mut queue, &ui, &mut next_id);
+
+        assert!(queue.is_empty());
+        assert!(!data_path.exists());
+        assert!(!store.contains(meta.info_hash));
+        assert!(lock_or_recover(ui.as_ref().unwrap()).torrents.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_retains_failed_tombstone_as_nonqueued_ui_entry() {
+        let root = temp_path("startup-delete-failure");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let data_path = storage::data_paths(&meta, &root).unwrap().remove(0);
+        fs::create_dir_all(&data_path).unwrap();
+        let store = Arc::new(SessionStore::load(&root).unwrap());
+        store
+            .upsert(
+                meta.info_hash,
+                "test".to_string(),
+                torrent_bytes,
+                &root,
+                false,
+            )
+            .unwrap();
+        store.begin_delete(meta.info_hash).unwrap();
+        let mut queue = VecDeque::new();
+        let ui = Some(Arc::new(Mutex::new(ui::UiState::default())));
+        let mut next_id = 1;
+
+        restore_session_entries(&store, &mut queue, &ui, &mut next_id);
+
+        assert!(queue.is_empty());
+        assert!(store.get(meta.info_hash).unwrap().pending_delete);
+        let state = lock_or_recover(ui.as_ref().unwrap());
+        assert_eq!(state.torrents.len(), 1);
+        assert_eq!(state.torrents[0].info_hash, hex(&meta.info_hash));
+        assert_eq!(state.torrents[0].status, "delete failed");
+        assert!(!state.torrents[0].last_error.is_empty());
+        drop(state);
+
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        assert!(delete_torrent(
+            &registry,
+            &ui,
+            &mut queue,
+            1,
+            true,
+            &store,
+            &empty_in_flight(),
+        )
+        .is_err());
+        assert!(store.get(meta.info_hash).unwrap().pending_delete);
+        assert_eq!(
+            lock_or_recover(ui.as_ref().unwrap()).torrents[0].status,
+            "delete failed"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_delete_is_idempotent_when_files_are_already_absent() {
+        let root = temp_path("delete-not-found");
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(
+                meta.info_hash,
+                "test".to_string(),
+                torrent_bytes,
+                &root,
+                false,
+            )
+            .unwrap();
+        store.begin_delete(meta.info_hash).unwrap();
+
+        retry_pending_delete(&store, meta.info_hash).unwrap();
+        assert!(!store.contains(meta.info_hash));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_file_rename_recovers_before_storage_open() {
+        let root = temp_path("rename-journal-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        let original = storage.file_path(0).unwrap().to_path_buf();
+        drop(storage);
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(
+                meta.info_hash,
+                "test".to_string(),
+                torrent_bytes,
+                &root,
+                false,
+            )
+            .unwrap();
+        store
+            .begin_file_rename(meta.info_hash, 0, "renamed.bin")
+            .unwrap();
+        let entry = store.get(meta.info_hash).unwrap();
+
+        let renames = reconcile_pending_file_rename(&meta, &root, &store, &entry).unwrap();
+        let renamed = original.with_file_name("renamed.bin");
+        assert!(!original.exists());
+        assert!(renamed.exists());
+        assert_eq!(renames, vec![(0, "renamed.bin".to_string())]);
+        assert!(store
+            .get(meta.info_hash)
+            .unwrap()
+            .pending_file_rename
+            .is_none());
+
+        // Simulate a crash after the second physical rename but before its
+        // journal commit. Recovery must commit the already-moved path.
+        store
+            .begin_file_rename(meta.info_hash, 0, "renamed-again.bin")
+            .unwrap();
+        let renamed_again = original.with_file_name("renamed-again.bin");
+        fs::rename(&renamed, &renamed_again).unwrap();
+        let entry = store.get(meta.info_hash).unwrap();
+        let renames = reconcile_pending_file_rename(&meta, &root, &store, &entry).unwrap();
+        assert_eq!(renames, vec![(0, "renamed-again.bin".to_string())]);
+        assert!(renamed_again.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_file_rename_refuses_ambiguous_or_missing_paths() {
+        let root = temp_path("rename-journal-ambiguous");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let storage =
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap();
+        let original = storage.file_path(0).unwrap().to_path_buf();
+        drop(storage);
+        let target = original.with_file_name("ambiguous.bin");
+        fs::copy(&original, &target).unwrap();
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(
+                meta.info_hash,
+                "test".to_string(),
+                torrent_bytes,
+                &root,
+                false,
+            )
+            .unwrap();
+        store
+            .begin_file_rename(meta.info_hash, 0, "ambiguous.bin")
+            .unwrap();
+
+        let entry = store.get(meta.info_hash).unwrap();
+        assert!(reconcile_pending_file_rename(&meta, &root, &store, &entry)
+            .unwrap_err()
+            .contains("both old and new"));
+        assert!(original.exists());
+        assert!(target.exists());
+        assert!(store
+            .get(meta.info_hash)
+            .unwrap()
+            .pending_file_rename
+            .is_some());
+
+        fs::remove_file(&original).unwrap();
+        fs::remove_file(&target).unwrap();
+        let entry = store.get(meta.info_hash).unwrap();
+        assert!(reconcile_pending_file_rename(&meta, &root, &store, &entry)
+            .unwrap_err()
+            .contains("neither old nor new"));
+        assert!(store
+            .get(meta.info_hash)
+            .unwrap()
+            .pending_file_rename
+            .is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_paths_roundtrip_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_path("session-non-utf8-path");
+        let raw = std::ffi::OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]);
+        let download_dir = PathBuf::from(raw);
+        let move_raw = std::ffi::OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xfe]);
+        let move_dir = PathBuf::from(move_raw);
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(
+                info_hash,
+                "demo".to_string(),
+                torrent_bytes,
+                &download_dir,
+                false,
+            )
+            .unwrap();
+        store.begin_completion(info_hash, Some(&move_dir)).unwrap();
+
+        let entry = SessionStore::load(&root).unwrap().get(info_hash).unwrap();
+        assert_eq!(entry.download_dir, download_dir);
+        assert_eq!(entry.completion_move_dir, Some(move_dir));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_session_without_completion_state_loads_as_none() {
+        let root = temp_path("legacy-session-state");
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let encoded = bencode::encode(&Value::List(vec![Value::Dict(vec![
+            (b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec())),
+            (b"name".to_vec(), Value::Bytes(b"legacy".to_vec())),
+            (b"torrent".to_vec(), Value::Bytes(torrent_bytes)),
+        ])]));
+        let entries = parse_session_entries(&encoded, &root).unwrap();
+        assert_eq!(
+            entries.get(&info_hash).unwrap().completion_state,
+            CompletionState::None
+        );
+    }
+
+    #[test]
+    fn completion_move_commit_updates_directory_and_state_together() {
+        let root = temp_path("completion-move-commit");
+        let torrent_bytes = test_torrent_bytes();
+        let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
+        let destination = root.join("destination");
+        let store = SessionStore::load(&root).unwrap();
+        store
+            .upsert(info_hash, "demo".to_string(), torrent_bytes, &root, false)
+            .unwrap();
+        assert!(store
+            .begin_completion(info_hash, Some(&destination))
+            .unwrap());
+        assert!(store
+            .commit_completion_move(info_hash, &destination)
+            .unwrap());
+
+        let entry = SessionStore::load(&root).unwrap().get(info_hash).unwrap();
+        assert_eq!(entry.download_dir, destination);
+        assert_eq!(entry.completion_state, CompletionState::Done);
+        assert_eq!(entry.completion_move_dir, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_no_replace_move_preserves_a_racing_destination() {
+        let root = temp_path("completion-no-replace");
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::write(&source, b"source payload").unwrap();
+        fs::write(&destination, b"independent payload").unwrap();
+
+        let error = rename_path_no_overwrite(&source, &destination, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).unwrap(), b"source payload");
+        assert_eq!(fs::read(&destination).unwrap(), b"independent payload");
+
+        let source_dir = root.join("source-dir");
+        let destination_dir = root.join("destination-dir");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&destination_dir).unwrap();
+        fs::write(source_dir.join("source.txt"), b"source").unwrap();
+        fs::write(destination_dir.join("destination.txt"), b"destination").unwrap();
+
+        let error = rename_path_no_overwrite(&source_dir, &destination_dir, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(source_dir.join("source.txt").exists());
+        assert_eq!(
+            fs::read(destination_dir.join("destination.txt")).unwrap(),
+            b"destination"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_session_commit_rolls_back_completed_move() {
+        let root = temp_path("completion-move-rollback");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, b"payload").unwrap();
+        move_path_no_overwrite(&source, &destination).unwrap();
+        let completed_move = CompletedMove {
+            source: source.clone(),
+            destination: destination.clone(),
+        };
+
+        let error = commit_completed_move(Some(&completed_move), || {
+            Err("simulated session failure".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("rolled back"));
+        assert_eq!(fs::read(&source).unwrap(), b"payload");
+        assert!(!destination.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_move_reconciles_only_a_verified_destination() {
+        let root = temp_path("completion-move-reconcile");
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        let source = source_dir.join("payload.bin");
+        let torrent_path = root.join("payload.torrent");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&destination_dir).unwrap();
+        fs::write(&source, b"payload").unwrap();
+        create_torrent(
+            &source,
+            "https://tracker.example/announce",
+            &torrent_path,
+            4,
+        )
+        .unwrap();
+        let meta = torrent::parse_torrent(&fs::read(&torrent_path).unwrap()).unwrap();
+        let completed_move =
+            completed_move_paths(&meta, &source_dir, &destination_dir, None).unwrap();
+
+        fs::write(&completed_move.destination, b"unrelated").unwrap();
+        assert!(completion_move_recovery(&meta, &destination_dir, &[], &completed_move,).is_err());
+        fs::remove_file(&completed_move.destination).unwrap();
+        fs::copy(&source, &completed_move.destination).unwrap();
+        assert_eq!(
+            completion_move_recovery(&meta, &destination_dir, &[], &completed_move).unwrap(),
+            CompletionMoveRecovery::AdoptDestination {
+                remove_source: true
+            }
+        );
+        fs::remove_file(&source).unwrap();
+        assert_eq!(
+            completion_move_recovery(&meta, &destination_dir, &[], &completed_move).unwrap(),
+            CompletionMoveRecovery::AdoptDestination {
+                remove_source: false
+            }
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn published_multifile_recovery_deletes_only_exact_source_files() {
+        let root = temp_path("completion-move-exact-source-cleanup");
+        let source_dir = root.join("source");
+        let destination_dir = root.join("destination");
+        let bundle = source_dir.join("bundle");
+        let torrent_path = root.join("bundle.torrent");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("payload.bin"), b"payload").unwrap();
+        create_torrent(
+            &bundle,
+            "https://tracker.example/announce",
+            &torrent_path,
+            4,
+        )
+        .unwrap();
+        let meta = torrent::parse_torrent(&fs::read(torrent_path).unwrap()).unwrap();
+        fs::write(bundle.join("unrelated.txt"), b"keep").unwrap();
+        fs::create_dir_all(destination_dir.join("bundle")).unwrap();
+        fs::copy(
+            bundle.join("payload.bin"),
+            destination_dir.join("bundle/payload.bin"),
+        )
+        .unwrap();
+        let completed_move =
+            completed_move_paths(&meta, &source_dir, &destination_dir, None).unwrap();
+        assert_eq!(
+            completion_move_recovery(&meta, &destination_dir, &[], &completed_move).unwrap(),
+            CompletionMoveRecovery::AdoptDestination {
+                remove_source: true
+            }
+        );
+        let source_paths = storage::data_paths(&meta, &source_dir).unwrap();
+        delete_storage_paths(&source_dir, &source_paths).unwrap();
+        assert_eq!(fs::read(bundle.join("unrelated.txt")).unwrap(), b"keep");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10112,6 +16878,76 @@ mod core_helpers_tests {
         );
         assert_eq!(added, 2);
         assert_eq!(queue.known_len(), 2);
+    }
+
+    #[test]
+    fn peer_queue_normalizes_mapped_ipv4_and_rejects_special_ipv6_routes() {
+        let mut queue = PeerQueue::new(None);
+        let added = queue.enqueue_with_source(
+            [
+                "[::ffff:127.0.0.1]:6881".parse().unwrap(),
+                "[::ffff:192.168.1.1]:6881".parse().unwrap(),
+                "[::ffff:169.254.1.1]:6881".parse().unwrap(),
+                "[::ffff:203.0.113.9]:6881".parse().unwrap(),
+                "[64:ff9b:1::c0a8:1]:6881".parse().unwrap(),
+                "[::ffff:8.8.8.8]:6881".parse().unwrap(),
+            ],
+            PeerSource::Tracker,
+        );
+        assert_eq!(added, 1);
+        assert_eq!(queue.pop(), Some("8.8.8.8:6881".parse().unwrap()));
+
+        let mut lpd = PeerQueue::new(None);
+        assert_eq!(
+            lpd.enqueue_with_source(
+                ["[::ffff:192.168.1.2]:6881".parse().unwrap()],
+                PeerSource::Lpd,
+            ),
+            1
+        );
+        assert_eq!(lpd.pop(), Some("192.168.1.2:6881".parse().unwrap()));
+    }
+
+    #[test]
+    fn metadata_discovery_filters_tracker_dht_and_magnet_scope_before_connecting() {
+        for unsafe_peer in [
+            "127.0.0.1:6881",
+            "10.0.0.1:6881",
+            "169.254.1.1:6881",
+            "192.0.0.1:6881",
+            "[::ffff:192.168.1.1]:6881",
+            "[64:ff9b:1::c0a8:1]:6881",
+            "[fc00::1]:6881",
+            "[fe80::1]:6881",
+        ] {
+            assert!(
+                safe_metadata_peer(unsafe_peer.parse().unwrap(), PeerSource::Tracker, None,)
+                    .is_none()
+            );
+            assert!(
+                safe_metadata_peer(unsafe_peer.parse().unwrap(), PeerSource::Dht, None,).is_none()
+            );
+            assert!(
+                safe_metadata_peer(unsafe_peer.parse().unwrap(), PeerSource::Magnet, None,)
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            safe_metadata_peer(
+                "[::ffff:8.8.8.8]:6881".parse().unwrap(),
+                PeerSource::Tracker,
+                None,
+            ),
+            Some("8.8.8.8:6881".parse().unwrap())
+        );
+        assert_eq!(
+            safe_metadata_peer(
+                "[::ffff:8.8.8.8]:6881".parse().unwrap(),
+                PeerSource::Magnet,
+                None,
+            ),
+            Some("8.8.8.8:6881".parse().unwrap())
+        );
     }
 
     #[test]
@@ -10457,14 +17293,16 @@ mod core_helpers_tests {
         let info = b"d6:lengthi1e4:name4:test12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
         let torrent_bytes = wrap_torrent_with_info(info, &[], &[]);
         let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
-        let session_store = Arc::new(SessionStore::load(&root));
-        session_store.upsert(
-            meta.info_hash,
-            "bugonia".to_string(),
-            torrent_bytes.clone(),
-            &root,
-            false,
-        );
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
+        session_store
+            .upsert(
+                meta.info_hash,
+                "bugonia".to_string(),
+                torrent_bytes.clone(),
+                &root,
+                false,
+            )
+            .unwrap();
         let ui = Arc::new(Mutex::new(ui::UiState {
             current_id: Some(7),
             torrents: vec![ui::UiTorrent {
@@ -10483,9 +17321,18 @@ mod core_helpers_tests {
         }));
         let ui_state = Some(Arc::clone(&ui));
         let registry: SessionRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let in_flight: InFlightTorrents = Arc::new(Mutex::new(HashMap::new()));
         let mut queue = VecDeque::new();
 
-        resume_torrent(&registry, &ui_state, &mut queue, 7, &session_store).unwrap();
+        resume_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            7,
+            &session_store,
+            &in_flight,
+        )
+        .unwrap();
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].id, 7);
@@ -10531,7 +17378,7 @@ mod core_helpers_tests {
         }));
         let ui_state = Some(Arc::clone(&ui));
         let registry: SessionRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let session_store = Arc::new(SessionStore::load(&root));
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
         let mut queue = VecDeque::from([TorrentRequest {
             id: 11,
             source: TorrentSource::Bytes(torrent_bytes),
@@ -10540,7 +17387,15 @@ mod core_helpers_tests {
             initial_label: String::new(),
         }]);
 
-        stop_torrent(&registry, &ui_state, &mut queue, 11, &session_store).unwrap();
+        stop_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            11,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .unwrap();
 
         assert!(queue.is_empty());
         let state = lock_or_recover(&ui);
@@ -10564,8 +17419,8 @@ mod core_helpers_tests {
         fs::create_dir_all(&root).unwrap();
         let context = make_test_context(21, &root);
         let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
-        register_session(&registry, Arc::clone(&context));
-        let session_store = Arc::new(SessionStore::load(&root));
+        register_session(&registry, Arc::clone(&context)).unwrap();
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
         let ui_state = Some(Arc::new(Mutex::new(ui::UiState {
             torrents: vec![ui::UiTorrent {
                 id: 21,
@@ -10576,9 +17431,18 @@ mod core_helpers_tests {
         })));
         let mut queue = VecDeque::new();
 
-        stop_torrent(&registry, &ui_state, &mut queue, 21, &session_store).unwrap();
+        stop_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            21,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .unwrap();
 
         assert!(context.stop_requested.load(Ordering::SeqCst));
+        assert!(!context.allow_completion_reentry.load(Ordering::SeqCst));
         assert!(find_context_by_id(&registry, 21).is_some());
 
         let _ = fs::remove_dir_all(&root);
@@ -10624,11 +17488,11 @@ write_cache=64k
     #[test]
     fn webseed_url_builder_encodes_paths_for_multi_file_mode() {
         assert_eq!(
-            build_webseed_url("https://seed.example/base", "ignored", false),
+            build_webseed_url("https://seed.example/base", b"ignored", false),
             "https://seed.example/base"
         );
         assert_eq!(
-            build_webseed_url("https://seed.example/base/", "dir/file name#.bin", true),
+            build_webseed_url("https://seed.example/base/", b"dir/file name#.bin", true),
             "https://seed.example/base/dir/file%20name%23.bin"
         );
     }
@@ -10695,7 +17559,7 @@ mod local_harness_tests {
         });
 
         let url = format!("http://127.0.0.1:{}/announce", addr.port());
-        let response = tracker::announce(
+        let response = tracker::announce_local_test(
             &url,
             [1u8; 20],
             [2u8; 20],
@@ -10784,7 +17648,7 @@ mod local_harness_tests {
             proxy: None,
         };
         let mut stream = connect_peer_for_metadata(addr, &cfg).unwrap();
-        let handshake = plaintext_handshake(&mut stream, info_hash, local_peer_id).unwrap();
+        let handshake = plaintext_handshake(&mut stream, info_hash, None, local_peer_id).unwrap();
         assert_eq!(handshake.peer_id, remote_peer_id);
         assert_eq!(handshake.info_hash, info_hash);
         server.join().unwrap();
@@ -10794,50 +17658,53 @@ mod local_harness_tests {
     #[test]
     fn local_dht_fixture_node_returns_peers() {
         let dht_port = free_udp_port();
+        let download_dir = std::env::temp_dir().join(format!(
+            "rustorrent-dht-harness-{}-{dht_port}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&download_dir);
+        fs::create_dir(&download_dir).unwrap();
         let fixture = UdpSocket::bind("127.0.0.1:0").unwrap();
         fixture
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let fixture_addr = fixture.local_addr().unwrap();
 
-        let cache_path = PathBuf::from(".rustorrent").join("dht_nodes.dat");
-        let backup = fs::read(&cache_path).ok();
-        let mut entry = Vec::new();
-        entry.extend_from_slice(&[0x22u8; 20]);
-        entry.extend_from_slice(&[127, 0, 0, 1]);
-        entry.extend_from_slice(&fixture_addr.port().to_be_bytes());
-        if let Some(parent) = cache_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        fs::write(&cache_path, entry).unwrap();
+        let cache_path = download_dir.join(".rustorrent").join("dht_nodes.dat");
 
         let fixture_thread = thread::spawn(move || {
-            let mut buf = [0u8; 1500];
-            let (n, src) = fixture.recv_from(&mut buf).unwrap();
-            let parsed = bencode::parse(&buf[..n]).unwrap();
-            let Value::Dict(dict) = parsed else {
-                panic!("expected dict");
-            };
-            let tx = match dict_get(&dict, b"t") {
-                Some(Value::Bytes(tx)) => tx.clone(),
-                _ => panic!("missing tx id"),
-            };
-            let peer = compact_peer("127.0.0.1:6881".parse().unwrap());
-            let response = bencode::encode(&Value::Dict(vec![
-                (b"t".to_vec(), Value::Bytes(tx)),
-                (b"y".to_vec(), Value::Bytes(b"r".to_vec())),
-                (
-                    b"r".to_vec(),
-                    Value::Dict(vec![
-                        (b"id".to_vec(), Value::Bytes(vec![0x33u8; 20])),
-                        (b"values".to_vec(), Value::List(vec![Value::Bytes(peer)])),
-                    ]),
-                ),
-            ]));
-            fixture.send_to(&response, src).unwrap();
+            for expected_query in [b"ping".as_slice(), b"get_peers".as_slice()] {
+                let mut buf = [0u8; 1500];
+                let (n, src) = fixture.recv_from(&mut buf).unwrap();
+                let parsed = bencode::parse(&buf[..n]).unwrap();
+                let Value::Dict(dict) = parsed else {
+                    panic!("expected dict");
+                };
+                let tx = match dict_get(&dict, b"t") {
+                    Some(Value::Bytes(tx)) => tx.clone(),
+                    _ => panic!("missing tx id"),
+                };
+                assert_eq!(
+                    dict_get(&dict, b"q"),
+                    Some(&Value::Bytes(expected_query.to_vec()))
+                );
+                let mut response_fields = vec![(b"id".to_vec(), Value::Bytes(vec![0x22u8; 20]))];
+                if expected_query == b"get_peers" {
+                    let peer = compact_peer("127.0.0.1:6881".parse().unwrap());
+                    response_fields
+                        .push((b"values".to_vec(), Value::List(vec![Value::Bytes(peer)])));
+                }
+                let response = bencode::encode(&Value::Dict(vec![
+                    (b"t".to_vec(), Value::Bytes(tx)),
+                    (b"y".to_vec(), Value::Bytes(b"r".to_vec())),
+                    (b"r".to_vec(), Value::Dict(response_fields)),
+                ]));
+                fixture.send_to(&response, src).unwrap();
+            }
         });
 
-        let dht = dht::start(dht_port);
+        let dht =
+            dht::start_with_test_candidate(dht_port, &download_dir, [0x22u8; 20], fixture_addr);
         thread::sleep(Duration::from_millis(300));
         let (tx, rx) = mpsc::channel();
         let info_hash = [1u8; 20];
@@ -10846,14 +17713,17 @@ mod local_harness_tests {
         assert!(peers.contains(&"127.0.0.1:6881".parse().unwrap()));
         dht.remove_torrent(info_hash);
         fixture_thread.join().unwrap();
-        match backup {
-            Some(data) => {
-                let _ = fs::write(&cache_path, data);
+        drop(dht);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if fs::read(&cache_path).is_ok_and(|data| data.starts_with(b"DHTN\x01")) {
+                break;
             }
-            None => {
-                let _ = fs::remove_file(&cache_path);
-            }
+            thread::sleep(Duration::from_millis(25));
         }
+        assert!(fs::read(&cache_path).unwrap().starts_with(b"DHTN\x01"));
+        fs::remove_dir_all(download_dir).unwrap();
     }
 }
 
@@ -10876,6 +17746,13 @@ fn apply_file_priority(
             .map_err(|_| "priority lock failed".to_string())?;
         if file_index >= priorities.len() {
             return Err("file index out of range".to_string());
+        }
+        if context
+            .file_spans
+            .get(file_index)
+            .is_some_and(|span| span.is_padding)
+        {
+            return Err("padding files do not have a selectable priority".to_string());
         }
         priorities[file_index] = priority;
         priorities.clone()
@@ -10901,6 +17778,7 @@ fn apply_file_priority(
             pieces.completed_pieces(),
         )
     };
+    context.resume_save_requested.store(true, Ordering::SeqCst);
     update_ui(ui_state, |state| {
         if state.current_id == Some(torrent_id) {
             state.total_bytes = wanted_bytes;
@@ -10924,54 +17802,106 @@ fn apply_file_priority(
     Ok(())
 }
 
+fn valid_renamed_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name != "."
+        && name != ".."
+}
+
 fn apply_file_rename(
     registry: &SessionRegistry,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    session_store: &SessionStore,
     torrent_id: u64,
     file_index: usize,
     new_name: &str,
 ) -> Result<(), String> {
-    if new_name.is_empty()
-        || new_name.contains('/')
-        || new_name.contains('\\')
-        || new_name.contains('\0')
-        || new_name == "."
-        || new_name == ".."
-    {
+    if !valid_renamed_file_name(new_name) {
         return Err("invalid file name".to_string());
     }
+    let _operation = session_store.lock_operation();
+    // Acquire the lifecycle lock before cloning the context. Completion moves
+    // and active deletion hold this lock while waiting for all context/storage
+    // users to drain; retaining a clone while blocked on the same lock would
+    // deadlock that drain.
     let context =
         find_context_by_id(registry, torrent_id).ok_or_else(|| "unknown torrent".to_string())?;
     let spans = &context.file_spans;
     if file_index >= spans.len() {
         return Err("file index out of range".to_string());
     }
-    let old_rel = &spans[file_index].path;
-    let old_path = context.download_dir.join(old_rel);
-    let new_rel = if let Some(pos) = old_rel.rfind('/') {
-        format!("{}/{}", &old_rel[..pos], new_name)
-    } else {
-        new_name.to_string()
-    };
-    let new_path = context.download_dir.join(&new_rel);
+    let mut storage = context
+        .storage
+        .lock()
+        .map_err(|_| "storage lock failed".to_string())?;
+    let old_path = storage
+        .file_path(file_index)
+        .ok_or_else(|| "file index out of range".to_string())?
+        .to_path_buf();
+    let new_path = old_path.with_file_name(new_name);
     if old_path == new_path {
         return Ok(());
     }
-    {
-        let mut storage = context
-            .storage
-            .lock()
-            .map_err(|_| "storage lock failed".to_string())?;
-        storage
-            .rename_file(file_index, &old_path, &new_path)
-            .map_err(|err| format!("rename failed: {err}"))?;
+    storage
+        .validate_file_rename(file_index, &old_path, &new_path)
+        .map_err(|err| format!("rename validation failed: {err}"))?;
+    let pending = PendingFileRename {
+        index: file_index,
+        target: new_name.to_string(),
+    };
+    session_store.begin_file_rename(context.info_hash, file_index, new_name)?;
+    if let Err(err) = storage.rename_file(file_index, &old_path, &new_path) {
+        let cancel = session_store.cancel_file_rename(context.info_hash, &pending);
+        return Err(match cancel {
+            Ok(_) => format!("rename failed: {err}"),
+            Err(cancel_err) => {
+                format!("rename failed: {err}; rename journal cleanup failed: {cancel_err}")
+            }
+        });
     }
-    {
-        let mut renames = context
-            .file_renames
-            .lock()
-            .map_err(|_| "renames lock failed".to_string())?;
-        renames.insert(file_index, new_name.to_string());
+    match session_store.commit_file_rename(context.info_hash, &pending) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = storage.rename_file(file_index, &new_path, &old_path);
+            return Err("rename journal changed before commit".to_string());
+        }
+        Err(commit_err) => {
+            let rollback = storage.rename_file(file_index, &new_path, &old_path);
+            if rollback.is_ok() {
+                let _ = session_store.cancel_file_rename(context.info_hash, &pending);
+            }
+            return Err(match rollback {
+                Ok(()) => format!("{commit_err}; physical rename was rolled back"),
+                Err(rollback_err) => {
+                    format!("{commit_err}; physical rename rollback failed: {rollback_err}")
+                }
+            });
+        }
     }
+    let mut renames = context
+        .file_renames
+        .lock()
+        .map_err(|_| "renames lock failed".to_string())?;
+    renames.insert(file_index, new_name.to_string());
+    drop(renames);
+    drop(storage);
+    context.resume_save_requested.store(true, Ordering::SeqCst);
+    let display_path = renamed_display_path(&spans[file_index].path, new_name);
+    update_ui(ui_state, |state| {
+        if state.current_id == Some(torrent_id) {
+            if let Some(file) = state.files.get_mut(file_index) {
+                file.path = display_path.clone();
+            }
+        }
+        update_torrent_entry(state, torrent_id, |torrent| {
+            if let Some(file) = torrent.files.get_mut(file_index) {
+                file.path = display_path.clone();
+            }
+        });
+    });
     Ok(())
 }
 
@@ -11019,6 +17949,7 @@ fn resume_torrent(
     queue: &mut VecDeque<TorrentRequest>,
     torrent_id: u64,
     session_store: &Arc<SessionStore>,
+    in_flight: &InFlightTorrents,
 ) -> Result<(), String> {
     if let Some(context) = find_context_by_id(registry, torrent_id) {
         if context.stop_requested.load(Ordering::SeqCst) {
@@ -11029,11 +17960,16 @@ fn resume_torrent(
 
     let info_hash = info_hash_from_ui(ui_state, torrent_id)
         .ok_or_else(|| "torrent cannot be resumed".to_string())?;
-    if queue_contains_info_hash(queue, info_hash) {
+    let already_loading = lock_or_recover(in_flight).contains_key(&info_hash);
+    if queue_contains_info_hash(queue, info_hash) || already_loading {
         update_ui(ui_state, |state| {
             update_torrent_entry(state, torrent_id, |torrent| {
                 torrent.paused = false;
-                torrent.status = "queued".to_string();
+                torrent.status = if already_loading {
+                    "loading".to_string()
+                } else {
+                    "queued".to_string()
+                };
                 torrent.download_rate_bps = 0.0;
                 torrent.upload_rate_bps = 0.0;
                 torrent.active_peers = 0;
@@ -11041,7 +17977,11 @@ fn resume_torrent(
                 torrent.last_error.clear();
             });
             if state.current_id == Some(torrent_id) {
-                state.status = "queued".to_string();
+                state.status = if already_loading {
+                    "loading".to_string()
+                } else {
+                    "queued".to_string()
+                };
                 state.paused = false;
                 state.download_rate_bps = 0.0;
                 state.upload_rate_bps = 0.0;
@@ -11056,6 +17996,9 @@ fn resume_torrent(
     let entry = session_store.get(info_hash).ok_or_else(|| {
         "torrent cannot be resumed because its session metadata is unavailable".to_string()
     })?;
+    if entry.pending_delete {
+        return Err("torrent deletion is pending; retry deletion instead".to_string());
+    }
     let label = session_entry_label(&entry);
     let request = TorrentRequest {
         id: torrent_id,
@@ -11092,9 +18035,20 @@ fn stop_torrent(
     queue: &mut VecDeque<TorrentRequest>,
     torrent_id: u64,
     _session_store: &Arc<SessionStore>,
+    in_flight: &InFlightTorrents,
 ) -> Result<(), String> {
     if let Some(context) = find_context_by_id(registry, torrent_id) {
+        if context.teardown_failed.load(Ordering::Acquire) {
+            cancel_peer_connections(&context.peer_cancellations);
+            return Err(
+                "torrent teardown previously timed out; restart before retrying".to_string(),
+            );
+        }
+        context
+            .allow_completion_reentry
+            .store(false, Ordering::SeqCst);
         if context.stop_requested.load(Ordering::SeqCst) {
+            cancel_peer_connections(&context.peer_cancellations);
             update_ui(ui_state, |state| {
                 update_torrent_entry(state, torrent_id, |torrent| {
                     torrent.status = "stopping".to_string();
@@ -11116,6 +18070,7 @@ fn stop_torrent(
             return Ok(());
         }
         context.stop_requested.store(true, Ordering::SeqCst);
+        cancel_peer_connections(&context.peer_cancellations);
         update_ui(ui_state, |state| {
             update_torrent_entry(state, torrent_id, |torrent| {
                 torrent.status = "stopping".to_string();
@@ -11135,6 +18090,13 @@ fn stop_torrent(
             }
         });
         return Ok(());
+    }
+
+    if lock_or_recover(in_flight)
+        .values()
+        .any(|loading_id| *loading_id == torrent_id)
+    {
+        return Err("torrent is still loading; try again in a moment".to_string());
     }
 
     let mut removed = false;
@@ -11178,121 +18140,31 @@ fn archive_torrent(
     queue: &mut VecDeque<TorrentRequest>,
     torrent_id: u64,
     session_store: &Arc<SessionStore>,
+    in_flight: &InFlightTorrents,
 ) -> Result<(), String> {
-    delete_torrent(registry, ui_state, queue, torrent_id, false, session_store)
+    delete_torrent(
+        registry,
+        ui_state,
+        queue,
+        torrent_id,
+        false,
+        session_store,
+        in_flight,
+    )
 }
 
-fn delete_torrent(
-    registry: &SessionRegistry,
+fn remove_torrent_ui(
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
-    queue: &mut VecDeque<TorrentRequest>,
     torrent_id: u64,
-    remove_data: bool,
-    session_store: &Arc<SessionStore>,
-) -> Result<(), String> {
-    let mut delete_dir: Option<PathBuf> = None;
-    let mut delete_files: Vec<String> = Vec::new();
-    if let Some(context) = find_context_by_id(registry, torrent_id) {
-        context.stop_requested.store(true, Ordering::SeqCst);
-        unregister_session(registry, context.info_hash, context.id);
-        session_store.remove(context.info_hash);
-        if remove_data {
-            delete_dir = Some(context.download_dir.clone());
-            delete_files = context
-                .file_spans
-                .iter()
-                .map(|span| span.path.clone())
-                .collect();
-        }
-        update_ui(ui_state, |state| {
-            state.deleted_torrents.insert(torrent_id);
-            state.torrents.retain(|torrent| torrent.id != torrent_id);
-            state.queue_len = queue.len();
-            if state.current_id == Some(torrent_id) {
-                state.current_id = None;
-                state.status = if queue.is_empty() {
-                    "waiting for torrent".to_string()
-                } else {
-                    "queued".to_string()
-                };
-                state.paused = is_paused();
-                state.files.clear();
-                state.total_bytes = 0;
-                state.completed_bytes = 0;
-                state.total_pieces = 0;
-                state.completed_pieces = 0;
-            }
-        });
-        if remove_data {
-            delete_torrent_data(delete_dir.as_ref(), &delete_files);
-        }
-        return Ok(());
-    }
-
-    let mut removed = false;
-    let mut removed_info_hash: Option<[u8; 20]> = None;
-    let mut queued_request: Option<TorrentRequest> = None;
-    queue.retain(|request| {
-        if request.id == torrent_id {
-            removed_info_hash = info_hash_for_source(&request.source).ok();
-            queued_request = Some(request.clone());
-            removed = true;
-            false
-        } else {
-            true
-        }
-    });
-    if removed {
-        if let Some(info_hash) = removed_info_hash {
-            session_store.remove(info_hash);
-        }
-        if remove_data {
-            if let Some(request) = queued_request {
-                if let Ok((dir, files)) = delete_info_from_request(&request) {
-                    delete_torrent_data(Some(&dir), &files);
-                }
-            }
-        }
-        update_ui(ui_state, |state| {
-            state.queue_len = queue.len();
-            state.deleted_torrents.insert(torrent_id);
-            state.torrents.retain(|torrent| torrent.id != torrent_id);
-            if state.current_id == Some(torrent_id) {
-                state.current_id = None;
-                state.status = if queue.is_empty() {
-                    "waiting for torrent".to_string()
-                } else {
-                    "queued".to_string()
-                };
-                state.paused = is_paused();
-                state.files.clear();
-                state.total_bytes = 0;
-                state.completed_bytes = 0;
-                state.total_pieces = 0;
-                state.completed_pieces = 0;
-            }
-        });
-        return Ok(());
-    }
-
-    let ui_info = if remove_data {
-        delete_info_from_ui(ui_state, torrent_id)
-    } else {
-        None
-    };
-    if let Some((dir, files)) = ui_info {
-        delete_torrent_data(Some(&dir), &files);
-    }
-    if let Some(info_hash) = info_hash_from_ui(ui_state, torrent_id) {
-        session_store.remove(info_hash);
-    }
+    queue_len: usize,
+) {
     update_ui(ui_state, |state| {
         state.deleted_torrents.insert(torrent_id);
         state.torrents.retain(|torrent| torrent.id != torrent_id);
-        state.queue_len = queue.len();
+        state.queue_len = queue_len;
         if state.current_id == Some(torrent_id) {
             state.current_id = None;
-            state.status = if queue.is_empty() {
+            state.status = if queue_len == 0 {
                 "waiting for torrent".to_string()
             } else {
                 "queued".to_string()
@@ -11305,33 +18177,273 @@ fn delete_torrent(
             state.completed_pieces = 0;
         }
     });
+}
+
+fn mark_delete_failed_ui(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    error: &str,
+    queue_len: usize,
+) {
+    update_ui(ui_state, |state| {
+        state.queue_len = queue_len;
+        state.last_error = error.to_string();
+        if state.current_id == Some(torrent_id) {
+            state.status = "delete failed".to_string();
+            state.download_rate_bps = 0.0;
+            state.upload_rate_bps = 0.0;
+            state.active_peers = 0;
+        }
+        update_torrent_entry(state, torrent_id, |torrent| {
+            torrent.status = "delete failed".to_string();
+            torrent.last_error = error.to_string();
+            torrent.download_rate_bps = 0.0;
+            torrent.upload_rate_bps = 0.0;
+            torrent.active_peers = 0;
+        });
+    });
+}
+
+fn retain_delete_error<T>(
+    result: Result<T, String>,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    queue_len: usize,
+) -> Result<T, String> {
+    result.inspect_err(|error| {
+        mark_delete_failed_ui(ui_state, torrent_id, error, queue_len);
+    })
+}
+
+fn delete_torrent(
+    registry: &SessionRegistry,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    queue: &mut VecDeque<TorrentRequest>,
+    torrent_id: u64,
+    remove_data: bool,
+    session_store: &Arc<SessionStore>,
+    in_flight: &InFlightTorrents,
+) -> Result<(), String> {
+    let _operation = session_store.lock_operation();
+    if let Some(context) = find_context_by_id(registry, torrent_id) {
+        if context.teardown_failed.load(Ordering::Acquire) {
+            cancel_peer_connections(&context.peer_cancellations);
+            return Err(
+                "torrent teardown previously timed out; restart before retrying".to_string(),
+            );
+        }
+        context
+            .allow_completion_reentry
+            .store(false, Ordering::SeqCst);
+        if remove_data {
+            session_store.begin_delete(context.info_hash)?;
+            context.delete_data_requested.store(true, Ordering::Release);
+            context.stop_requested.store(true, Ordering::SeqCst);
+            cancel_peer_connections(&context.peer_cancellations);
+            update_ui(ui_state, |state| {
+                update_torrent_entry(state, torrent_id, |torrent| {
+                    torrent.status = "deleting".to_string();
+                    torrent.download_rate_bps = 0.0;
+                    torrent.upload_rate_bps = 0.0;
+                });
+            });
+            return Ok(());
+        }
+        let entry = session_store
+            .get(context.info_hash)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if entry.pending_delete {
+            return Err("data deletion is pending; retry delete with data".to_string());
+        }
+        context.archive_requested.store(true, Ordering::Release);
+        context.stop_requested.store(true, Ordering::SeqCst);
+        cancel_peer_connections(&context.peer_cancellations);
+        update_ui(ui_state, |state| {
+            update_torrent_entry(state, torrent_id, |torrent| {
+                torrent.status = "archiving".to_string();
+                torrent.download_rate_bps = 0.0;
+                torrent.upload_rate_bps = 0.0;
+            });
+        });
+        return Ok(());
+    }
+
+    if lock_or_recover(in_flight)
+        .values()
+        .any(|loading_id| *loading_id == torrent_id)
+    {
+        return Err("torrent is still loading; try again in a moment".to_string());
+    }
+
+    if let Some(queue_index) = queue.iter().position(|request| request.id == torrent_id) {
+        let request = queue
+            .get(queue_index)
+            .cloned()
+            .ok_or_else(|| "queued torrent disappeared".to_string())?;
+        let info_hash = info_hash_for_source(&request.source)
+            .map_err(|_| "torrent metadata unavailable for safe deletion".to_string())?;
+        if remove_data {
+            if !session_store.contains(info_hash) {
+                let data = match &request.source {
+                    TorrentSource::Bytes(data) if data.len() <= MAX_TORRENT_BYTES => data.clone(),
+                    TorrentSource::Bytes(_) => return Err("torrent file too large".to_string()),
+                    TorrentSource::Path(path) => {
+                        read_file_limited(Path::new(path), MAX_TORRENT_BYTES, false)
+                            .map_err(|err| format!("read failed: {err}"))?
+                    }
+                    TorrentSource::Magnet(_) => {
+                        return Err("magnet metadata unavailable for safe deletion".to_string())
+                    }
+                };
+                let meta =
+                    torrent::parse_torrent(&data).map_err(|err| format!("parse error: {err}"))?;
+                let legacy_renames = legacy_resume_file_renames(&request.download_dir, info_hash)?;
+                session_store.upsert_with_storage_claim(
+                    info_hash,
+                    String::from_utf8_lossy(&meta.info.name).into_owned(),
+                    data,
+                    &request.download_dir,
+                    request.preallocate,
+                    &legacy_renames,
+                )?;
+            }
+            if let Some(entry) = session_store
+                .get(info_hash)
+                .filter(|entry| entry.file_renames.is_empty())
+            {
+                let legacy_renames = legacy_resume_file_renames(&entry.download_dir, info_hash)?;
+                session_store.import_file_renames_if_empty(info_hash, &legacy_renames)?;
+            }
+            session_store.begin_delete(info_hash)?;
+            let _ = queue.remove(queue_index);
+            let entry = session_store
+                .get(info_hash)
+                .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+            if let Err(err) = delete_session_entry_payload(&entry) {
+                mark_delete_failed_ui(ui_state, torrent_id, &err, queue.len());
+                return Err(err);
+            }
+            if let Err(err) = session_store.remove(info_hash) {
+                mark_delete_failed_ui(ui_state, torrent_id, &err, queue.len());
+                return Err(err);
+            }
+            remove_torrent_ui(ui_state, torrent_id, queue.len());
+            return Ok(());
+        }
+        if let Some(entry) = session_store.get(info_hash) {
+            if entry.pending_delete {
+                return Err("data deletion is pending; retry delete with data".to_string());
+            }
+            session_store.remove(info_hash)?;
+        }
+        let _ = queue.remove(queue_index);
+        remove_torrent_ui(ui_state, torrent_id, queue.len());
+        return Ok(());
+    }
+
+    let info_hash =
+        info_hash_from_ui(ui_state, torrent_id).ok_or_else(|| "unknown torrent".to_string())?;
+    let mut entry = session_store
+        .get(info_hash)
+        .ok_or_else(|| "torrent metadata unavailable; refusing unsafe deletion".to_string())?;
+    if remove_data {
+        if entry.file_renames.is_empty() {
+            let legacy_renames = legacy_resume_file_renames(&entry.download_dir, info_hash)?;
+            session_store.import_file_renames_if_empty(info_hash, &legacy_renames)?;
+        }
+        session_store.begin_delete(info_hash)?;
+        entry = session_store
+            .get(info_hash)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if let Err(err) = delete_session_entry_payload(&entry) {
+            mark_delete_failed_ui(ui_state, torrent_id, &err, queue.len());
+            return Err(err);
+        }
+    } else if entry.pending_delete {
+        return Err("data deletion is pending; retry delete with data".to_string());
+    }
+    if let Err(err) = session_store.remove(info_hash) {
+        mark_delete_failed_ui(ui_state, torrent_id, &err, queue.len());
+        return Err(err);
+    }
+    remove_torrent_ui(ui_state, torrent_id, queue.len());
     Ok(())
 }
 
-fn delete_info_from_request(request: &TorrentRequest) -> Result<(PathBuf, Vec<String>), String> {
+fn delete_info_from_request(
+    request: &TorrentRequest,
+    file_renames: &[(usize, String)],
+) -> Result<([u8; 20], PathBuf, Vec<PathBuf>), String> {
     let data = match &request.source {
-        TorrentSource::Path(path) => fs::read(path).map_err(|err| format!("read failed: {err}"))?,
-        TorrentSource::Bytes(data) => data.clone(),
+        TorrentSource::Path(path) => read_file_limited(Path::new(path), MAX_TORRENT_BYTES, false)
+            .map_err(|err| format!("read failed: {err}"))?,
+        TorrentSource::Bytes(data) if data.len() <= MAX_TORRENT_BYTES => data.clone(),
+        TorrentSource::Bytes(_) => return Err("torrent file too large".to_string()),
         TorrentSource::Magnet(_) => return Err("magnet metadata unavailable".to_string()),
     };
     let meta = torrent::parse_torrent(&data).map_err(|err| format!("parse error: {err}"))?;
-    let spans = build_file_spans(&meta);
-    let files = spans.into_iter().map(|span| span.path).collect();
-    Ok((request.download_dir.clone(), files))
+    let paths = if file_renames.is_empty() {
+        storage::data_paths(&meta, &request.download_dir)
+    } else {
+        storage::data_paths_with_file_renames(&meta, &request.download_dir, file_renames)
+    }
+    .map_err(|err| format!("storage paths: {err}"))?;
+    Ok((meta.info_hash, request.download_dir.clone(), paths))
 }
 
-fn delete_info_from_ui(
-    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
-    torrent_id: u64,
-) -> Option<(PathBuf, Vec<String>)> {
-    let state = ui_state.as_ref()?.lock().ok()?;
-    let torrent = state
-        .torrents
-        .iter()
-        .find(|torrent| torrent.id == torrent_id)?;
-    let dir = PathBuf::from(&torrent.download_dir);
-    let files = torrent.files.iter().map(|file| file.path.clone()).collect();
-    Some((dir, files))
+fn legacy_resume_file_renames(
+    download_dir: &Path,
+    info_hash: [u8; 20],
+) -> Result<Vec<(usize, String)>, String> {
+    let path = resume_path(download_dir, info_hash);
+    let existed = path.exists() || sidecar_path(&path, ".bak").exists();
+    let resume = load_resume_data_with_recovery(&path);
+    if existed && resume.is_none() {
+        return Err("resume metadata unavailable for safe renamed-file deletion".to_string());
+    }
+    match resume {
+        Some(resume) if resume.info_hash == info_hash => Ok(resume.file_renames),
+        Some(_) => Err("resume metadata info hash mismatch".to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn delete_info_from_session_entry(
+    entry: &SessionEntry,
+) -> Result<([u8; 20], PathBuf, Vec<PathBuf>), String> {
+    let request = TorrentRequest {
+        id: 0,
+        source: TorrentSource::Bytes(entry.torrent_bytes.clone()),
+        download_dir: entry.download_dir.clone(),
+        preallocate: entry.preallocate,
+        initial_label: entry.label.clone(),
+    };
+    let info = delete_info_from_request(&request, &entry.file_renames)?;
+    if info.0 != entry.info_hash {
+        return Err("session metadata info hash mismatch".to_string());
+    }
+    Ok(info)
+}
+
+fn delete_session_entry_payload(entry: &SessionEntry) -> Result<(), String> {
+    let (info_hash, download_dir, paths) = delete_info_from_session_entry(entry)?;
+    delete_storage_paths(&download_dir, &paths)?;
+    remove_resume_files(&resume_path(&download_dir, info_hash))
+}
+
+fn retry_pending_delete(session_store: &SessionStore, info_hash: [u8; 20]) -> Result<(), String> {
+    let _operation = session_store.lock_operation();
+    let entry = session_store
+        .get(info_hash)
+        .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+    if !entry.pending_delete {
+        return Err("torrent deletion is not pending".to_string());
+    }
+    delete_session_entry_payload(&entry)?;
+    if !session_store.remove(info_hash)? {
+        return Err("torrent session metadata disappeared during deletion".to_string());
+    }
+    Ok(())
 }
 
 fn info_hash_from_ui(
@@ -11369,38 +18481,723 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn delete_torrent_data(download_dir: Option<&PathBuf>, files: &[String]) {
-    let Some(download_dir) = download_dir else {
-        return;
-    };
-    for file in files {
-        if file.trim().is_empty() {
-            continue;
-        }
-        let rel_path = Path::new(file);
-        if rel_path.is_absolute()
-            || rel_path.components().any(|comp| {
-                matches!(
-                    comp,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            })
-        {
-            log_warn!("delete skipped unsafe path: {file}");
-            continue;
-        }
-        let full_path = download_dir.join(rel_path);
-        if let Err(err) = fs::remove_file(&full_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                log_warn!("delete file failed: {err}");
-            }
-        }
-        cleanup_empty_dirs(&full_path, download_dir);
+fn delete_storage_paths(download_dir: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        delete_storage_paths_unix(download_dir, paths)
+    }
+    #[cfg(windows)]
+    {
+        delete_storage_paths_windows(download_dir, paths)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        delete_storage_paths_portable(download_dir, paths)
     }
 }
 
+#[cfg(unix)]
+fn delete_storage_paths_unix(download_dir: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn component_name(component: &std::path::Component<'_>) -> Result<CString, String> {
+        let std::path::Component::Normal(name) = component else {
+            return Err("unsafe storage path component".to_string());
+        };
+        CString::new(name.as_bytes()).map_err(|_| "storage path contains NUL".to_string())
+    }
+
+    fn open_child_directory(
+        parent: i32,
+        component: &std::path::Component<'_>,
+    ) -> io::Result<OwnedFd> {
+        let name = component_name(component)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        // SAFETY: `parent` is a live directory descriptor and `name` is a
+        // NUL-terminated single path component. O_NOFOLLOW prevents a swapped
+        // intermediate symlink from redirecting the walk.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn unlink_relative(root: &fs::File, relative: &Path, directory: bool) -> io::Result<()> {
+        let components = relative.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsafe storage path",
+            ));
+        }
+        let mut opened = Vec::<OwnedFd>::new();
+        let mut parent_fd = root.as_raw_fd();
+        for component in components.iter().take(components.len() - 1) {
+            let child = open_child_directory(parent_fd, component)?;
+            parent_fd = child.as_raw_fd();
+            opened.push(child);
+        }
+        let last = components
+            .last()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty storage path"))?;
+        let name =
+            component_name(last).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        // SAFETY: the verified parent descriptor remains owned by `root` or
+        // `opened` for the duration of the call. unlinkat does not follow the
+        // final component when removing a file entry.
+        let result = unsafe {
+            libc::unlinkat(
+                parent_fd,
+                name.as_ptr(),
+                if directory { libc::AT_REMOVEDIR } else { 0 },
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    let root_name = CString::new(download_dir.as_os_str().as_bytes())
+        .map_err(|_| "download directory contains NUL".to_string())?;
+    // SAFETY: `root_name` is a valid NUL-terminated path. The returned
+    // descriptor is checked for failure and then owned by `OwnedFd`.
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+        )
+    };
+    if root_fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(format!("open download directory safely: {error}"));
+    }
+    // SAFETY: `open` returned a new owned descriptor.
+    let root_fd = unsafe { fs::File::from_raw_fd(root_fd) };
+    let canonical_root = fs::canonicalize(download_dir)
+        .map_err(|err| format!("resolve download directory: {err}"))?;
+    let resolved_metadata = fs::metadata(&canonical_root)
+        .map_err(|err| format!("inspect resolved download directory: {err}"))?;
+    let opened_metadata = root_fd
+        .metadata()
+        .map_err(|err| format!("inspect open download directory: {err}"))?;
+    use std::os::unix::fs::MetadataExt;
+    if !resolved_metadata.is_dir()
+        || resolved_metadata.dev() != opened_metadata.dev()
+        || resolved_metadata.ino() != opened_metadata.ino()
+    {
+        return Err("download directory changed while opening for deletion".to_string());
+    }
+
+    let mut failures = Vec::new();
+    for full_path in paths {
+        let relative = match full_path.strip_prefix(download_dir) {
+            Ok(relative) => relative,
+            Err(_) => {
+                failures.push(format!(
+                    "path is outside download directory: {}",
+                    full_path.display()
+                ));
+                continue;
+            }
+        };
+        match unlink_relative(&root_fd, relative, false) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                failures.push(format!("remove {}: {err}", full_path.display()));
+                continue;
+            }
+        }
+
+        let mut parent = relative.parent();
+        while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            match unlink_relative(&root_fd, directory, true) {
+                Ok(()) => parent = directory.parent(),
+                Err(_) => break,
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("data deletion failed: {}", failures.join("; ")))
+    }
+}
+
+#[cfg(windows)]
+fn delete_storage_paths_windows(download_dir: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_TRAVERSE: u32 = 0x0000_0020;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_OPEN: u32 = 0x0000_0001;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_file: i32,
+    }
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: RawHandle,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    union IoStatusBlockStatus {
+        status: i32,
+        pointer: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: IoStatusBlockStatus,
+        information: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFinalPathNameByHandleW(
+            file: RawHandle,
+            path: *mut u16,
+            path_len: u32,
+            flags: u32,
+        ) -> u32;
+        fn SetFileInformationByHandle(
+            file: RawHandle,
+            information_class: i32,
+            information: *const std::ffi::c_void,
+            information_len: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut RawHandle,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    fn open_root(path: &Path) -> io::Result<fs::File> {
+        let mut options = fs::OpenOptions::new();
+        options
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+            // Omitting FILE_SHARE_DELETE pins the directory entry while the
+            // operation holds this handle.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+
+    fn open_relative(
+        root: &fs::File,
+        component: &std::ffi::OsStr,
+        delete_access: bool,
+        directory: bool,
+    ) -> io::Result<fs::File> {
+        let mut wide = component.encode_wide().collect::<Vec<_>>();
+        if wide.is_empty() || wide.contains(&0) || wide.len() > (u16::MAX as usize / 2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Windows path component",
+            ));
+        }
+        let byte_length = (wide.len() * 2) as u16;
+        let mut name = UnicodeString {
+            length: byte_length,
+            maximum_length: byte_length,
+            buffer: wide.as_mut_ptr(),
+        };
+        let mut attributes = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: root.as_raw_handle(),
+            object_name: &mut name,
+            // Deliberately omit OBJ_CASE_INSENSITIVE. This fails closed in a
+            // case-sensitive Windows directory instead of opening an alias.
+            attributes: 0,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut io_status = IoStatusBlock {
+            status: IoStatusBlockStatus {
+                pointer: std::ptr::null_mut(),
+            },
+            information: 0,
+        };
+        let mut handle: RawHandle = std::ptr::null_mut();
+        let desired_access = FILE_READ_ATTRIBUTES
+            | if directory { FILE_TRAVERSE } else { 0 }
+            | if delete_access { DELETE } else { 0 };
+        let create_options = FILE_OPEN_FOR_BACKUP_INTENT
+            | FILE_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                FILE_NON_DIRECTORY_FILE
+            };
+        // SAFETY: all native structures use their documented C layout and
+        // remain live for the call. `root` is a live directory handle, the
+        // object name is one validated relative component, and a successful
+        // call returns a new handle owned below by `File`.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                desired_access,
+                &mut attributes,
+                &mut io_status,
+                std::ptr::null_mut(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_OPEN,
+                create_options,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: translating an NTSTATUS has no preconditions.
+            let error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        if handle.is_null() {
+            return Err(io::Error::other("Windows returned an empty file handle"));
+        }
+        // SAFETY: NtCreateFile succeeded and transferred ownership of this
+        // newly-created handle to the caller.
+        Ok(unsafe { fs::File::from_raw_handle(handle) })
+    }
+
+    fn final_path(file: &fs::File) -> io::Result<Vec<u16>> {
+        let mut capacity = 512usize;
+        loop {
+            if capacity > 65_536 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "resolved Windows path is unreasonably long",
+                ));
+            }
+            let mut buffer = vec![0u16; capacity];
+            // SAFETY: `file` owns a live Windows handle and `buffer` provides
+            // the writable capacity reported to the operating system.
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    0,
+                )
+            };
+            if length == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (length as usize) < buffer.len() {
+                buffer.truncate(length as usize);
+                return Ok(buffer);
+            }
+            capacity = (length as usize).saturating_add(1);
+        }
+    }
+
+    fn open_verified(
+        root: &fs::File,
+        relative: &Path,
+        expected: &Path,
+        delete_access: bool,
+        directory: bool,
+    ) -> io::Result<(fs::File, Vec<fs::File>)> {
+        let components = relative.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsafe storage path",
+            ));
+        }
+
+        // Walk from the pinned root one component at a time and retain every
+        // directory handle. Relative native opens bind the walk to the root
+        // handle even if an ancestor's textual path is concurrently moved;
+        // omitting FILE_SHARE_DELETE prevents each opened entry being swapped.
+        let mut opened = Vec::<fs::File>::new();
+        for component in components.iter().take(components.len() - 1) {
+            let name = match component {
+                std::path::Component::Normal(name) => name,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unsafe storage path component",
+                    ));
+                }
+            };
+            let parent = opened.last().unwrap_or(root);
+            let child = open_relative(parent, name, false, true)?;
+            let metadata = child.metadata()?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "path traverses a filesystem reparse point",
+                ));
+            }
+            opened.push(child);
+        }
+        let last = components
+            .last()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty storage path"))?;
+        let name = match last {
+            std::path::Component::Normal(name) => name,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsafe storage path component",
+                ));
+            }
+        };
+        let parent = opened.last().unwrap_or(root);
+        let file = open_relative(parent, name, delete_access, directory)?;
+        let resolved = final_path(&file)?;
+        let expected_wide = expected.as_os_str().encode_wide().collect::<Vec<_>>();
+        // Exact comparison intentionally fails closed for Windows directories
+        // with case-sensitive semantics. Files created by rustorrent retain
+        // the metainfo spelling, so normal payloads have identical paths.
+        if resolved != expected_wide {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "path was redirected through a filesystem reparse point",
+            ));
+        }
+        Ok((file, opened))
+    }
+
+    fn mark_delete(file: &fs::File) -> io::Result<()> {
+        let information = FileDispositionInfo { delete_file: 1 };
+        // SAFETY: the handle was opened with DELETE access and `information`
+        // has the exact layout required for FileDispositionInfo.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_DISPOSITION_INFO_CLASS,
+                (&information as *const FileDispositionInfo).cast(),
+                std::mem::size_of::<FileDispositionInfo>() as u32,
+            )
+        };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    let canonical_root = match fs::canonicalize(download_dir) {
+        Ok(root) => root,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("resolve download directory: {err}")),
+    };
+    // Do not share delete access for the root handle. Keeping it open pins the
+    // security boundary while descendants are opened and removed.
+    let root_handle = open_root(&canonical_root)
+        .map_err(|err| format!("open download directory safely: {err}"))?;
+    let root_metadata = root_handle
+        .metadata()
+        .map_err(|err| format!("inspect download directory: {err}"))?;
+    if !root_metadata.is_dir()
+        || root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err("download directory is not a real directory".to_string());
+    }
+    let root_wide = final_path(&root_handle)
+        .map_err(|err| format!("resolve open download directory: {err}"))?;
+    let canonical_root_wide = canonical_root.as_os_str().encode_wide().collect::<Vec<_>>();
+    if root_wide != canonical_root_wide {
+        return Err("download directory changed while opening it".to_string());
+    }
+    let root_path = PathBuf::from(std::ffi::OsString::from_wide(&root_wide));
+
+    let mut failures = Vec::new();
+    for full_path in paths {
+        let relative = match full_path.strip_prefix(download_dir) {
+            Ok(relative) => relative,
+            Err(_) => {
+                failures.push(format!(
+                    "path is outside download directory: {}",
+                    full_path.display()
+                ));
+                continue;
+            }
+        };
+        let components = relative.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            failures.push(format!("unsafe storage path: {}", full_path.display()));
+            continue;
+        }
+
+        let mut expected = root_path.clone();
+        for component in &components {
+            expected.push(component.as_os_str());
+        }
+        let (file, opened_parents) =
+            match open_verified(&root_handle, relative, &expected, true, false) {
+                Ok(opened) => opened,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    failures.push(format!("open {} safely: {err}", full_path.display()));
+                    continue;
+                }
+            };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                failures.push(format!("inspect {}: {err}", full_path.display()));
+                continue;
+            }
+        };
+        if metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            failures.push(format!(
+                "refusing to remove a directory or reparse point as torrent data: {}",
+                full_path.display()
+            ));
+            continue;
+        }
+        if let Err(err) = mark_delete(&file) {
+            failures.push(format!("remove {}: {err}", full_path.display()));
+            continue;
+        }
+        drop(file);
+        drop(opened_parents);
+
+        // Empty-parent cleanup is best-effort, as on Unix. Each directory is
+        // independently opened without following its final reparse point and
+        // must resolve to its exact lexical location beneath the pinned root.
+        let mut parent = relative.parent();
+        while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            let expected = root_path.join(directory);
+            let (directory_handle, opened_parents) =
+                match open_verified(&root_handle, directory, &expected, true, true) {
+                    Ok(opened) => opened,
+                    Err(_) => break,
+                };
+            let metadata = match directory_handle.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => break,
+            };
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                break;
+            }
+            if mark_delete(&directory_handle).is_err() {
+                break;
+            }
+            drop(directory_handle);
+            drop(opened_parents);
+            parent = directory.parent();
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("data deletion failed: {}", failures.join("; ")))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn delete_storage_paths_portable(download_dir: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for full_path in paths {
+        let rel_path = match full_path.strip_prefix(download_dir) {
+            Ok(path) => path,
+            Err(_) => {
+                failures.push(format!(
+                    "path is outside download directory: {}",
+                    full_path.display()
+                ));
+                continue;
+            }
+        };
+        let components = rel_path.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            failures.push(format!("unsafe storage path: {}", full_path.display()));
+            continue;
+        }
+        let mut parent = download_dir.to_path_buf();
+        let mut unsafe_parent = false;
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(component.as_os_str());
+            match fs::symlink_metadata(&parent) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    unsafe_parent = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+                Err(_) => {
+                    unsafe_parent = true;
+                    break;
+                }
+            }
+        }
+        if unsafe_parent {
+            failures.push(format!(
+                "path traverses an unsafe parent: {}",
+                full_path.display()
+            ));
+            continue;
+        }
+        if let Err(err) = fs::remove_file(full_path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                failures.push(format!("remove {}: {err}", full_path.display()));
+                continue;
+            }
+        }
+        cleanup_empty_dirs(full_path, download_dir);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("data deletion failed: {}", failures.join("; ")))
+    }
+}
+
+fn remove_resume_files(path: &Path) -> Result<(), String> {
+    #[cfg(any(unix, windows))]
+    if state_dir::is_state_file_path(path) {
+        return state_dir::remove_resume_artifacts(path)
+            .map_err(|err| format!("resume deletion failed: {err}"));
+    }
+    let mut failures = Vec::new();
+    for candidate in [
+        path.to_path_buf(),
+        sidecar_path(path, ".bak"),
+        sidecar_path(path, ".tmp"),
+    ] {
+        if let Err(err) = fs::remove_file(&candidate) {
+            if err.kind() != io::ErrorKind::NotFound {
+                failures.push(format!("remove {}: {err}", candidate.display()));
+            }
+        }
+    }
+    let Some(parent) = path.parent() else {
+        return if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("resume deletion failed: {}", failures.join("; ")))
+        };
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("resume deletion failed: {}", failures.join("; ")))
+        };
+    };
+    let tmp_prefix = format!("{file_name}.tmp.");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("resume deletion failed: {}", failures.join("; ")))
+            };
+        }
+        Err(err) => {
+            failures.push(format!("read resume directory {}: {err}", parent.display()));
+            return Err(format!("resume deletion failed: {}", failures.join("; ")));
+        }
+    };
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.file_name().to_string_lossy().starts_with(&tmp_prefix) => {
+                if let Err(err) = fs::remove_file(entry.path()) {
+                    if err.kind() != io::ErrorKind::NotFound {
+                        failures.push(format!("remove {}: {err}", entry.path().display()));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(err) => failures.push(format!("read resume directory entry: {err}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("resume deletion failed: {}", failures.join("; ")))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn cleanup_empty_dirs(path: &Path, root: &Path) {
     let mut current = path.parent();
     while let Some(dir) = current {
@@ -11418,11 +19215,15 @@ fn cleanup_empty_dirs(path: &Path, root: &Path) {
 
 fn info_hash_for_source(source: &TorrentSource) -> Result<[u8; 20], String> {
     match source {
-        TorrentSource::Bytes(data) => torrent::parse_torrent(data)
-            .map(|meta| meta.info_hash)
-            .map_err(|err| format!("parse error: {err}")),
+        TorrentSource::Bytes(data) if data.len() <= MAX_TORRENT_BYTES => {
+            torrent::parse_torrent(data)
+                .map(|meta| meta.info_hash)
+                .map_err(|err| format!("parse error: {err}"))
+        }
+        TorrentSource::Bytes(_) => Err("torrent file too large".to_string()),
         TorrentSource::Path(path) => {
-            let data = fs::read(path).map_err(|err| format!("read failed: {err}"))?;
+            let data = read_file_limited(Path::new(path), MAX_TORRENT_BYTES, false)
+                .map_err(|err| format!("read failed: {err}"))?;
             torrent::parse_torrent(&data)
                 .map(|meta| meta.info_hash)
                 .map_err(|err| format!("parse error: {err}"))
@@ -11431,6 +19232,16 @@ fn info_hash_for_source(source: &TorrentSource) -> Result<[u8; 20], String> {
             .map(|meta| meta.info_hash)
             .map_err(|err| format!("magnet parse error: {err}")),
     }
+}
+
+fn freeze_request_source(request: &mut TorrentRequest) -> Result<[u8; 20], String> {
+    let TorrentSource::Path(path) = &request.source else {
+        return info_hash_for_source(&request.source);
+    };
+    let data = read_file_limited(Path::new(path), MAX_TORRENT_BYTES, false)
+        .map_err(|err| format!("read failed: {err}"))?;
+    request.source = TorrentSource::Bytes(data);
+    info_hash_for_source(&request.source)
 }
 
 struct ProgressStats {
@@ -11475,11 +19286,11 @@ impl ProgressStats {
             }
         }
         if self.snapshots.len() >= 2 {
-            let first = self.snapshots.front().unwrap();
-            let last = self.snapshots.back().unwrap();
-            let elapsed = last.1.duration_since(first.1).as_secs_f64();
-            if elapsed >= 0.1 {
-                self.speed_bps = last.0.saturating_sub(first.0) as f64 / elapsed;
+            if let (Some(first), Some(last)) = (self.snapshots.front(), self.snapshots.back()) {
+                let elapsed = last.1.duration_since(first.1).as_secs_f64();
+                if elapsed >= 0.1 {
+                    self.speed_bps = last.0.saturating_sub(first.0) as f64 / elapsed;
+                }
             }
         }
     }
@@ -11530,86 +19341,91 @@ impl ProgressStats {
 fn start_console_progress(
     state: Arc<Mutex<ui::UiState>>,
     registry: SessionRegistry,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut download_stats = ProgressStats::new();
-        let mut upload_stats = ProgressStats::new();
-        PROGRESS_ACTIVE.store(true, Ordering::SeqCst);
-        loop {
-            if shutdown_requested() {
-                break;
-            }
-            let (mut snapshot, current_id) = match state.lock() {
-                Ok(guard) => (
-                    ProgressSnapshot {
-                        downloaded_bytes: 0,
-                        completed_bytes: guard.completed_bytes,
-                        total_bytes: guard.total_bytes,
-                        active_peers: guard.active_peers,
-                        tracker_peers: guard.tracker_peers,
-                        status: guard.status.clone(),
-                    },
-                    guard.current_id,
-                ),
-                Err(_) => (ProgressSnapshot::default(), None),
-            };
-            let (downloaded_bytes, uploaded_bytes) = current_id
-                .and_then(|id| find_context_by_id(&registry, id))
-                .map(|ctx| {
-                    (
-                        ctx.downloaded.load(Ordering::SeqCst),
-                        ctx.uploaded.load(Ordering::SeqCst),
-                    )
-                })
-                .unwrap_or((0, 0));
-            snapshot.downloaded_bytes = downloaded_bytes;
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("console-progress".to_string())
+        .spawn(move || {
+            let mut download_stats = ProgressStats::new();
+            let mut upload_stats = ProgressStats::new();
+            PROGRESS_ACTIVE.store(true, Ordering::SeqCst);
+            loop {
+                if shutdown_requested() {
+                    break;
+                }
+                let (mut snapshot, current_id) = match state.lock() {
+                    Ok(guard) => (
+                        ProgressSnapshot {
+                            downloaded_bytes: 0,
+                            completed_bytes: guard.completed_bytes,
+                            total_bytes: guard.total_bytes,
+                            active_peers: guard.active_peers,
+                            tracker_peers: guard.tracker_peers,
+                            status: guard.status.clone(),
+                        },
+                        guard.current_id,
+                    ),
+                    Err(_) => (ProgressSnapshot::default(), None),
+                };
+                let (downloaded_bytes, uploaded_bytes) = current_id
+                    .and_then(|id| find_context_by_id(&registry, id))
+                    .map(|ctx| {
+                        (
+                            ctx.downloaded.load(Ordering::SeqCst),
+                            ctx.uploaded.load(Ordering::SeqCst),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                snapshot.downloaded_bytes = downloaded_bytes;
 
-            let (mut line, _speed_bps, eta_secs) = download_stats.render_line(&snapshot);
-            upload_stats.update_speed(uploaded_bytes);
-            let _upload_speed = upload_stats.current_speed();
-            if line.len() < download_stats.last_line_len {
-                line.push_str(&" ".repeat(download_stats.last_line_len - line.len()));
-            }
-            download_stats.last_line_len = line.len();
-            PROGRESS_LINE_LEN.store(download_stats.last_line_len, Ordering::SeqCst);
-            let _guard = LOG_LOCK.lock().ok();
-            eprint!("\r{line}");
-            let _ = io::stderr().flush();
+                let (mut line, _speed_bps, eta_secs) = download_stats.render_line(&snapshot);
+                upload_stats.update_speed(uploaded_bytes);
+                let _upload_speed = upload_stats.current_speed();
+                if line.len() < download_stats.last_line_len {
+                    line.push_str(&" ".repeat(download_stats.last_line_len - line.len()));
+                }
+                download_stats.last_line_len = line.len();
+                PROGRESS_LINE_LEN.store(download_stats.last_line_len, Ordering::SeqCst);
+                let _guard = LOG_LOCK.lock().ok();
+                eprint!("\r{line}");
+                let _ = io::stderr().flush();
 
-            let metrics = storage::metrics_snapshot();
-            let read_ms = if metrics.read_ops > 0 {
-                metrics.read_ns as f64 / metrics.read_ops as f64 / 1_000_000.0
-            } else {
-                0.0
-            };
-            let write_ms = if metrics.write_ops > 0 {
-                metrics.write_ns as f64 / metrics.write_ops as f64 / 1_000_000.0
-            } else {
-                0.0
-            };
-            if let Ok(mut guard) = state.lock() {
-                let (session_download_rate, session_upload_rate) = aggregate_session_rates(&guard);
-                guard.download_rate_bps = session_download_rate;
-                guard.upload_rate_bps = session_upload_rate;
-                guard.eta_secs = eta_secs;
-                guard.paused = is_paused();
-                guard.downloaded_bytes = downloaded_bytes;
-                guard.uploaded_bytes = uploaded_bytes;
-                guard.session_downloaded_bytes = SESSION_DOWNLOADED_BYTES.load(Ordering::SeqCst);
-                guard.session_uploaded_bytes = SESSION_UPLOADED_BYTES.load(Ordering::SeqCst);
-                guard.peer_connected = PEER_CONNECTED.load(Ordering::SeqCst);
-                guard.peer_disconnected = PEER_DISCONNECTED.load(Ordering::SeqCst);
-                guard.disk_read_ms_avg = read_ms;
-                guard.disk_write_ms_avg = write_ms;
-                push_speed_sample(&mut guard.download_history_bps, session_download_rate);
-                push_speed_sample(&mut guard.upload_history_bps, session_upload_rate);
-            }
+                let metrics = storage::metrics_snapshot();
+                let read_ms = if metrics.read_ops > 0 {
+                    metrics.read_ns as f64 / metrics.read_ops as f64 / 1_000_000.0
+                } else {
+                    0.0
+                };
+                let write_ms = if metrics.write_ops > 0 {
+                    metrics.write_ns as f64 / metrics.write_ops as f64 / 1_000_000.0
+                } else {
+                    0.0
+                };
+                if let Ok(mut guard) = state.lock() {
+                    let (session_download_rate, session_upload_rate) =
+                        aggregate_session_rates(&guard);
+                    guard.download_rate_bps = session_download_rate;
+                    guard.upload_rate_bps = session_upload_rate;
+                    guard.eta_secs = eta_secs;
+                    guard.paused = is_paused();
+                    guard.downloaded_bytes = downloaded_bytes;
+                    guard.uploaded_bytes = uploaded_bytes;
+                    guard.session_downloaded_bytes =
+                        SESSION_DOWNLOADED_BYTES.load(Ordering::SeqCst);
+                    guard.session_uploaded_bytes = SESSION_UPLOADED_BYTES.load(Ordering::SeqCst);
+                    guard.peer_connected = PEER_CONNECTED.load(Ordering::SeqCst);
+                    guard.peer_disconnected = PEER_DISCONNECTED.load(Ordering::SeqCst);
+                    guard.disk_read_ms_avg = read_ms;
+                    guard.disk_write_ms_avg = write_ms;
+                    push_speed_sample(&mut guard.download_history_bps, session_download_rate);
+                    push_speed_sample(&mut guard.upload_history_bps, session_upload_rate);
+                }
 
-            sleep_with_shutdown(Duration::from_secs(1));
-        }
-        PROGRESS_ACTIVE.store(false, Ordering::SeqCst);
-        eprintln!();
-    })
+                sleep_with_shutdown(Duration::from_secs(1));
+            }
+            PROGRESS_ACTIVE.store(false, Ordering::SeqCst);
+            eprintln!();
+        })
+        .map_err(|err| format!("console progress worker could not start: {err}"))
 }
 
 fn human_bytes(value: u64) -> String {
@@ -11660,70 +19476,566 @@ fn format_eta(secs: f64) -> String {
     }
 }
 
-fn move_completed_files(meta: &torrent::TorrentMeta, src_dir: &Path, dest_dir: &Path) {
-    if let Err(err) = fs::create_dir_all(dest_dir) {
-        log_warn!(
-            "move-completed: failed to create {}: {err}",
-            dest_dir.display()
-        );
-        return;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedMove {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+fn single_file_source_override(
+    meta: &torrent::TorrentMeta,
+    src_dir: &Path,
+    file_renames: &[(usize, String)],
+) -> Result<Option<PathBuf>, String> {
+    if meta.info.length.is_none() || !file_renames.iter().any(|(index, _)| *index == 0) {
+        return Ok(None);
     }
-    let name = String::from_utf8_lossy(&meta.info.name);
-    let src_path = src_dir.join(name.as_ref());
-    let dest_path = dest_dir.join(name.as_ref());
-    if src_path == dest_path {
-        return;
-    }
-    match fs::rename(&src_path, &dest_path) {
-        Ok(()) => {
-            log_info!(
-                "moved completed: {} -> {}",
-                src_path.display(),
-                dest_path.display()
-            );
+    let paths = storage::data_paths_with_file_renames(meta, src_dir, file_renames)
+        .map_err(|err| format!("renamed completion source: {err}"))?;
+    paths
+        .into_iter()
+        .next()
+        .map(Some)
+        .ok_or_else(|| "single-file torrent has no storage path".to_string())
+}
+
+fn inspect_regular_path(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!("unsafe non-regular path: {}", path.display()));
+            }
+            Ok(Some(metadata))
         }
-        Err(_) => {
-            // Cross-device: try copy + delete
-            if src_path.is_dir() {
-                if let Err(err) = copy_dir_recursive(&src_path, &dest_path) {
-                    log_warn!("move-completed copy failed: {err}");
-                    return;
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("inspect {}: {err}", path.display())),
+    }
+}
+
+fn reconcile_pending_file_rename(
+    meta: &torrent::TorrentMeta,
+    download_dir: &Path,
+    session_store: &SessionStore,
+    entry: &SessionEntry,
+) -> Result<Vec<(usize, String)>, String> {
+    let Some(pending) = entry.pending_file_rename.as_ref() else {
+        return Ok(entry.file_renames.clone());
+    };
+    let paths = if entry.file_renames.is_empty() {
+        storage::data_paths(meta, download_dir)
+    } else {
+        storage::data_paths_with_file_renames(meta, download_dir, &entry.file_renames)
+    }
+    .map_err(|err| format!("rename storage paths: {err}"))?;
+    let old_path = paths
+        .get(pending.index)
+        .cloned()
+        .ok_or_else(|| "pending file rename index is out of range".to_string())?;
+    let new_path = old_path.with_file_name(&pending.target);
+    let mut prospective = entry.file_renames.clone();
+    if let Some((_, target)) = prospective
+        .iter_mut()
+        .find(|(index, _)| *index == pending.index)
+    {
+        *target = pending.target.clone();
+    } else {
+        prospective.push((pending.index, pending.target.clone()));
+    }
+    storage::data_paths_with_file_renames(meta, download_dir, &prospective)
+        .map_err(|err| format!("pending rename validation failed: {err}"))?;
+    if new_path == old_path {
+        if !session_store.commit_file_rename(entry.info_hash, pending)? {
+            return Err("pending file rename changed during commit".to_string());
+        }
+        return session_store
+            .get(entry.info_hash)
+            .map(|entry| entry.file_renames)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string());
+    }
+    let old_exists = inspect_regular_path(&old_path)?.is_some();
+    let new_exists = inspect_regular_path(&new_path)?.is_some();
+    match (old_exists, new_exists) {
+        (true, false) => {
+            rename_path_no_overwrite(&old_path, &new_path, false).map_err(|err| {
+                format!(
+                    "resume pending rename {} to {}: {err}",
+                    old_path.display(),
+                    new_path.display()
+                )
+            })?;
+            match session_store.commit_file_rename(entry.info_hash, pending) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = rename_path_no_overwrite(&new_path, &old_path, false);
+                    return Err("pending file rename changed during commit".to_string());
                 }
-                let _ = fs::remove_dir_all(&src_path);
-            } else {
-                match fs::copy(&src_path, &dest_path) {
-                    Ok(_) => {
-                        let _ = fs::remove_file(&src_path);
-                    }
-                    Err(err) => {
-                        log_warn!("move-completed copy failed: {err}");
-                        return;
-                    }
+                Err(err) => {
+                    let rollback = rename_path_no_overwrite(&new_path, &old_path, false);
+                    return Err(match rollback {
+                        Ok(()) => format!("{err}; physical rename was rolled back"),
+                        Err(rollback_err) => {
+                            format!("{err}; physical rename rollback failed: {rollback_err}")
+                        }
+                    });
                 }
             }
-            log_info!(
-                "moved completed: {} -> {}",
-                src_path.display(),
+        }
+        (false, true) => {
+            if !session_store.commit_file_rename(entry.info_hash, pending)? {
+                return Err("pending file rename changed during recovery".to_string());
+            }
+        }
+        (true, true) => return Err("both old and new pending file rename paths exist".to_string()),
+        (false, false) => {
+            return Err("neither old nor new pending file rename path exists".to_string())
+        }
+    }
+    session_store
+        .get(entry.info_hash)
+        .map(|entry| entry.file_renames)
+        .ok_or_else(|| "torrent session metadata is unavailable".to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionMoveRecovery {
+    RetryMove,
+    AdoptDestination { remove_source: bool },
+}
+
+fn safe_payload_root_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+                return Err(format!("unsafe payload root: {}", path.display()));
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("inspect payload root {}: {err}", path.display())),
+    }
+}
+
+fn verify_existing_payload(
+    meta: &torrent::TorrentMeta,
+    download_dir: &Path,
+    file_renames: &[(usize, String)],
+) -> Result<bool, String> {
+    let mut storage =
+        storage::Storage::open_existing_with_file_renames(meta, download_dir, file_renames)
+            .map_err(|err| format!("open completion destination: {err}"))?;
+    let mut pieces = piece::PieceManager::new(meta)
+        .map_err(|err| format!("completion verification pieces: {err}"))?;
+    full_recheck(&mut pieces, &mut storage, meta.info.piece_length, None)?;
+    Ok(pieces.is_complete())
+}
+
+fn completion_move_recovery(
+    meta: &torrent::TorrentMeta,
+    destination_dir: &Path,
+    file_renames: &[(usize, String)],
+    completed_move: &CompletedMove,
+) -> Result<CompletionMoveRecovery, String> {
+    if completed_move.source == completed_move.destination {
+        return Ok(CompletionMoveRecovery::RetryMove);
+    }
+    let source_exists = safe_payload_root_exists(&completed_move.source)?;
+    let destination_exists = safe_payload_root_exists(&completed_move.destination)?;
+    if !destination_exists {
+        return if source_exists {
+            Ok(CompletionMoveRecovery::RetryMove)
+        } else {
+            Err("neither completion source nor destination exists".to_string())
+        };
+    }
+    if !verify_existing_payload(meta, destination_dir, file_renames)? {
+        return Err(format!(
+            "completion destination failed payload verification: {}",
+            completed_move.destination.display()
+        ));
+    }
+    Ok(CompletionMoveRecovery::AdoptDestination {
+        remove_source: source_exists,
+    })
+}
+
+fn completed_move_paths(
+    meta: &torrent::TorrentMeta,
+    src_dir: &Path,
+    dest_dir: &Path,
+    source_override: Option<&Path>,
+) -> Result<CompletedMove, String> {
+    let src_path = match source_override {
+        Some(path) if meta.info.length.is_some() => {
+            let relative = path
+                .strip_prefix(src_dir)
+                .map_err(|_| "renamed source is outside the download directory".to_string())?;
+            if relative.components().count() != 1
+                || !relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err("renamed source path is invalid".to_string());
+            }
+            path.to_path_buf()
+        }
+        Some(_) => {
+            return Err("source override is only valid for a single-file torrent".to_string())
+        }
+        None => storage::root_path(meta, src_dir)
+            .map_err(|err| format!("invalid source path: {err}"))?,
+    };
+    let dest_path = if source_override.is_some() {
+        let name = src_path
+            .file_name()
+            .ok_or_else(|| "renamed source has no file name".to_string())?;
+        dest_dir.join(name)
+    } else {
+        storage::root_path(meta, dest_dir)
+            .map_err(|err| format!("invalid destination path: {err}"))?
+    };
+    Ok(CompletedMove {
+        source: src_path,
+        destination: dest_path,
+    })
+}
+
+fn move_completed_files(
+    meta: &torrent::TorrentMeta,
+    src_dir: &Path,
+    dest_dir: &Path,
+    source_override: Option<&Path>,
+) -> Result<Option<CompletedMove>, String> {
+    fs::create_dir_all(dest_dir)
+        .map_err(|err| format!("failed to create destination {}: {err}", dest_dir.display()))?;
+    let completed_move = completed_move_paths(meta, src_dir, dest_dir, source_override)?;
+    if completed_move.source == completed_move.destination {
+        return Ok(None);
+    }
+    move_path_no_overwrite(&completed_move.source, &completed_move.destination)?;
+    log_info!(
+        "moved completed: {} -> {}",
+        completed_move.source.display(),
+        completed_move.destination.display()
+    );
+    Ok(Some(completed_move))
+}
+
+fn move_path_no_overwrite(src_path: &Path, dest_path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(dest_path) {
+        Ok(_) => {
+            return Err(format!(
+                "destination already exists: {}",
                 dest_path.display()
-            );
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "inspect destination {}: {err}",
+                dest_path.display()
+            ));
+        }
+    }
+    let source_meta = fs::symlink_metadata(src_path)
+        .map_err(|err| format!("inspect {}: {err}", src_path.display()))?;
+    if source_meta.file_type().is_symlink() || (!source_meta.is_file() && !source_meta.is_dir()) {
+        return Err(format!(
+            "refusing to move unsafe source {}",
+            src_path.display()
+        ));
+    }
+    match rename_path_no_overwrite(src_path, dest_path, source_meta.is_dir()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(format!(
+            "destination already exists: {}",
+            dest_path.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            // Copy into a sibling staging path, then atomically publish it.
+            // This prevents a failed copy from leaving a partial destination
+            // that a later run could mistake for completed data.
+            let staging = move_staging_path(dest_path)?;
+            let copy_result = if src_path.is_dir() {
+                copy_dir_recursive(src_path, &staging)
+            } else {
+                copy_regular_file(src_path, &staging)
+            };
+            if let Err(err) = copy_result {
+                let _ = remove_path_if_present(&staging);
+                return Err(err);
+            }
+            if let Err(err) = rename_path_no_overwrite(&staging, dest_path, source_meta.is_dir()) {
+                let _ = remove_path_if_present(&staging);
+                return Err(format!("publish copied data: {err}"));
+            }
+            if let Err(err) = remove_path_if_present(src_path) {
+                // Recursive source cleanup can fail after removing only part of
+                // a directory. The published destination is the only known
+                // complete copy at that point, so never delete it as a
+                // rollback. The durable Pending completion journal will verify
+                // and adopt it on recovery, then clean exact source data paths.
+                return Err(format!(
+                    "copied data but failed to remove source: {err}; published destination retained for recovery"
+                ));
+            }
+            Ok(())
+        }
+        Err(err) => Err(format!(
+            "rename {} to {} failed: {err}",
+            src_path.display(),
+            dest_path.display()
+        )),
+    }
+}
+
+/// Atomically moves `source` to an absent `destination` without ever replacing
+/// a directory entry created by another process between validation and publish.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn rename_path_no_overwrite(
+    source: &Path,
+    destination: &Path,
+    source_is_dir: bool,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let source_c = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let destination_c =
+        std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source_c.as_ptr(),
+            libc::AT_FDCWD,
+            destination_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == libc::ENOSYS || code == libc::EINVAL || code == libc::EOPNOTSUPP
+    ) {
+        return rename_path_no_overwrite_fallback(source, destination, source_is_dir);
+    }
+    Err(error)
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) fn rename_path_no_overwrite(
+    source: &Path,
+    destination: &Path,
+    source_is_dir: bool,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let source_c = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let destination_c =
+        std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+    let result =
+        unsafe { libc::renamex_np(source_c.as_ptr(), destination_c.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EINVAL || code == libc::ENOTSUP
+    ) {
+        return rename_path_no_overwrite_fallback(source, destination, source_is_dir);
+    }
+    Err(error)
+}
+
+#[cfg(windows)]
+pub(crate) fn rename_path_no_overwrite(
+    source: &Path,
+    destination: &Path,
+    _source_is_dir: bool,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileW(existing: *const u16, new: *const u16) -> i32;
+    }
+
+    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = wide_path(source)?;
+    let destination = wide_path(destination)?;
+    if unsafe { MoveFileW(source.as_ptr(), destination.as_ptr()) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+pub(crate) fn rename_path_no_overwrite(
+    source: &Path,
+    destination: &Path,
+    source_is_dir: bool,
+) -> io::Result<()> {
+    rename_path_no_overwrite_fallback(source, destination, source_is_dir)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn rename_path_no_overwrite(
+    source: &Path,
+    destination: &Path,
+    source_is_dir: bool,
+) -> io::Result<()> {
+    rename_path_no_overwrite_fallback(source, destination, source_is_dir)
+}
+
+#[cfg(not(windows))]
+fn rename_path_no_overwrite_fallback(
+    source: &Path,
+    destination: &Path,
+    source_is_dir: bool,
+) -> io::Result<()> {
+    if source_is_dir {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace directory moves are unsupported on this filesystem",
+        ));
+    }
+    fs::hard_link(source, destination)?;
+    fs::remove_file(source)
+}
+
+fn rollback_completed_move(completed_move: &CompletedMove) -> Result<(), String> {
+    move_path_no_overwrite(&completed_move.destination, &completed_move.source)?;
+    log_info!(
+        "rolled back completed move: {} -> {}",
+        completed_move.destination.display(),
+        completed_move.source.display()
+    );
+    Ok(())
+}
+
+fn commit_completed_move<F>(completed_move: Option<&CompletedMove>, commit: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match commit() {
+        Ok(()) => Ok(()),
+        Err(commit_err) => {
+            let Some(completed_move) = completed_move else {
+                return Err(commit_err);
+            };
+            match rollback_completed_move(completed_move) {
+                Ok(()) => Err(format!("{commit_err}; completed move was rolled back")),
+                Err(rollback_err) => Err(format!(
+                    "{commit_err}; completed move rollback failed: {rollback_err}"
+                )),
+            }
         }
     }
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
-    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let source_meta = fs::symlink_metadata(src).map_err(|err| err.to_string())?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_dir() {
+        return Err(format!("refusing to copy non-directory {}", src.display()));
+    }
+    fs::create_dir(dest).map_err(|err| err.to_string())?;
     let entries = fs::read_dir(src).map_err(|e| e.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let ft = entry.file_type().map_err(|e| e.to_string())?;
         let dest_path = dest.join(entry.file_name());
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            return Err(format!(
+                "refusing to copy symbolic link {}",
+                entry.path().display()
+            ));
+        } else if ft.is_dir() {
             copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else if ft.is_file() {
+            copy_regular_file(&entry.path(), &dest_path)?;
         } else {
-            fs::copy(entry.path(), &dest_path).map_err(|e| e.to_string())?;
+            return Err(format!("unsupported file type: {}", entry.path().display()));
         }
     }
     Ok(())
+}
+
+fn copy_regular_file(src: &Path, dest: &Path) -> Result<(), String> {
+    let source_meta = fs::symlink_metadata(src).map_err(|err| err.to_string())?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_file() {
+        return Err(format!("refusing to copy non-file {}", src.display()));
+    }
+    let mut input = fs::File::open(src).map_err(|err| err.to_string())?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(|err| err.to_string())?;
+    io::copy(&mut input, &mut output).map_err(|err| err.to_string())?;
+    output.sync_all().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn move_staging_path(dest: &Path) -> Result<PathBuf, String> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| "destination has no parent".to_string())?;
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| "destination has no file name".to_string())?;
+    for attempt in 0..32u64 {
+        let mut staging_name = file_name.to_os_string();
+        staging_name.push(format!(
+            ".rustorrent-moving-{}-{:016x}",
+            std::process::id(),
+            system_entropy_u64().wrapping_add(attempt)
+        ));
+        let candidate = parent.join(staging_name);
+        if fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
+        }
+    }
+    Err("could not allocate a move staging path".to_string())
+}
+
+fn remove_path_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Debug)]
+struct CreateFile {
+    source_path: PathBuf,
+    path_segments: Vec<Vec<u8>>,
+    length: u64,
 }
 
 fn create_torrent(
@@ -11732,50 +20044,69 @@ fn create_torrent(
     output_path: &Path,
     piece_length: u64,
 ) -> Result<(), String> {
-    let name = source_path
-        .file_name()
-        .ok_or("invalid source path")?
-        .to_string_lossy();
-
-    let mut files_data: Vec<(Vec<Vec<u8>>, u64)> = Vec::new();
-    let mut all_data = Vec::new();
-
-    if source_path.is_dir() {
-        collect_files(source_path, &[], &mut files_data)?;
-        files_data.sort_by(|a, b| a.0.cmp(&b.0));
-        for (path_segments, _) in &files_data {
-            let mut full = source_path.to_path_buf();
-            for seg in path_segments {
-                full.push(String::from_utf8_lossy(seg).as_ref());
-            }
-            let data = fs::read(&full).map_err(|e| format!("read {}: {e}", full.display()))?;
-            all_data.extend_from_slice(&data);
-        }
-    } else {
-        let data =
-            fs::read(source_path).map_err(|e| format!("read {}: {e}", source_path.display()))?;
-        all_data = data;
+    if piece_length == 0 || piece_length > u32::MAX as u64 {
+        return Err("piece length must be between 1 and 4294967295 bytes".to_string());
+    }
+    if tracker_url.trim().is_empty() {
+        return Err("missing --tracker URL".to_string());
+    }
+    if !valid_tracker_url(tracker_url) {
+        return Err("tracker URL must be a valid http, https, or udp URL".to_string());
     }
 
-    let total_length = all_data.len() as u64;
+    let source_meta = fs::symlink_metadata(source_path)
+        .map_err(|err| format!("inspect {}: {err}", source_path.display()))?;
+    if source_meta.file_type().is_symlink() {
+        return Err("torrent source must not be a symbolic link".to_string());
+    }
+    if !source_meta.is_file() && !source_meta.is_dir() {
+        return Err("torrent source must be a regular file or directory".to_string());
+    }
+    let source_path = fs::canonicalize(source_path)
+        .map_err(|err| format!("resolve {}: {err}", source_path.display()))?;
+    let resolved_output = resolve_path_for_safety(output_path)?;
+    if resolved_output == source_path {
+        return Err("output path must not overwrite the source".to_string());
+    }
+    if source_meta.is_dir() && resolved_output.starts_with(&source_path) {
+        return Err("torrent output must be outside the source directory".to_string());
+    }
+
+    let name = source_path
+        .file_name()
+        .map(os_str_to_torrent_bytes)
+        .ok_or("invalid source path")?;
+
+    let multi_file = source_meta.is_dir();
+    let mut files_data = Vec::new();
+    if multi_file {
+        collect_files(&source_path, &[], &mut files_data)?;
+        files_data.sort_by(|a, b| a.path_segments.cmp(&b.path_segments));
+    } else {
+        files_data.push(CreateFile {
+            source_path: source_path.clone(),
+            path_segments: Vec::new(),
+            length: source_meta.len(),
+        });
+    }
+
+    let total_length = files_data.iter().try_fold(0u64, |total, file| {
+        total
+            .checked_add(file.length)
+            .ok_or_else(|| "source is too large".to_string())
+    })?;
     if total_length == 0 {
         return Err("empty source".to_string());
     }
-
-    let mut pieces_bytes = Vec::new();
-    let mut offset = 0usize;
-    while offset < all_data.len() {
-        let end = (offset + piece_length as usize).min(all_data.len());
-        let hash = sha1::sha1(&all_data[offset..end]);
-        pieces_bytes.extend_from_slice(&hash);
-        offset = end;
+    if total_length > i64::MAX as u64 || files_data.iter().any(|file| file.length > i64::MAX as u64)
+    {
+        return Err("source is too large for torrent metainfo".to_string());
     }
 
+    let pieces_bytes = hash_create_files(&files_data, piece_length)?;
+
     let mut info_items = vec![
-        (
-            b"name".to_vec(),
-            bencode::Value::Bytes(name.as_bytes().to_vec()),
-        ),
+        (b"name".to_vec(), bencode::Value::Bytes(name)),
         (
             b"piece length".to_vec(),
             bencode::Value::Int(piece_length as i64),
@@ -11783,16 +20114,17 @@ fn create_torrent(
         (b"pieces".to_vec(), bencode::Value::Bytes(pieces_bytes)),
     ];
 
-    if source_path.is_dir() {
+    if multi_file {
         let file_list: Vec<bencode::Value> = files_data
             .iter()
-            .map(|(path_segments, length)| {
-                let path_values: Vec<bencode::Value> = path_segments
+            .map(|file| {
+                let path_values: Vec<bencode::Value> = file
+                    .path_segments
                     .iter()
                     .map(|s| bencode::Value::Bytes(s.clone()))
                     .collect();
                 bencode::Value::Dict(vec![
-                    (b"length".to_vec(), bencode::Value::Int(*length as i64)),
+                    (b"length".to_vec(), bencode::Value::Int(file.length as i64)),
                     (b"path".to_vec(), bencode::Value::List(path_values)),
                 ])
             })
@@ -11818,8 +20150,7 @@ fn create_torrent(
     let torrent = bencode::Value::Dict(torrent_items);
     let encoded = bencode::encode(&torrent);
 
-    fs::write(output_path, &encoded)
-        .map_err(|e| format!("write {}: {e}", output_path.display()))?;
+    write_atomic_file(output_path, &encoded, "torrent", true, false)?;
 
     log_info!(
         "created torrent: {} ({} bytes, {} pieces, info_hash: {})",
@@ -11831,29 +20162,142 @@ fn create_torrent(
     Ok(())
 }
 
-fn collect_files(
-    dir: &Path,
-    prefix: &[Vec<u8>],
-    out: &mut Vec<(Vec<Vec<u8>>, u64)>,
-) -> Result<(), String> {
+fn resolve_path_for_safety(path: &Path) -> Result<PathBuf, String> {
+    let mut cursor = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("resolve output directory: {err}"))?
+            .join(path)
+    };
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match fs::canonicalize(&cursor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    match component.as_os_str() {
+                        value if value == "." => {}
+                        value if value == ".." => {
+                            if !resolved.pop() {
+                                return Err("output path escapes the filesystem root".to_string());
+                            }
+                        }
+                        value => resolved.push(value),
+                    }
+                }
+                return Ok(resolved);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let component = cursor
+                    .file_name()
+                    .ok_or_else(|| format!("resolve output path {}: {err}", path.display()))?;
+                missing.push(component.to_os_string());
+                if !cursor.pop() {
+                    return Err(format!("resolve output path {}: {err}", path.display()));
+                }
+            }
+            Err(err) => {
+                return Err(format!("resolve output path {}: {err}", path.display()));
+            }
+        }
+    }
+}
+
+fn hash_create_files(files: &[CreateFile], piece_length: u64) -> Result<Vec<u8>, String> {
+    let mut pieces = Vec::new();
+    let mut hasher = sha1::Sha1::new();
+    let mut bytes_in_piece = 0u64;
+    let mut read_buffer = [0u8; 64 * 1024];
+
+    for entry in files {
+        let mut file = fs::File::open(&entry.source_path)
+            .map_err(|err| format!("read {}: {err}", entry.source_path.display()))?;
+        let mut file_bytes = 0u64;
+        loop {
+            let read = file
+                .read(&mut read_buffer)
+                .map_err(|err| format!("read {}: {err}", entry.source_path.display()))?;
+            if read == 0 {
+                break;
+            }
+            file_bytes = file_bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| "source changed size while hashing".to_string())?;
+            let mut chunk = &read_buffer[..read];
+            while !chunk.is_empty() {
+                let remaining = piece_length - bytes_in_piece;
+                let take = chunk.len().min(remaining as usize);
+                hasher.update(&chunk[..take]);
+                bytes_in_piece += take as u64;
+                chunk = &chunk[take..];
+                if bytes_in_piece == piece_length {
+                    pieces.extend_from_slice(&hasher.finalize());
+                    hasher = sha1::Sha1::new();
+                    bytes_in_piece = 0;
+                }
+            }
+        }
+        if file_bytes != entry.length {
+            return Err(format!(
+                "source changed size while hashing: {}",
+                entry.source_path.display()
+            ));
+        }
+    }
+    if bytes_in_piece > 0 {
+        pieces.extend_from_slice(&hasher.finalize());
+    }
+    Ok(pieces)
+}
+
+fn collect_files(dir: &Path, prefix: &[Vec<u8>], out: &mut Vec<CreateFile>) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    let mut entries: Vec<_> = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("read_dir {}: {err}", dir.display()))?;
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let ft = entry.file_type().map_err(|e| e.to_string())?;
-        let name_bytes = entry.file_name().to_string_lossy().as_bytes().to_vec();
+        if ft.is_symlink() {
+            return Err(format!(
+                "symbolic links are not supported in torrent sources: {}",
+                entry.path().display()
+            ));
+        }
+        let name_bytes = os_str_to_torrent_bytes(&entry.file_name());
         let mut path_segments = prefix.to_vec();
         path_segments.push(name_bytes);
         if ft.is_dir() {
             collect_files(&entry.path(), &path_segments, out)?;
         } else if ft.is_file() {
             let meta = entry.metadata().map_err(|e| e.to_string())?;
-            out.push((path_segments, meta.len()));
+            out.push(CreateFile {
+                source_path: entry.path(),
+                path_segments,
+                length: meta.len(),
+            });
+        } else {
+            return Err(format!(
+                "unsupported source entry: {}",
+                entry.path().display()
+            ));
         }
     }
     Ok(())
 }
 
+#[cfg(unix)]
+fn os_str_to_torrent_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn os_str_to_torrent_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn scan_watch_dir(
     watch_dir: &Path,
     queue: &mut VecDeque<TorrentRequest>,
@@ -11861,6 +20305,9 @@ fn scan_watch_dir(
     next_id: &mut u64,
     download_dir: &Path,
     preallocate: bool,
+    registry: &SessionRegistry,
+    session_store: &SessionStore,
+    in_flight: &InFlightTorrents,
 ) {
     let entries = match fs::read_dir(watch_dir) {
         Ok(e) => e,
@@ -11876,7 +20323,7 @@ fn scan_watch_dir(
         if ext != Some("torrent") {
             continue;
         }
-        let data = match fs::read(&path) {
+        let data = match read_file_limited(&path, MAX_TORRENT_BYTES, true) {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -11887,12 +20334,21 @@ fn scan_watch_dir(
             preallocate,
             initial_label: String::new(),
         };
-        *next_id = next_id.saturating_add(1);
         let label = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "watch".to_string());
-        enqueue_request_with_label(queue, ui_state, request, label);
+        if enqueue_request_if_new(
+            registry,
+            queue,
+            session_store,
+            in_flight,
+            ui_state,
+            request,
+            Some(label),
+        ) {
+            *next_id = next_id.saturating_add(1);
+        }
         // Move to processed
         let _ = fs::create_dir_all(&processed_dir);
         if let Some(name) = path.file_name() {
@@ -11910,6 +20366,7 @@ struct TuiState {
     confirm_delete: Option<u64>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn tui_terminal_size() -> (u16, u16) {
     #[repr(C)]
     struct Winsize {
@@ -11937,14 +20394,17 @@ fn tui_terminal_size() -> (u16, u16) {
     (ws.ws_row, ws.ws_col)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn tui_terminal_size() -> (u16, u16) {
+    (24, 80)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn tui_set_raw_mode() -> Option<[u8; 128]> {
     #[cfg(target_os = "macos")]
     const TERMIOS_SIZE: usize = 72;
     #[cfg(target_os = "linux")]
     const TERMIOS_SIZE: usize = 60;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    const TERMIOS_SIZE: usize = 72;
-
     extern "C" {
         fn tcgetattr(fd: i32, termios: *mut u8) -> i32;
         fn tcsetattr(fd: i32, action: i32, termios: *const u8) -> i32;
@@ -11961,9 +20421,6 @@ fn tui_set_raw_mode() -> Option<[u8; 128]> {
     const LFLAG_OFFSET: usize = 16;
     #[cfg(target_os = "linux")]
     const LFLAG_OFFSET: usize = 12;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    const LFLAG_OFFSET: usize = 16;
-
     let lflag = u64::from_ne_bytes([
         raw[LFLAG_OFFSET],
         raw[LFLAG_OFFSET + 1],
@@ -11979,9 +20436,6 @@ fn tui_set_raw_mode() -> Option<[u8; 128]> {
     let new_lflag = lflag & !(0x100 | 0x8);
     #[cfg(target_os = "linux")]
     let new_lflag = lflag & !(0x2 | 0x8);
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let new_lflag = lflag & !(0x100 | 0x8);
-
     let bytes = new_lflag.to_ne_bytes();
     raw[LFLAG_OFFSET..LFLAG_OFFSET + 4].copy_from_slice(&bytes);
     // Set VMIN=1, VTIME=0 for non-blocking-ish reads
@@ -12003,6 +20457,12 @@ fn tui_set_raw_mode() -> Option<[u8; 128]> {
     Some(original)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn tui_set_raw_mode() -> Option<[u8; 128]> {
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn tui_restore_mode(original: &[u8; 128]) {
     extern "C" {
         fn tcsetattr(fd: i32, action: i32, termios: *const u8) -> i32;
@@ -12012,6 +20472,10 @@ fn tui_restore_mode(original: &[u8; 128]) {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn tui_restore_mode(_original: &[u8; 128]) {}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn tui_read_key() -> Option<u8> {
     extern "C" {
         fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
@@ -12023,6 +20487,11 @@ fn tui_read_key() -> Option<u8> {
     } else {
         None
     }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn tui_read_key() -> Option<u8> {
+    None
 }
 
 fn tui_read_escape_seq() -> Vec<u8> {
@@ -12103,8 +20572,10 @@ fn tui_status_icon(status: &str, paused: bool) -> &'static str {
 fn start_tui(
     state: Arc<Mutex<ui::UiState>>,
     cmd_tx: mpsc::Sender<ui::UiCommand>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("terminal-ui".to_string())
+        .spawn(move || {
         let original = match tui_set_raw_mode() {
             Some(orig) => orig,
             None => {
@@ -12463,6 +20934,7 @@ fn start_tui(
         }
         tui_restore_mode(&original);
     })
+        .map_err(|err| format!("terminal UI worker could not start: {err}"))
 }
 
 fn strip_ansi_len(s: &str) -> usize {

@@ -16,6 +16,9 @@ pub enum Error {
     InvalidLen,
     TrailingData,
     InvalidDictKey,
+    InvalidDictOrder,
+    DepthLimitExceeded,
+    ValueLimitExceeded,
 }
 
 impl fmt::Display for Error {
@@ -27,6 +30,11 @@ impl fmt::Display for Error {
             Error::InvalidLen => write!(f, "invalid byte string length"),
             Error::TrailingData => write!(f, "trailing data"),
             Error::InvalidDictKey => write!(f, "invalid dict key"),
+            Error::InvalidDictOrder => {
+                write!(f, "dictionary keys are not in strictly increasing order")
+            }
+            Error::DepthLimitExceeded => write!(f, "bencode nesting limit exceeded"),
+            Error::ValueLimitExceeded => write!(f, "bencode value count limit exceeded"),
         }
     }
 }
@@ -88,7 +96,76 @@ pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
+/// Verifies that an in-memory value fits the same depth and value-count
+/// budgets enforced by the decoder. Dictionary keys count as byte-string
+/// values because the decoder accounts for them independently.
+pub fn validate_structure(value: &Value) -> Result<(), Error> {
+    let mut remaining = MAX_VALUES;
+    validate_structure_with_depth(value, 0, &mut remaining)
+}
+
+fn validate_structure_with_depth(
+    value: &Value,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(), Error> {
+    consume_structure_slot(depth, remaining)?;
+    match value {
+        Value::Int(_) | Value::Bytes(_) => Ok(()),
+        Value::List(items) => {
+            for item in items {
+                validate_structure_with_depth(item, depth + 1, remaining)?;
+            }
+            Ok(())
+        }
+        Value::Dict(items) => {
+            for (_, value) in items {
+                consume_structure_slot(depth + 1, remaining)?;
+                validate_structure_with_depth(value, depth + 1, remaining)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn consume_structure_slot(depth: usize, remaining: &mut usize) -> Result<(), Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::DepthLimitExceeded);
+    }
+    if *remaining == 0 {
+        return Err(Error::ValueLimitExceeded);
+    }
+    *remaining -= 1;
+    Ok(())
+}
+
 pub fn parse_value(data: &[u8], pos: usize) -> Result<(Value, usize), Error> {
+    let mut remaining = MAX_VALUES;
+    parse_value_with_depth(data, pos, 0, &mut remaining)
+}
+
+// A malicious metainfo or tracker response can otherwise exhaust the call stack
+// with a few thousand nested lists or dictionaries. This is deliberately much
+// higher than any practical torrent metadata needs.
+const MAX_DEPTH: usize = 512;
+// Small scalar values can otherwise expand a bounded input into millions of
+// heap allocations. The limit is comfortably above legitimate metainfo,
+// tracker, resume, and session structures.
+pub(crate) const MAX_VALUES: usize = 262_144;
+
+fn parse_value_with_depth(
+    data: &[u8],
+    pos: usize,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(Value, usize), Error> {
+    if depth > MAX_DEPTH {
+        return Err(Error::DepthLimitExceeded);
+    }
+    if *remaining == 0 {
+        return Err(Error::ValueLimitExceeded);
+    }
+    *remaining -= 1;
     if pos >= data.len() {
         return Err(Error::UnexpectedEof);
     }
@@ -101,7 +178,7 @@ pub fn parse_value(data: &[u8], pos: usize) -> Result<(Value, usize), Error> {
             let mut items = Vec::new();
             let mut i = pos + 1;
             while i < data.len() && data[i] != b'e' {
-                let (value, next) = parse_value(data, i)?;
+                let (value, next) = parse_value_with_depth(data, i, depth + 1, remaining)?;
                 items.push(value);
                 i = next;
             }
@@ -113,13 +190,21 @@ pub fn parse_value(data: &[u8], pos: usize) -> Result<(Value, usize), Error> {
         b'd' => {
             let mut items = Vec::new();
             let mut i = pos + 1;
+            let mut previous_key: Option<Vec<u8>> = None;
             while i < data.len() && data[i] != b'e' {
-                let (key_value, next) = parse_value(data, i)?;
+                let (key_value, next) = parse_value_with_depth(data, i, depth + 1, remaining)?;
                 let key = match key_value {
                     Value::Bytes(bytes) => bytes,
                     _ => return Err(Error::InvalidDictKey),
                 };
-                let (value, next) = parse_value(data, next)?;
+                if previous_key
+                    .as_ref()
+                    .is_some_and(|previous| previous.as_slice() >= key.as_slice())
+                {
+                    return Err(Error::InvalidDictOrder);
+                }
+                let (value, next) = parse_value_with_depth(data, next, depth + 1, remaining)?;
+                previous_key = Some(key.clone());
                 items.push((key, value));
                 i = next;
             }
@@ -148,9 +233,13 @@ fn parse_int(data: &[u8], pos: usize) -> Result<(i64, usize), Error> {
     if slice.is_empty() {
         return Err(Error::InvalidInt);
     }
-    if (slice.len() > 1 && slice[0] == b'0')
-        || (slice.len() > 1 && slice[0] == b'-' && slice[1] == b'0')
-    {
+    let valid_syntax = match slice {
+        b"0" => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        [b'-', b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    if !valid_syntax {
         return Err(Error::InvalidInt);
     }
     let s = std::str::from_utf8(slice).map_err(|_| Error::InvalidInt)?;
@@ -173,7 +262,7 @@ fn parse_bytes(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), Error> {
     let s = std::str::from_utf8(slice).map_err(|_| Error::InvalidLen)?;
     let len = s.parse::<usize>().map_err(|_| Error::InvalidLen)?;
     let start = i + 1;
-    let end = start + len;
+    let end = start.checked_add(len).ok_or(Error::InvalidLen)?;
     if end > data.len() {
         return Err(Error::UnexpectedEof);
     }
@@ -218,6 +307,83 @@ mod tests {
         assert!(matches!(parse(b"03:abc"), Err(Error::InvalidLen)));
         assert!(matches!(parse(b"i01e"), Err(Error::InvalidInt)));
         assert!(matches!(parse(b"ie"), Err(Error::InvalidInt)));
+        assert!(matches!(parse(b"i+1e"), Err(Error::InvalidInt)));
+
+        let overflowing_end = format!("{}:x", usize::MAX);
+        assert!(matches!(
+            parse(overflowing_end.as_bytes()),
+            Err(Error::InvalidLen)
+        ));
+    }
+
+    #[test]
+    fn rejects_noncanonical_dictionary_order_and_duplicates() {
+        assert!(matches!(
+            parse(b"d1:bi1e1:ai2ee"),
+            Err(Error::InvalidDictOrder)
+        ));
+        assert!(matches!(
+            parse(b"d1:ai1e1:ai2ee"),
+            Err(Error::InvalidDictOrder)
+        ));
+    }
+
+    #[test]
+    fn rejects_excessive_nesting_without_overflowing_the_stack() {
+        let mut data = vec![b'l'; MAX_DEPTH + 2];
+        data.extend(std::iter::repeat_n(b'e', MAX_DEPTH + 2));
+        assert!(matches!(parse(&data), Err(Error::DepthLimitExceeded)));
+    }
+
+    #[test]
+    fn rejects_structures_that_exceed_the_value_budget() {
+        let mut remaining = 2;
+        assert!(matches!(
+            parse_value_with_depth(b"li0ei1ee", 0, 0, &mut remaining),
+            Err(Error::ValueLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn structure_validator_matches_decoder_value_accounting() {
+        let one_pair = Value::Dict(vec![(b"key".to_vec(), Value::Int(0))]);
+        let mut validator_remaining = 2;
+        assert!(matches!(
+            validate_structure_with_depth(&one_pair, 0, &mut validator_remaining),
+            Err(Error::ValueLimitExceeded)
+        ));
+        let mut decoder_remaining = 2;
+        assert!(matches!(
+            parse_value_with_depth(b"d3:keyi0ee", 0, 0, &mut decoder_remaining),
+            Err(Error::ValueLimitExceeded)
+        ));
+
+        let at_limit = Value::List(vec![Value::Int(0); MAX_VALUES - 1]);
+        validate_structure(&at_limit).unwrap();
+        assert!(parse(&encode(&at_limit)).is_ok());
+
+        let over_limit = Value::List(vec![Value::Int(0); MAX_VALUES]);
+        assert!(matches!(
+            validate_structure(&over_limit),
+            Err(Error::ValueLimitExceeded)
+        ));
+        assert!(matches!(
+            parse(&encode(&over_limit)),
+            Err(Error::ValueLimitExceeded)
+        ));
+
+        let mut too_deep = Value::Int(0);
+        for _ in 0..=MAX_DEPTH {
+            too_deep = Value::List(vec![too_deep]);
+        }
+        assert!(matches!(
+            validate_structure(&too_deep),
+            Err(Error::DepthLimitExceeded)
+        ));
+        assert!(matches!(
+            parse(&encode(&too_deep)),
+            Err(Error::DepthLimitExceeded)
+        ));
     }
 
     #[test]

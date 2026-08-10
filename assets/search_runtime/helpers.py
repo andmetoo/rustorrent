@@ -63,6 +63,9 @@ def _getBrowserUserAgent() -> str:
 
 _headers: dict[str, str] = {'User-Agent': _getBrowserUserAgent()}
 _original_socket = socket.socket
+NETWORK_TIMEOUT_SECONDS = 30
+MAX_PAGE_BYTES = 16 * 1024 * 1024
+MAX_TORRENT_BYTES = 10 * 1024 * 1024
 
 
 def _truthy_env(name: str) -> bool:
@@ -133,15 +136,15 @@ def _ssl_context_candidates() -> list[ssl.SSLContext]:
 
 def _urlopen_with_context_fallback(request: urllib.request.Request, ssl_context: Optional[ssl.SSLContext]):
     if ssl_context is not None:
-        return urllib.request.urlopen(request, context=ssl_context)
+        return urllib.request.urlopen(request, context=ssl_context, timeout=NETWORK_TIMEOUT_SECONDS)
 
     if not str(request.full_url).lower().startswith("https://"):
-        return urllib.request.urlopen(request)
+        return urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT_SECONDS)
 
     last_error: Optional[urllib.error.URLError] = None
     for context in _ssl_context_candidates():
         try:
-            return urllib.request.urlopen(request, context=context)
+            return urllib.request.urlopen(request, context=context, timeout=NETWORK_TIMEOUT_SECONDS)
         except urllib.error.URLError as err:
             last_error = err
             reason = getattr(err, "reason", None)
@@ -150,7 +153,34 @@ def _urlopen_with_context_fallback(request: urllib.request.Request, ssl_context:
 
     if last_error is not None:
         raise last_error
-    return urllib.request.urlopen(request)
+    return urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT_SECONDS)
+
+
+def _read_limited(stream: Any, limit: int) -> bytes:
+    getheader = getattr(stream, 'getheader', None)
+    content_length = getheader('Content-Length') if callable(getheader) else None
+    if content_length is not None:
+        try:
+            if int(content_length) > limit:
+                raise ValueError(f"response exceeds {limit} bytes")
+        except ValueError as err:
+            if str(err).startswith("response exceeds"):
+                raise
+
+    data = bytearray()
+    while len(data) <= limit:
+        chunk = stream.read(min(64 * 1024, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) > limit:
+        raise ValueError(f"response exceeds {limit} bytes")
+    return bytes(data)
+
+
+def _decompress_gzip_limited(data: bytes, limit: int) -> bytes:
+    with io.BytesIO(data) as compressedStream, gzip.GzipFile(fileobj=compressedStream) as gzipper:
+        return _read_limited(gzipper, limit)
 
 
 def enable_socks_proxy(enable: bool) -> None:
@@ -182,13 +212,19 @@ def enable_socks_proxy(enable: bool) -> None:
 htmlentitydecode = html.unescape
 
 
-def retrieve_url(url: str, custom_headers: Mapping[str, str] = {}, request_data: Optional[Any] = None, ssl_context: Optional[ssl.SSLContext] = None, unescape_html_entities: bool = True) -> str:
+def retrieve_url(url: str, custom_headers: Optional[Mapping[str, str]] = None, request_data: Optional[Any] = None, ssl_context: Optional[ssl.SSLContext] = None, unescape_html_entities: bool = True) -> str:
     """ Return the content of the url page as a string """
 
-    request = urllib.request.Request(url, request_data, {**_headers, **custom_headers})
+    request = urllib.request.Request(url, request_data, {**_headers, **(custom_headers or {})})
     try:
-        response = _urlopen_with_context_fallback(request, ssl_context)
-    except urllib.error.URLError as errno:
+        with _urlopen_with_context_fallback(request, ssl_context) as response:
+            data = _read_limited(response, MAX_PAGE_BYTES)
+            charset = 'utf-8'
+            try:
+                charset = response.getheader('Content-Type', '').split('charset=', 1)[1]
+            except IndexError:
+                pass
+    except (urllib.error.URLError, OSError, ValueError) as errno:
         reason = getattr(errno, "reason", errno)
         if isinstance(reason, ssl.SSLError):
             print(
@@ -198,19 +234,13 @@ def retrieve_url(url: str, custom_headers: Mapping[str, str] = {}, request_data:
         else:
             print(f"Connection error: {reason}", file=sys.stderr)
         return ""
-    data: bytes = response.read()
-
     # Check if it is gzipped
     if data[:2] == b'\x1f\x8b':
-        # Data is gzip encoded, decode it
-        with io.BytesIO(data) as compressedStream, gzip.GzipFile(fileobj=compressedStream) as gzipper:
-            data = gzipper.read()
-
-    charset = 'utf-8'
-    try:
-        charset = response.getheader('Content-Type', '').split('charset=', 1)[1]
-    except IndexError:
-        pass
+        try:
+            data = _decompress_gzip_limited(data, MAX_PAGE_BYTES)
+        except (OSError, ValueError) as err:
+            print(f"Connection error: invalid or oversized gzip response: {err}", file=sys.stderr)
+            return ""
 
     dataStr = data.decode(charset, 'replace')
 
@@ -227,14 +257,12 @@ def download_file(url: str, referer: Optional[str] = None, ssl_context: Optional
     request = urllib.request.Request(url, headers=_headers)
     if referer is not None:
         request.add_header('referer', referer)
-    response = _urlopen_with_context_fallback(request, ssl_context)
-    data = response.read()
+    with _urlopen_with_context_fallback(request, ssl_context) as response:
+        data = _read_limited(response, MAX_TORRENT_BYTES)
 
     # Check if it is gzipped
     if data[:2] == b'\x1f\x8b':
-        # Data is gzip encoded, decode it
-        with io.BytesIO(data) as compressedStream, gzip.GzipFile(fileobj=compressedStream) as gzipper:
-            data = gzipper.read()
+        data = _decompress_gzip_limited(data, MAX_TORRENT_BYTES)
 
     # Write it to a file
     fileHandle, path = tempfile.mkstemp()

@@ -1,20 +1,33 @@
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[cfg(unix)]
-use std::fs::DirBuilder;
+use std::ffi::CString;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::torrent::TorrentMeta;
 
 #[derive(Debug)]
 pub struct Storage {
     entries: Vec<FileEntry>,
+    root: PathBuf,
+    #[cfg(unix)]
+    root_directory: File,
+    #[cfg(windows)]
+    root_directory: crate::windows_fs::PinnedDir,
     total_length: u64,
     write_cache: Vec<WriteEntry>,
     write_cache_bytes: usize,
@@ -51,9 +64,18 @@ pub struct StorageOptions {
 
 #[derive(Debug)]
 struct FileEntry {
+    path: PathBuf,
     offset: u64,
     length: u64,
     file: File,
+    #[cfg(windows)]
+    parent_identity: crate::windows_fs::FileIdentity,
+}
+
+struct OpenedPayload {
+    file: File,
+    #[cfg(windows)]
+    parent_identity: crate::windows_fs::FileIdentity,
 }
 
 #[derive(Debug)]
@@ -79,6 +101,7 @@ pub enum Error {
     OutOfBounds,
     SymlinkNotAllowed,
     InsufficientDiskSpace,
+    PayloadInUse,
 }
 
 impl fmt::Display for Error {
@@ -92,6 +115,7 @@ impl fmt::Display for Error {
             Error::OutOfBounds => write!(f, "read/write out of bounds"),
             Error::SymlinkNotAllowed => write!(f, "symlinks are not allowed in torrent paths"),
             Error::InsufficientDiskSpace => write!(f, "insufficient disk space"),
+            Error::PayloadInUse => write!(f, "torrent payload is already in use"),
         }
     }
 }
@@ -110,17 +134,50 @@ impl Storage {
         download_dir: &Path,
         options: StorageOptions,
     ) -> Result<Self, Error> {
-        let layouts = build_layout(meta, download_dir)?;
+        Self::new_with_file_renames(meta, download_dir, options, &[])
+    }
+
+    pub fn new_with_file_renames(
+        meta: &TorrentMeta,
+        download_dir: &Path,
+        options: StorageOptions,
+        file_renames: &[(usize, String)],
+    ) -> Result<Self, Error> {
+        let mut layouts = build_layout(meta, download_dir)?;
+        apply_saved_file_renames(&mut layouts, file_renames)?;
+        validate_no_reserved_state_paths(download_dir, &layouts)?;
+        fs::create_dir_all(download_dir)?;
+        #[cfg(unix)]
+        let root_directory = open_directory_no_follow(download_dir)?;
+        #[cfg(windows)]
+        let root_directory =
+            crate::windows_fs::PinnedDir::open(download_dir).map_err(windows_path_error)?;
+        let total_length = layouts.iter().try_fold(0u64, |end, layout| {
+            layout
+                .offset
+                .checked_add(layout.length)
+                .map(|layout_end| end.max(layout_end))
+        });
+        let total_length = total_length.ok_or(Error::InvalidLength)?;
         let mut entries = Vec::with_capacity(layouts.len());
         for layout in layouts {
-            if let Some(parent) = layout.path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    create_dir_secure(parent)?;
+            #[cfg(unix)]
+            let opened = open_payload_file_unix(&root_directory, download_dir, &layout.path, true)?;
+            #[cfg(windows)]
+            let opened =
+                open_payload_file_windows(&root_directory, download_dir, &layout.path, true)?;
+            #[cfg(not(any(unix, windows)))]
+            let opened = {
+                if let Some(parent) = layout.path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        create_dir_secure(download_dir, parent)?;
+                    }
                 }
-            }
-            let file = open_file_no_follow(&layout.path, true)?;
+                open_payload_file(&layout.path, true)?
+            };
+            opened.file.try_lock().map_err(|_| Error::PayloadInUse)?;
             if options.preallocate {
-                if let Err(err) = file.set_len(layout.length) {
+                if let Err(err) = opened.file.set_len(layout.length) {
                     if err.raw_os_error() == Some(28) {
                         return Err(Error::InsufficientDiskSpace);
                     }
@@ -128,15 +185,23 @@ impl Storage {
                 }
             }
             entries.push(FileEntry {
+                path: layout.path,
                 offset: layout.offset,
                 length: layout.length,
-                file,
+                #[cfg(windows)]
+                parent_identity: opened.parent_identity,
+                file: opened.file,
             });
         }
+        validate_distinct_files(&entries)?;
 
-        let total_length = meta.info.total_length();
         Ok(Self {
             entries,
+            root: download_dir.to_path_buf(),
+            #[cfg(unix)]
+            root_directory,
+            #[cfg(windows)]
+            root_directory,
             total_length,
             write_cache: Vec::new(),
             write_cache_bytes: 0,
@@ -144,8 +209,70 @@ impl Storage {
         })
     }
 
+    /// Open an existing payload without creating directories or files. This is
+    /// used to verify a crash-recovery destination before adopting it.
+    pub fn open_existing_with_file_renames(
+        meta: &TorrentMeta,
+        download_dir: &Path,
+        file_renames: &[(usize, String)],
+    ) -> Result<Self, Error> {
+        let mut layouts = build_layout(meta, download_dir)?;
+        apply_saved_file_renames(&mut layouts, file_renames)?;
+        let total_length = layouts.iter().try_fold(0u64, |end, layout| {
+            layout
+                .offset
+                .checked_add(layout.length)
+                .map(|layout_end| end.max(layout_end))
+        });
+        let total_length = total_length.ok_or(Error::InvalidLength)?;
+        #[cfg(unix)]
+        let root_directory = open_directory_no_follow(download_dir)?;
+        #[cfg(windows)]
+        let root_directory =
+            crate::windows_fs::PinnedDir::open(download_dir).map_err(windows_path_error)?;
+        let mut entries = Vec::with_capacity(layouts.len());
+        for layout in layouts {
+            #[cfg(unix)]
+            let opened =
+                open_payload_file_unix(&root_directory, download_dir, &layout.path, false)?;
+            #[cfg(windows)]
+            let opened =
+                open_payload_file_windows(&root_directory, download_dir, &layout.path, false)?;
+            #[cfg(not(any(unix, windows)))]
+            let opened = open_payload_file(&layout.path, false)?;
+            opened.file.try_lock().map_err(|_| Error::PayloadInUse)?;
+            entries.push(FileEntry {
+                path: layout.path,
+                offset: layout.offset,
+                length: layout.length,
+                #[cfg(windows)]
+                parent_identity: opened.parent_identity,
+                file: opened.file,
+            });
+        }
+        validate_distinct_files(&entries)?;
+        Ok(Self {
+            entries,
+            root: download_dir.to_path_buf(),
+            #[cfg(unix)]
+            root_directory,
+            #[cfg(windows)]
+            root_directory,
+            total_length,
+            write_cache: Vec::new(),
+            write_cache_bytes: 0,
+            write_cache_limit: 0,
+        })
+    }
+
     pub fn file_count(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn file_path(&self, file_index: usize) -> Option<&Path> {
+        self.entries
+            .get(file_index)
+            .map(|entry| entry.path.as_path())
     }
 
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
@@ -156,6 +283,9 @@ impl Storage {
                 .ok_or(Error::OutOfBounds)?;
             if end > self.total_length {
                 return Err(Error::OutOfBounds);
+            }
+            if data.is_empty() {
+                return Ok(());
             }
             if self.write_cache_limit == 0 {
                 return self.write_direct(offset, data);
@@ -305,8 +435,17 @@ impl Storage {
         }
         for fi in synced_files {
             if let Some(fe) = self.entries.get(fi) {
-                let _ = fe.file.sync_data();
+                fe.file.sync_data()?;
             }
+        }
+        Ok(())
+    }
+
+    /// Persist all queued writes and report any write or sync failure.
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.flush_cache()?;
+        for entry in &self.entries {
+            entry.file.sync_data()?;
         }
         Ok(())
     }
@@ -317,29 +456,414 @@ impl Storage {
         old_path: &Path,
         new_path: &Path,
     ) -> Result<(), Error> {
+        self.validate_file_rename(file_index, old_path, new_path)?;
+        self.flush_cache()?;
+        #[cfg(unix)]
+        {
+            let new_name = new_path.file_name().ok_or(Error::InvalidPathSegment)?;
+            let (parent, old_name) =
+                open_payload_parent_unix(&self.root_directory, &self.root, old_path, false)?;
+            let entry = &mut self.entries[file_index];
+            verify_open_file_entry(&parent, &old_name, &entry.file)?;
+            rename_at_no_overwrite(&parent, &old_name, new_name)?;
+        }
+        #[cfg(windows)]
+        {
+            let new_name = new_path.file_name().ok_or(Error::InvalidPathSegment)?;
+            let relative = old_path
+                .strip_prefix(&self.root)
+                .map_err(|_| Error::InvalidPathSegment)?;
+            let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+            let entry = &mut self.entries[file_index];
+            let info = crate::windows_fs::file_info(&entry.file).map_err(windows_path_error)?;
+            if info.is_directory() || info.is_reparse_point() || info.number_of_links != 1 {
+                return Err(Error::InvalidFiles);
+            }
+            let opened_parent = self
+                .root_directory
+                .open_relative_dir(parent, false)
+                .map_err(windows_path_error)?
+                .0;
+            if opened_parent.identity() != entry.parent_identity {
+                return Err(Error::InvalidFiles);
+            }
+            opened_parent
+                .rename_open_file_here(&entry.file, new_name, false)
+                .map_err(windows_path_error)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        crate::rename_path_no_overwrite(old_path, new_path, false)?;
+        // A successful filesystem rename keeps the already-open handle bound
+        // to the same file. Reopening here would introduce a fallible window
+        // after the path has moved but before the caller can commit its rename
+        // journal.
+        self.entries[file_index].path = new_path.to_path_buf();
+        Ok(())
+    }
+
+    pub fn validate_file_rename(
+        &self,
+        file_index: usize,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Result<(), Error> {
         if file_index >= self.entries.len() {
             return Err(Error::OutOfBounds);
         }
-        self.flush_cache()?;
+        if old_path != self.entries[file_index].path {
+            return Err(Error::InvalidPathSegment);
+        }
+        validate_path_beneath(&self.root, old_path)?;
+        validate_path_beneath(&self.root, new_path)?;
+        let new_name = new_path.file_name().ok_or(Error::InvalidPathSegment)?;
+        validate_os_file_name(new_name)?;
+        if new_path.parent() == Some(self.root.as_path()) && is_reserved_app_name(new_name) {
+            return Err(Error::InvalidPathSegment);
+        }
+        if old_path
+            .symlink_metadata()
+            .map(|metadata| metadata.is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(Error::SymlinkNotAllowed);
+        }
+        match new_path.symlink_metadata() {
+            Ok(_) => return Err(Error::InvalidFiles),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Error::Io(err)),
+        }
         if let Some(parent) = new_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                create_dir_secure(parent)?;
+            if parent != old_path.parent().unwrap_or_else(|| Path::new("")) {
+                return Err(Error::InvalidPathSegment);
             }
         }
-        fs::rename(old_path, new_path)?;
-        let file = open_file_no_follow(new_path, false)?;
-        self.entries[file_index].file = file;
         Ok(())
     }
 }
 
-fn open_file_no_follow(path: &Path, create: bool) -> Result<File, Error> {
-    if path
-        .symlink_metadata()
-        .map(|m| m.is_symlink())
-        .unwrap_or(false)
-    {
+fn apply_saved_file_renames(
+    layouts: &mut [FileLayout],
+    file_renames: &[(usize, String)],
+) -> Result<(), Error> {
+    let mut seen = HashSet::with_capacity(file_renames.len());
+    for (index, name) in file_renames {
+        if !seen.insert(*index) {
+            return Err(Error::InvalidFiles);
+        }
+        let layout = layouts.get_mut(*index).ok_or(Error::OutOfBounds)?;
+        let name = OsStr::new(name);
+        validate_os_file_name(name)?;
+        layout.path.set_file_name(name);
+    }
+    validate_layout_paths(layouts)
+}
+
+#[cfg(unix)]
+fn validate_distinct_files(entries: &[FileEntry]) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut identities = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let metadata = entry.file.metadata()?;
+        if !identities.insert((metadata.dev(), metadata.ino())) {
+            return Err(Error::InvalidFiles);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_distinct_files(entries: &[FileEntry]) -> Result<(), Error> {
+    let mut identities = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let info = crate::windows_fs::file_info(&entry.file).map_err(windows_path_error)?;
+        if !identities.insert(info.identity) {
+            return Err(Error::InvalidFiles);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_distinct_files(_entries: &[FileEntry]) -> Result<(), Error> {
+    Ok(())
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        // Drop cannot return an error. Normal shutdown paths should call
+        // `flush`; this still prevents a below-limit cache from being silently
+        // discarded on routine scope exit.
+        let _ = self.flush();
+    }
+}
+
+#[cfg(unix)]
+fn component_name(name: &OsStr) -> Result<CString, Error> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(Error::InvalidPathSegment);
+    }
+    CString::new(bytes).map_err(|_| Error::InvalidPathSegment)
+}
+
+#[cfg(unix)]
+fn component_open_error(error: std::io::Error) -> Error {
+    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+        Error::SymlinkNotAllowed
+    } else {
+        Error::Io(error)
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow(path: &Path) -> Result<File, Error> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let directory = options.open(path).map_err(component_open_error)?;
+    let opened = directory.metadata()?;
+    if !opened.is_dir() {
+        return Err(Error::InvalidFiles);
+    }
+    let canonical = fs::canonicalize(path)?;
+    let resolved = fs::metadata(canonical)?;
+    use std::os::unix::fs::MetadataExt;
+    if !resolved.is_dir() || opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
         return Err(Error::SymlinkNotAllowed);
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_child_directory(parent: &File, name: &OsStr, create: bool) -> Result<File, Error> {
+    let name = component_name(name)?;
+    let open = || {
+        // SAFETY: `parent` is a live directory descriptor and `name` is a
+        // validated, NUL-terminated single path component.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: openat returned a new owned descriptor.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+    };
+    match open() {
+        Ok(directory) => Ok(directory),
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            // SAFETY: the parent descriptor and component remain live for the
+            // call. EEXIST is expected if another creator wins the race.
+            let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+            if created != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(component_open_error(error));
+                }
+            }
+            open().map_err(component_open_error)
+        }
+        Err(error) => Err(component_open_error(error)),
+    }
+}
+
+#[cfg(unix)]
+fn open_payload_file_unix(
+    root_directory: &File,
+    root: &Path,
+    path: &Path,
+    create: bool,
+) -> Result<OpenedPayload, Error> {
+    open_payload_file_unix_with_hook(root_directory, root, path, create, || Ok(()))
+}
+
+#[cfg(unix)]
+fn open_payload_file_unix_with_hook<F>(
+    root_directory: &File,
+    root: &Path,
+    path: &Path,
+    create: bool,
+    before_final_open: F,
+) -> Result<OpenedPayload, Error>
+where
+    F: FnOnce() -> Result<(), Error>,
+{
+    let (parent, file_name) = open_payload_parent_unix(root_directory, root, path, create)?;
+
+    before_final_open()?;
+    let file_name_c = component_name(&file_name)?;
+    let mut flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    if create {
+        flags |= libc::O_CREAT;
+    }
+    // SAFETY: the pinned parent descriptor is live and the final component is
+    // validated and NUL terminated. O_NOFOLLOW rejects a final symlink.
+    let descriptor =
+        unsafe { libc::openat(parent.as_raw_fd(), file_name_c.as_ptr(), flags, 0o644) };
+    if descriptor < 0 {
+        return Err(component_open_error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::InvalidFiles);
+    }
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() > 1 {
+        return Err(Error::InvalidFiles);
+    }
+    Ok(OpenedPayload { file })
+}
+
+#[cfg(unix)]
+fn open_payload_parent_unix(
+    root_directory: &File,
+    root: &Path,
+    path: &Path,
+    create: bool,
+) -> Result<(File, OsString), Error> {
+    use std::path::Component;
+
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| Error::InvalidPathSegment)?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => Err(Error::InvalidPathSegment),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (file_name, parents) = components.split_last().ok_or(Error::InvalidPathSegment)?;
+    let mut parent = root_directory.try_clone()?;
+    for component in parents {
+        parent = open_child_directory(&parent, component, create)?;
+    }
+    Ok((parent, file_name.clone()))
+}
+
+#[cfg(unix)]
+fn rename_at_no_overwrite(parent: &File, old_name: &OsStr, new_name: &OsStr) -> Result<(), Error> {
+    let old_name = component_name(old_name)?;
+    let new_name = component_name(new_name)?;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let result = {
+        // SAFETY: both names are live, validated C strings and the same pinned
+        // directory descriptor is used for source and destination.
+        unsafe {
+            libc::renameatx_np(
+                parent.as_raw_fd(),
+                old_name.as_ptr(),
+                parent.as_raw_fd(),
+                new_name.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        }
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = {
+        // SAFETY: renameat2 receives live descriptors and validated C strings.
+        unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                old_name.as_ptr(),
+                parent.as_raw_fd(),
+                new_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            ) as libc::c_int
+        }
+    };
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    let result = {
+        // Use a no-overwrite link/unlink fallback on less common Unix targets.
+        // If unlink fails, remove the new link again before surfacing failure.
+        let linked = unsafe {
+            libc::linkat(
+                parent.as_raw_fd(),
+                old_name.as_ptr(),
+                parent.as_raw_fd(),
+                new_name.as_ptr(),
+                0,
+            )
+        };
+        if linked != 0 {
+            linked
+        } else {
+            let removed = unsafe { libc::unlinkat(parent.as_raw_fd(), old_name.as_ptr(), 0) };
+            if removed != 0 {
+                unsafe {
+                    libc::unlinkat(parent.as_raw_fd(), new_name.as_ptr(), 0);
+                }
+            }
+            removed
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(unix)]
+fn verify_open_file_entry(parent: &File, name: &OsStr, opened: &File) -> Result<(), Error> {
+    use std::mem::MaybeUninit;
+    use std::os::unix::fs::MetadataExt;
+
+    let name = component_name(name)?;
+    let mut linked = MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the parent descriptor and component are live and `linked`
+    // points to writable stat storage.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            linked.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(component_open_error(std::io::Error::last_os_error()));
+    }
+    // SAFETY: fstatat initialized the structure on success.
+    let linked = unsafe { linked.assume_init() };
+    let metadata = opened.metadata()?;
+    if linked.st_mode & libc::S_IFMT != libc::S_IFREG
+        || linked.st_nlink != 1
+        || linked.st_dev as u64 != metadata.dev()
+        || linked.st_ino != metadata.ino()
+    {
+        return Err(Error::InvalidFiles);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_payload_file(path: &Path, create: bool) -> Result<OpenedPayload, Error> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.is_symlink() => return Err(Error::SymlinkNotAllowed),
+        Ok(metadata) if !metadata.is_file() => return Err(Error::InvalidFiles),
+        Ok(_) => {}
+        Err(err) if create && err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::Io(err)),
     }
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).truncate(false);
@@ -349,38 +873,164 @@ fn open_file_no_follow(path: &Path, create: bool) -> Result<File, Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = 0x0100;
-        opts.custom_flags(O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         opts.mode(0o644);
     }
-    opts.open(path).map_err(Error::Io)
-}
-
-fn create_dir_secure(path: &Path) -> Result<(), Error> {
+    let file = opts.open(path).map_err(Error::Io)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::InvalidFiles);
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new().recursive(true).mode(0o755).create(path)?;
-        Ok(())
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Err(Error::InvalidFiles);
+        }
     }
-    #[cfg(not(unix))]
+    Ok(OpenedPayload { file })
+}
+
+#[cfg(windows)]
+fn windows_path_error(error: std::io::Error) -> Error {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => Error::SymlinkNotAllowed,
+        std::io::ErrorKind::InvalidData => Error::InvalidFiles,
+        _ => Error::Io(error),
+    }
+}
+
+#[cfg(windows)]
+fn open_payload_file_windows(
+    root_directory: &crate::windows_fs::PinnedDir,
+    root: &Path,
+    path: &Path,
+    create: bool,
+) -> Result<OpenedPayload, Error> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| Error::InvalidPathSegment)?;
+    let disposition = if create {
+        crate::windows_fs::CreateDisposition::OpenOrCreate
+    } else {
+        crate::windows_fs::CreateDisposition::OpenExisting
+    };
+    let opened = root_directory
+        .open_regular(relative, disposition, create)
+        .map_err(windows_path_error)?;
+    Ok(OpenedPayload {
+        file: opened.file,
+        parent_identity: opened.parent_identity,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_dir_secure(root: &Path, path: &Path) -> Result<(), Error> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| Error::InvalidPathSegment)?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        use std::path::Component;
+        let Component::Normal(segment) = component else {
+            return Err(Error::InvalidPathSegment);
+        };
+        current.push(segment);
+        match current.symlink_metadata() {
+            Ok(metadata) if metadata.is_symlink() => return Err(Error::SymlinkNotAllowed),
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "torrent path component is not a directory",
+                )))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    DirBuilder::new().mode(0o755).create(&current)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir(&current)?;
+                }
+            }
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+    Ok(())
+}
+
+fn validate_path_beneath(root: &Path, path: &Path) -> Result<(), Error> {
+    use std::path::Component;
+
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| Error::InvalidPathSegment)?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
-        fs::create_dir_all(path)?;
-        Ok(())
+        return Err(Error::InvalidPathSegment);
     }
+    Ok(())
+}
+
+/// Return the exact filesystem root used for this torrent. On Unix this
+/// preserves non-UTF-8 metainfo names and must be preferred over lossy string
+/// reconstruction in move/cleanup code.
+pub fn root_path(meta: &TorrentMeta, download_dir: &Path) -> Result<PathBuf, Error> {
+    Ok(download_dir.join(clean_name(&meta.info.name)?))
+}
+
+/// Return the exact filesystem paths for torrent data without opening or
+/// creating them. Cleanup code must use these raw-safe paths instead of lossy
+/// UI display strings.
+pub fn data_paths(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    data_paths_with_file_renames(meta, download_dir, &[])
+}
+
+/// Return the exact filesystem paths for torrent data after applying saved
+/// per-file renames, without opening or creating any files.
+pub fn data_paths_with_file_renames(
+    meta: &TorrentMeta,
+    download_dir: &Path,
+    file_renames: &[(usize, String)],
+) -> Result<Vec<PathBuf>, Error> {
+    let mut layouts = build_layout(meta, download_dir)?;
+    apply_saved_file_renames(&mut layouts, file_renames)?;
+    validate_no_reserved_state_paths(download_dir, &layouts)?;
+    Ok(layouts.into_iter().map(|layout| layout.path).collect())
+}
+
+fn validate_no_reserved_state_paths(
+    download_dir: &Path,
+    layouts: &[FileLayout],
+) -> Result<(), Error> {
+    if layouts.iter().any(|layout| {
+        layout.path.parent() == Some(download_dir)
+            && layout.path.file_name().is_some_and(is_reserved_app_name)
+    }) {
+        return Err(Error::InvalidName);
+    }
+    Ok(())
 }
 
 fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayout>, Error> {
-    let name = clean_name(&meta.info.name)?;
-    let total_length = meta.info.total_length();
+    let root = root_path(meta, download_dir)?;
+    let total_length = meta
+        .info
+        .checked_total_length()
+        .ok_or(Error::InvalidLength)?;
     if total_length == 0 {
         return Err(Error::InvalidLength);
     }
 
     if let Some(length) = meta.info.length {
-        let path = download_dir.join(name);
         return Ok(vec![FileLayout {
-            path,
+            path: root,
             offset: 0,
             length,
         }]);
@@ -390,15 +1040,15 @@ fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayou
         return Err(Error::InvalidFiles);
     }
 
-    let base = download_dir.join(name);
+    let base = root;
     let mut layouts = if !meta.info.files.is_empty() {
         Vec::with_capacity(meta.info.files.len())
     } else {
         Vec::with_capacity(meta.info.file_tree.len())
     };
-    let mut offset = 0u64;
     if !meta.info.files.is_empty() {
-        for file in &meta.info.files {
+        let file_offsets = meta.file_offsets().ok_or(Error::InvalidLength)?;
+        for (file, file_offset) in meta.info.files.iter().zip(file_offsets) {
             if file.path.is_empty() {
                 return Err(Error::InvalidPathSegment);
             }
@@ -409,13 +1059,13 @@ fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayou
             }
             layouts.push(FileLayout {
                 path,
-                offset,
+                offset: file_offset,
                 length: file.length,
             });
-            offset = offset.saturating_add(file.length);
         }
     } else {
-        for file in &meta.info.file_tree {
+        let file_offsets = meta.file_offsets().ok_or(Error::InvalidLength)?;
+        for (file, file_offset) in meta.info.file_tree.iter().zip(file_offsets) {
             if file.path.is_empty() {
                 return Err(Error::InvalidPathSegment);
             }
@@ -426,21 +1076,60 @@ fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayou
             }
             layouts.push(FileLayout {
                 path,
-                offset,
+                offset: file_offset,
                 length: file.length,
             });
-            offset = offset.saturating_add(file.length);
         }
     }
 
-    if offset != total_length {
+    let laid_out_content = layouts
+        .iter()
+        .try_fold(0u64, |total, layout| total.checked_add(layout.length))
+        .ok_or(Error::InvalidLength)?;
+    if laid_out_content != total_length {
         return Err(Error::InvalidLength);
     }
+    validate_layout_paths(&layouts)?;
     Ok(layouts)
 }
 
+fn validate_layout_paths(layouts: &[FileLayout]) -> Result<(), Error> {
+    let mut paths: Vec<&Path> = layouts.iter().map(|layout| layout.path.as_path()).collect();
+    paths.sort_unstable();
+    for pair in paths.windows(2) {
+        if pair[0] == pair[1] || pair[1].starts_with(pair[0]) {
+            return Err(Error::InvalidFiles);
+        }
+    }
+    Ok(())
+}
+
 fn clean_name(bytes: &[u8]) -> Result<OsString, Error> {
+    if is_reserved_app_name_bytes(bytes) {
+        return Err(Error::InvalidName);
+    }
     clean_segment(bytes).map_err(|_| Error::InvalidName)
+}
+
+fn is_reserved_app_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| is_reserved_app_name_bytes(name.as_bytes()))
+}
+
+fn is_reserved_app_name_bytes(bytes: &[u8]) -> bool {
+    bytes.eq_ignore_ascii_case(b".rustorrent") || bytes.eq_ignore_ascii_case(b".rustorrent.lock")
+}
+
+#[cfg(unix)]
+fn validate_os_file_name(name: &std::ffi::OsStr) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    clean_segment(name.as_bytes()).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn validate_os_file_name(name: &std::ffi::OsStr) -> Result<(), Error> {
+    let name = name.to_str().ok_or(Error::InvalidPathSegment)?;
+    clean_segment(name.as_bytes()).map(|_| ())
 }
 
 fn clean_segment(bytes: &[u8]) -> Result<OsString, Error> {
@@ -477,11 +1166,12 @@ fn clean_segment(bytes: &[u8]) -> Result<OsString, Error> {
 
 #[cfg(not(unix))]
 fn is_windows_reserved(name: &str) -> bool {
-    if name.is_empty() {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    if stem.is_empty() {
         return true;
     }
     matches!(
-        name,
+        stem,
         "CON"
             | "PRN"
             | "AUX"
@@ -545,10 +1235,12 @@ mod tests {
                     FileInfo {
                         length: 3,
                         path: vec![b"a.txt".to_vec()],
+                        attr: Vec::new(),
                     },
                     FileInfo {
                         length: 5,
                         path: vec![b"dir".to_vec(), b"b.bin".to_vec()],
+                        attr: Vec::new(),
                     },
                 ],
                 private: false,
@@ -559,6 +1251,7 @@ mod tests {
 
     fn dummy_meta_v2_tree() -> TorrentMeta {
         let mut meta = dummy_meta();
+        meta.meta_version = 2;
         meta.info.files.clear();
         meta.info.file_tree = vec![
             FileTreeEntry {
@@ -603,7 +1296,7 @@ mod tests {
         assert_eq!(layout.len(), 2);
         assert_eq!(layout[0].offset, 0);
         assert_eq!(layout[0].length, 3);
-        assert_eq!(layout[1].offset, 3);
+        assert_eq!(layout[1].offset, 16_384);
         assert_eq!(layout[1].length, 5);
     }
 
@@ -613,6 +1306,78 @@ mod tests {
         meta.info.files[0].path = vec![b"..".to_vec()];
         let err = build_layout(&meta, Path::new("/tmp")).unwrap_err();
         assert!(matches!(err, Error::InvalidPathSegment));
+    }
+
+    #[test]
+    fn rejects_roots_reserved_for_application_state() {
+        for name in [b".rustorrent".as_slice(), b".RUSTORRENT.LOCK".as_slice()] {
+            let mut meta = dummy_meta();
+            meta.info.name = name.to_vec();
+            assert!(matches!(
+                build_layout(&meta, Path::new("/tmp")),
+                Err(Error::InvalidName)
+            ));
+        }
+    }
+
+    #[test]
+    fn malicious_search_plugin_layout_is_rejected_before_creation() {
+        let dir = temp_dir("reserved-search-plugin");
+        let mut meta = dummy_meta();
+        meta.info.name = b".rustorrent".to_vec();
+        meta.info.files = vec![FileInfo {
+            length: 3,
+            path: vec![
+                b"search".to_vec(),
+                b"nova3".to_vec(),
+                b"engines".to_vec(),
+                b"evil.py".to_vec(),
+            ],
+            attr: Vec::new(),
+        }];
+
+        let result = Storage::new(
+            &meta,
+            &dir,
+            StorageOptions {
+                preallocate: false,
+                write_cache_bytes: 0,
+            },
+        );
+        assert!(matches!(result, Err(Error::InvalidName)));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn single_file_rename_cannot_enter_reserved_state_namespace() {
+        let dir = temp_dir("reserved-live-rename");
+        fs::create_dir_all(&dir).unwrap();
+        let mut meta = dummy_meta();
+        meta.info.length = Some(3);
+        meta.info.files.clear();
+        let mut storage = Storage::new(
+            &meta,
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+        let old_path = storage.file_path(0).unwrap().to_path_buf();
+
+        assert!(matches!(
+            storage.rename_file(0, &old_path, &dir.join(".RUSTORRENT")),
+            Err(Error::InvalidPathSegment)
+        ));
+        assert!(old_path.exists());
+        assert!(matches!(
+            data_paths_with_file_renames(&meta, &dir, &[(0, ".rustorrent.lock".to_string())]),
+            Err(Error::InvalidName)
+        ));
+
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -688,6 +1453,269 @@ mod tests {
         storage.read_at(1, &mut out).unwrap();
         assert_eq!(out, [7, 8, 9]);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_storage_flushes_below_limit_cached_writes() {
+        let dir = temp_dir("cache-drop");
+        fs::create_dir_all(&dir).unwrap();
+        {
+            let mut storage = Storage::new(
+                &dummy_meta(),
+                &dir,
+                StorageOptions {
+                    preallocate: true,
+                    write_cache_bytes: 1024,
+                },
+            )
+            .unwrap();
+            storage.write_at(0, &[1, 2, 3]).unwrap();
+        }
+
+        assert_eq!(fs::read(dir.join("root/a.txt")).unwrap(), [1, 2, 3]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_storage_uses_piece_aligned_file_offsets() {
+        let dir = temp_dir("v2-alignment");
+        fs::create_dir_all(&dir).unwrap();
+        let mut storage = Storage::new(
+            &dummy_meta_v2_tree(),
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        storage.write_at(0, &[1, 2, 3]).unwrap();
+        storage.write_at(16_384, &[4, 5, 6, 7, 8]).unwrap();
+        let mut second = [0u8; 5];
+        storage.read_at(16_384, &mut second).unwrap();
+        assert_eq!(second, [4, 5, 6, 7, 8]);
+        let mut gap = [0u8; 1];
+        assert!(matches!(
+            storage.read_at(3, &mut gap),
+            Err(Error::OutOfBounds)
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn layout_rejects_duplicate_and_prefix_colliding_paths() {
+        let mut duplicate = dummy_meta();
+        duplicate.info.files[1].path = vec![b"a.txt".to_vec()];
+        assert!(matches!(
+            build_layout(&duplicate, Path::new("/tmp")),
+            Err(Error::InvalidFiles)
+        ));
+
+        let mut prefix = dummy_meta();
+        prefix.info.files[0].path = vec![b"node".to_vec()];
+        prefix.info.files[1].path = vec![b"node".to_vec(), b"child".to_vec()];
+        assert!(matches!(
+            build_layout(&prefix, Path::new("/tmp")),
+            Err(Error::InvalidFiles)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_rejects_symlinked_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("parent-symlink");
+        let outside = temp_dir("parent-symlink-outside");
+        fs::create_dir_all(dir.join("root")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, dir.join("root/dir")).unwrap();
+
+        let err = Storage::new(
+            &dummy_meta(),
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SymlinkNotAllowed));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_parent_open_cannot_be_redirected_by_a_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("pinned-parent-swap");
+        let outside = temp_dir("pinned-parent-swap-outside");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let path = dir.join("root/dir/payload.bin");
+        let original_parent = dir.join("root/dir");
+        let moved_parent = dir.join("root/pinned-dir");
+        let root = open_directory_no_follow(&dir).unwrap();
+
+        let mut opened = open_payload_file_unix_with_hook(&root, &dir, &path, true, || {
+            fs::rename(&original_parent, &moved_parent)?;
+            symlink(&outside, &original_parent)?;
+            Ok(())
+        })
+        .unwrap();
+        opened.file.write_all(b"safe").unwrap();
+        opened.file.sync_all().unwrap();
+
+        assert_eq!(fs::read(moved_parent.join("payload.bin")).unwrap(), b"safe");
+        assert!(!outside.join("payload.bin").exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_rejects_two_paths_to_the_same_file() {
+        let dir = temp_dir("hardlink-alias");
+        fs::create_dir_all(dir.join("root/dir")).unwrap();
+        fs::write(dir.join("root/a.txt"), []).unwrap();
+        fs::hard_link(dir.join("root/a.txt"), dir.join("root/dir/b.bin")).unwrap();
+
+        let err = Storage::new(
+            &dummy_meta(),
+            &dir,
+            StorageOptions {
+                preallocate: false,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidFiles));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_renames_are_applied_before_files_are_opened() {
+        let dir = temp_dir("saved-rename");
+        fs::create_dir_all(&dir).unwrap();
+        let options = StorageOptions {
+            preallocate: true,
+            write_cache_bytes: 0,
+        };
+        {
+            let mut storage = Storage::new(&dummy_meta(), &dir, options).unwrap();
+            storage.write_at(0, &[1, 2, 3]).unwrap();
+            let old_path = storage.file_path(0).unwrap().to_path_buf();
+            let new_path = old_path.with_file_name("renamed.txt");
+            storage.rename_file(0, &old_path, &new_path).unwrap();
+        }
+
+        let mut reopened = Storage::new_with_file_renames(
+            &dummy_meta(),
+            &dir,
+            options,
+            &[(0, "renamed.txt".to_string())],
+        )
+        .unwrap();
+        let mut data = [0u8; 3];
+        reopened.read_at(0, &mut data).unwrap();
+        assert_eq!(data, [1, 2, 3]);
+        assert!(!dir.join("root/a.txt").exists());
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn payload_files_are_exclusively_locked_while_storage_is_open() {
+        let dir = temp_dir("exclusive-lock");
+        fs::create_dir_all(&dir).unwrap();
+        let options = StorageOptions {
+            preallocate: true,
+            write_cache_bytes: 0,
+        };
+        let storage = Storage::new(&dummy_meta(), &dir, options).unwrap();
+
+        assert!(matches!(
+            Storage::new(&dummy_meta(), &dir, options),
+            Err(Error::PayloadInUse)
+        ));
+
+        drop(storage);
+        Storage::new(&dummy_meta(), &dir, options).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_paths_include_saved_file_renames_without_creating_files() {
+        let dir = temp_dir("renamed-data-paths");
+        let paths =
+            data_paths_with_file_renames(&dummy_meta(), &dir, &[(0, "renamed.txt".to_string())])
+                .unwrap();
+
+        assert_eq!(paths[0], dir.join("root/renamed.txt"));
+        assert_eq!(paths[1], dir.join("root/dir/b.bin"));
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_rejects_a_replaced_source_directory_entry() {
+        let dir = temp_dir("rename-replaced-entry");
+        fs::create_dir_all(&dir).unwrap();
+        let mut storage = Storage::new(
+            &dummy_meta(),
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+        let old_path = storage.file_path(0).unwrap().to_path_buf();
+        let displaced = old_path.with_file_name("displaced.bin");
+        let requested = old_path.with_file_name("requested.bin");
+        fs::rename(&old_path, &displaced).unwrap();
+        fs::write(&old_path, b"replacement").unwrap();
+
+        assert!(matches!(
+            storage.rename_file(0, &old_path, &requested),
+            Err(Error::InvalidFiles)
+        ));
+        assert_eq!(storage.file_path(0), Some(old_path.as_path()));
+        assert!(old_path.exists());
+        assert!(displaced.exists());
+        assert!(!requested.exists());
+
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_uses_the_exact_non_utf8_stored_path() {
+        let dir = temp_dir("rename-non-utf8");
+        fs::create_dir_all(&dir).unwrap();
+        let mut meta = dummy_meta();
+        meta.info.files[0].path = vec![vec![0xff, b'a']];
+        let mut storage = Storage::new(
+            &meta,
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+        let old_path = storage.file_path(0).unwrap().to_path_buf();
+        let new_path = old_path.with_file_name("renamed.bin");
+        storage.rename_file(0, &old_path, &new_path).unwrap();
+        assert_eq!(storage.file_path(0), Some(new_path.as_path()));
+        assert!(new_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

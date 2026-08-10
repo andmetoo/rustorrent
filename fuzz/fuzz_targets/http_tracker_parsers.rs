@@ -1,4 +1,5 @@
 #![no_main]
+#![allow(dead_code)]
 
 use libfuzzer_sys::fuzz_target;
 
@@ -14,6 +15,10 @@ mod http {
     pub fn fuzz_parse_http_response(data: &[u8]) {
         let _ = parse_http_response(data);
     }
+}
+
+mod proxy {
+    include!("../../src/proxy.rs");
 }
 
 mod tracker {
