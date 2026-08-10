@@ -846,9 +846,14 @@ fn verify_open_file_entry(parent: &File, name: &OsStr, opened: &File) -> Result<
     // SAFETY: fstatat initialized the structure on success.
     let linked = unsafe { linked.assume_init() };
     let metadata = opened.metadata()?;
+    // `libc::dev_t` is already `u64` on Linux but is narrower on some of the
+    // other Unix targets supported here. Keep the common comparison type
+    // explicit without making the Linux-only Clippy result dictate the cast.
+    #[allow(clippy::unnecessary_cast)]
+    let linked_device = linked.st_dev as u64;
     if linked.st_mode & libc::S_IFMT != libc::S_IFREG
         || linked.st_nlink != 1
-        || linked.st_dev as u64 != metadata.dev()
+        || linked_device != metadata.dev()
         || linked.st_ino != metadata.ino()
     {
         return Err(Error::InvalidFiles);
@@ -893,6 +898,11 @@ fn open_payload_file(path: &Path, create: bool) -> Result<OpenedPayload, Error> 
 
 #[cfg(windows)]
 fn windows_path_error(error: std::io::Error) -> Error {
+    // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION mean another payload
+    // owner already holds the deliberately exclusive Windows file handle.
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return Error::PayloadInUse;
+    }
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => Error::SymlinkNotAllowed,
         std::io::ErrorKind::InvalidData => Error::InvalidFiles,
@@ -1010,7 +1020,10 @@ fn validate_no_reserved_state_paths(
     layouts: &[FileLayout],
 ) -> Result<(), Error> {
     if layouts.iter().any(|layout| {
-        layout.path.parent() == Some(download_dir)
+        layout
+            .path
+            .strip_prefix(download_dir)
+            .is_ok_and(|relative| relative.components().count() == 1)
             && layout.path.file_name().is_some_and(is_reserved_app_name)
     }) {
         return Err(Error::InvalidName);

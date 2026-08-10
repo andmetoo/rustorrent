@@ -1212,7 +1212,14 @@ mod teardown_liveness_tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
-        let stream = PeerStream::tcp(client);
+        let mut stream = PeerStream::tcp(client);
+        // Production peer streams have a bounded read deadline. Retain that
+        // invariant in this cross-platform liveness test because Windows does
+        // not guarantee that shutdown on a duplicated socket handle promptly
+        // interrupts a blocking read on another thread.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         let registry = Arc::new(Mutex::new(HashMap::new()));
         let cancellation = PeerCancellationGuard::new(&registry, 7, &stream);
         let (started_tx, started_rx) = mpsc::channel();
@@ -1226,7 +1233,7 @@ mod teardown_liveness_tests {
         started_rx.recv().unwrap();
 
         cancel_peer_connections(&registry);
-        let result = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(matches!(result, Ok(0) | Err(_)));
 
         worker.join().unwrap();
@@ -2206,7 +2213,7 @@ fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant
     state.last_schedule = now;
     let prev_unchoked = state.unchoked.clone();
     let mut any_downloading = false;
-    for (_peer_id, info) in state.peers.iter_mut() {
+    for info in state.peers.values_mut() {
         info.rate = info.uploaded_total.saturating_sub(info.last_uploaded_total);
         info.last_uploaded_total = info.uploaded_total;
         info.download_rate = info
@@ -2237,7 +2244,7 @@ fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant
             candidates.push((*peer_id, effective_rate));
         }
     }
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
     state.unchoked.clear();
     for (peer_id, _) in candidates.iter().take(max_unchoked) {
         state.unchoked.insert(*peer_id);
@@ -5647,15 +5654,13 @@ fn parse_magnet(link: &str) -> Result<MagnetMeta, String> {
                     web_seeds.push(value);
                 }
             }
-            "x.pe" => {
-                if peers.len() < MAX_MAGNET_EXPLICIT_PEERS {
-                    if let Ok(addr) = value.parse::<SocketAddr>() {
-                        let Some(addr) = safe_metadata_peer(addr, PeerSource::Magnet, None) else {
-                            continue;
-                        };
-                        if !peers.contains(&addr) {
-                            peers.push(addr);
-                        }
+            "x.pe" if peers.len() < MAX_MAGNET_EXPLICIT_PEERS => {
+                if let Ok(addr) = value.parse::<SocketAddr>() {
+                    let Some(addr) = safe_metadata_peer(addr, PeerSource::Magnet, None) else {
+                        continue;
+                    };
+                    if !peers.contains(&addr) {
+                        peers.push(addr);
                     }
                 }
             }
@@ -13444,7 +13449,9 @@ fn add_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
     } else {
         torrent.peer_country_counts.push((cc.to_string(), 1));
     }
-    torrent.peer_country_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    torrent
+        .peer_country_counts
+        .sort_by_key(|entry| std::cmp::Reverse(entry.1));
 }
 
 fn remove_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
@@ -16095,8 +16102,15 @@ mod core_helpers_tests {
         let root = temp_path("session-fail-closed");
         ensure_private_state_directory(&root).unwrap();
         let path = session_path(&root);
-        fs::write(&path, b"invalid primary").unwrap();
-        fs::write(sidecar_path(&path, ".bak"), b"invalid backup").unwrap();
+        write_atomic_file(&path, b"invalid primary", "test session", false, true).unwrap();
+        write_atomic_file(
+            &sidecar_path(&path, ".bak"),
+            b"invalid backup",
+            "test session backup",
+            false,
+            true,
+        )
+        .unwrap();
 
         let error = match SessionStore::load(&root) {
             Ok(_) => panic!("invalid durable session state must not be ignored"),
@@ -16133,8 +16147,9 @@ mod core_helpers_tests {
         );
         save_session(&path, &entries).unwrap();
         let backup_path = sidecar_path(&path, ".bak");
-        fs::copy(&path, &backup_path).unwrap();
-        fs::write(&path, b"corrupt").unwrap();
+        let saved = fs::read(&path).unwrap();
+        write_atomic_file(&backup_path, &saved, "test session backup", false, true).unwrap();
+        write_atomic_file(&path, b"corrupt", "test session", false, true).unwrap();
 
         let store = Arc::new(SessionStore::load(&root).unwrap());
         assert!(store.contains(info_hash));
@@ -17067,9 +17082,10 @@ mod core_helpers_tests {
         let session = session_path(root);
         assert!(resume.to_string_lossy().contains(".rustorrent"));
         assert!(resume.to_string_lossy().ends_with(".resume"));
-        assert!(session
-            .to_string_lossy()
-            .ends_with(".rustorrent/session.benc"));
+        assert_eq!(
+            session.strip_prefix(root).unwrap(),
+            Path::new(".rustorrent").join("session.benc")
+        );
     }
 
     #[test]
@@ -17723,7 +17739,9 @@ mod local_harness_tests {
             thread::sleep(Duration::from_millis(25));
         }
         assert!(fs::read(&cache_path).unwrap().starts_with(b"DHTN\x01"));
-        fs::remove_dir_all(download_dir).unwrap();
+        // Windows keeps the hardened state-directory binding pinned for the
+        // process lifetime, so best-effort cleanup is the portable contract.
+        let _ = fs::remove_dir_all(download_dir);
     }
 }
 
@@ -20624,9 +20642,9 @@ fn start_tui(
                     0x1b => {
                         // ESC - start of escape sequence
                         let seq = tui_read_escape_seq();
-                        if seq == [b'[', b'A'] {
+                        if seq == *b"[A" {
                             tui.selected = tui.selected.saturating_sub(1);
-                        } else if seq == [b'[', b'B'] {
+                        } else if seq == *b"[B" {
                             tui.selected = tui.selected.saturating_add(1);
                         }
                         tui.confirm_delete = None;

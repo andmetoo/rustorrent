@@ -358,6 +358,7 @@ impl PinnedDir {
                 desired_access,
                 disposition,
                 true,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 security_descriptor,
             )?;
             let next = Self::from_file(opened.file)?;
@@ -391,6 +392,7 @@ impl PinnedDir {
             regular_access(),
             disposition,
             false,
+            0,
             None,
         )?;
         checked_regular(opened, &parent, &name)
@@ -413,6 +415,7 @@ impl PinnedDir {
             regular_access() | READ_CONTROL,
             disposition,
             false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
         )?;
         checked_regular(opened, &parent, &name)
@@ -437,6 +440,7 @@ impl PinnedDir {
             regular_access() | READ_CONTROL | WRITE_DAC,
             disposition,
             false,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             security_descriptor,
         )?;
         checked_regular(opened, &parent, &name)
@@ -581,6 +585,7 @@ fn nt_open_component(
     desired_access: u32,
     disposition: CreateDisposition,
     directory: bool,
+    share_access: u32,
     security_descriptor: Option<&[u8]>,
 ) -> io::Result<NativeOpen> {
     let mut wide = validate_component(component)?;
@@ -646,8 +651,10 @@ fn nt_open_component(
             } else {
                 FILE_ATTRIBUTE_NORMAL
             },
-            // Omitting FILE_SHARE_DELETE pins the opened directory entry.
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            // FILE_SHARE_DELETE is always omitted to pin the entry. Payload
+            // callers additionally pass zero so ownership is exclusive even
+            // between multiple handles opened by the same process.
+            share_access,
             disposition.native(),
             create_options,
             std::ptr::null_mut(),

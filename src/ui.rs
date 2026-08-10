@@ -5302,11 +5302,7 @@ fn status_json(state: &UiState) -> String {
 }
 
 fn percent(done: u64, total: u64) -> u64 {
-    if total == 0 {
-        0
-    } else {
-        (done.saturating_mul(10_000)) / total
-    }
+    done.saturating_mul(10_000).checked_div(total).unwrap_or(0)
 }
 
 fn ratio_value(uploaded: u64, downloaded: u64) -> f64 {

@@ -3030,7 +3030,9 @@ mod tests {
             assert_eq!(metadata.nlink(), 1);
         }
 
-        fs::remove_dir_all(root).unwrap();
+        // The Windows state backend deliberately pins directory handles for
+        // the process lifetime; temporary cleanup is therefore best effort.
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3043,10 +3045,10 @@ mod tests {
 
         let table = RoutingTable::new([0u8; 20]);
         let err = save_nodes(&table, &cache).unwrap_err();
-        assert!(err.contains("hard-linked"));
+        assert!(err.contains("hard-linked") || err.contains("multiply-linked"));
         assert_eq!(fs::read(&original).unwrap(), b"sentinel");
 
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
