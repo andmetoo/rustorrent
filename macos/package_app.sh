@@ -149,6 +149,19 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
   codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \
     "$APP_BUNDLE"
   codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+else
+  # Apple Silicon executables receive linker-generated ad-hoc signatures, but
+  # those do not bind the helper binary to the surrounding app bundle. Seal
+  # every executable and then the bundle so macOS can consistently attribute
+  # Local Network permission to CFBundleIdentifier. This is not a substitute
+  # for Developer ID signing or notarization.
+  echo "==> Ad-hoc signing app bundle"
+  codesign --force --sign - --identifier "com.rustorrent.app.backend" \
+    "$APP_BUNDLE/Contents/MacOS/rustorrent-bin"
+  codesign --force --sign - --identifier "com.rustorrent.app.launcher" \
+    "$APP_BUNDLE/Contents/MacOS/rustorrent"
+  codesign --force --sign - "$APP_BUNDLE"
+  codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 fi
 
 ARTIFACT_BASE="${APP_NAME}-${VERSION}-${ARCH_TAG}"
@@ -189,7 +202,7 @@ if $CREATE_DMG; then
   echo "==> Creating DMG artifact"
   hdiutil create -volname "$APP_NAME" \
     -srcfolder "$DMG_TEMP" \
-    -ov -format UDZO \
+    -fs HFS+ -ov -format UDBZ \
     "$DMG_PATH" >/dev/null
   rm -rf "$DMG_TEMP"
   echo "DMG artifact: $DMG_PATH"

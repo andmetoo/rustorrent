@@ -2873,7 +2873,17 @@ fn run() -> Result<(), String> {
         let port = args.port;
         let mapping_ui = ui_state.clone();
         spawn_detached("upnp-mapping", move || {
-            record_port_mapping_result(&mapping_ui, "upnp", port, upnp::map_port(port));
+            run_port_mapping_with_retries(
+                &mapping_ui,
+                "upnp",
+                port,
+                &[
+                    Duration::from_secs(3),
+                    Duration::from_secs(10),
+                    Duration::from_secs(30),
+                ],
+                || upnp::map_port(port),
+            );
         });
     } else {
         update_ui(&ui_state, |state| {
@@ -13414,11 +13424,51 @@ fn record_port_mapping_result(
     } else {
         log_warn!("{message}");
     }
+    set_port_mapping_status(ui_state, protocol, message);
+}
+
+fn set_port_mapping_status(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    protocol: &str,
+    message: String,
+) {
     update_ui(ui_state, |state| match protocol {
         "nat-pmp" => state.natpmp_status = message,
         "upnp" => state.upnp_status = message,
         _ => {}
     });
+}
+
+fn run_port_mapping_with_retries<F>(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    protocol: &str,
+    port: u16,
+    retry_delays: &[Duration],
+    mut map_port: F,
+) where
+    F: FnMut() -> Result<(), String>,
+{
+    for attempt in 0..=retry_delays.len() {
+        let result = map_port();
+        let error = result.as_ref().err().cloned();
+        record_port_mapping_result(ui_state, protocol, port, result);
+        let Some(error) = error else {
+            return;
+        };
+        let Some(delay) = retry_delays.get(attempt) else {
+            return;
+        };
+        let message = format!(
+            "retrying {protocol} on port {port} in {}s after: {error}",
+            delay.as_secs()
+        );
+        log_info!("{message}");
+        set_port_mapping_status(ui_state, protocol, message);
+        sleep_with_shutdown(*delay);
+        if shutdown_requested() {
+            return;
+        }
+    }
 }
 
 fn set_peer_interest(

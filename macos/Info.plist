@@ -72,5 +72,7 @@
     </array>
     <key>NSDownloadsFolderUsageDescription</key>
     <string>Rustorrent needs access to the Downloads folder to save downloaded files.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Rustorrent uses the local network to discover your router, map its incoming peer port, and find nearby BitTorrent peers.</string>
 </dict>
 </plist>

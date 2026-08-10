@@ -1,13 +1,16 @@
-use std::net::UdpSocket;
-use std::time::Duration;
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::time::{Duration, Instant};
 
 use crate::http;
 
-const SSDP_ADDR: &str = "239.255.255.250:1900";
-const SSDP_TIMEOUT: Duration = Duration::from_secs(2);
+const SSDP_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900);
+const SSDP_ATTEMPTS: usize = 3;
+const SSDP_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub fn map_port(port: u16) -> Result<(), String> {
-    let location = discover_gateway().ok_or_else(|| "upnp gateway not found".to_string())?;
+    let location = discover_gateway()
+        .ok_or_else(|| "gateway did not answer UPnP discovery after 3 attempts".to_string())?;
     let description = http::get_same_origin(&location, 512 * 1024)?;
     let control = parse_control_url(&description, &location)
         .ok_or_else(|| "upnp control url not found".to_string())?;
@@ -27,30 +30,66 @@ pub fn map_port(port: u16) -> Result<(), String> {
 }
 
 fn discover_gateway() -> Option<String> {
+    discover_gateway_at(SSDP_ADDR, SSDP_ATTEMPTS, SSDP_TIMEOUT)
+}
+
+fn discover_gateway_at(
+    discovery_addr: SocketAddrV4,
+    attempts: usize,
+    timeout: Duration,
+) -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    let _ = socket.set_read_timeout(Some(SSDP_TIMEOUT));
     let msg = "\
 M-SEARCH * HTTP/1.1\r\n\
 HOST: 239.255.255.250:1900\r\n\
 MAN: \"ssdp:discover\"\r\n\
-MX: 2\r\n\
+MX: 1\r\n\
 ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\
 \r\n";
-    let _ = socket.send_to(msg.as_bytes(), SSDP_ADDR);
-    let mut buf = [0u8; 2048];
-    if let Ok((n, source)) = socket.recv_from(&mut buf) {
-        let text = String::from_utf8_lossy(&buf[..n]);
-        for line in text.split("\r\n") {
-            if let Some((name, value)) = line.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("location") {
-                    let value = value.trim();
-                    if (value.starts_with("http://") || value.starts_with("https://"))
-                        && !value.bytes().any(|b| b.is_ascii_control())
-                        && http::url_host_ip(value) == Some(source.ip())
-                    {
-                        return Some(value.to_string());
+    for _ in 0..attempts {
+        if socket.send_to(msg.as_bytes(), discovery_addr).is_err() {
+            continue;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if socket.set_read_timeout(Some(remaining)).is_err() {
+                return None;
+            }
+            let mut buf = [0u8; 2048];
+            match socket.recv_from(&mut buf) {
+                Ok((n, source)) => {
+                    if let Some(location) = ssdp_location(&buf[..n], source.ip()) {
+                        return Some(location);
                     }
                 }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    break;
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+    None
+}
+
+fn ssdp_location(response: &[u8], source_ip: IpAddr) -> Option<String> {
+    let text = std::str::from_utf8(response).ok()?;
+    for line in text.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("location") {
+            let value = value.trim();
+            if (value.starts_with("http://") || value.starts_with("https://"))
+                && !value.bytes().any(|byte| byte.is_ascii_control())
+                && http::url_host_ip(value) == Some(source_ip)
+            {
+                return Some(value.to_string());
             }
         }
     }
@@ -133,6 +172,7 @@ fn local_ip() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn parse_control_url_supports_relative_and_absolute_urls() {
@@ -181,5 +221,50 @@ mod tests {
         assert!(body.contains("AddPortMapping"));
         assert!(body.contains("<NewProtocol>UDP</NewProtocol>"));
         assert!(body.contains("WANPPPConnection:1"));
+    }
+
+    #[test]
+    fn ssdp_location_requires_the_response_source_host() {
+        let response = b"HTTP/1.1 200 OK\r\nLOCATION: http://192.0.2.1:1900/igd.xml\r\n\r\n";
+        assert_eq!(
+            ssdp_location(response, "192.0.2.1".parse().unwrap()),
+            Some("http://192.0.2.1:1900/igd.xml".to_string())
+        );
+        assert_eq!(ssdp_location(response, "192.0.2.2".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn discovery_retries_and_ignores_an_invalid_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server_addr = match server.local_addr().unwrap() {
+            std::net::SocketAddr::V4(addr) => addr,
+            _ => unreachable!(),
+        };
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let _ = server.recv_from(&mut buf).unwrap();
+            let (_, peer) = server.recv_from(&mut buf).unwrap();
+            server
+                .send_to(
+                    b"HTTP/1.1 200 OK\r\nLOCATION: http://192.0.2.1/igd.xml\r\n\r\n",
+                    peer,
+                )
+                .unwrap();
+            server
+                .send_to(
+                    b"HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:1900/igd.xml\r\n\r\n",
+                    peer,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            discover_gateway_at(server_addr, 2, Duration::from_millis(100)),
+            Some("http://127.0.0.1:1900/igd.xml".to_string())
+        );
+        handle.join().unwrap();
     }
 }

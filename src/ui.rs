@@ -4681,10 +4681,23 @@ fn app_body_html(state: &UiState) -> String {
             "<div class=\"session-row\"><span>Incoming Port</span><span class=\"session-value\">{}</span></div>",
             state.incoming_port
         ));
+        let all_mapping_statuses = [&state.natpmp_status, &state.upnp_status];
+        let successful_mapping_statuses = all_mapping_statuses
+            .iter()
+            .copied()
+            .filter(|status| status.starts_with("mapped "))
+            .collect::<Vec<_>>();
+        let visible_mapping_statuses = if successful_mapping_statuses.is_empty() {
+            all_mapping_statuses.as_slice()
+        } else {
+            successful_mapping_statuses.as_slice()
+        };
+        let mapping_html = visible_mapping_statuses
+            .iter()
+            .map(|status| format!("<span>{}</span>", escape_html(status)))
+            .collect::<String>();
         out.push_str(&format!(
-            "<div class=\"session-row stack\"><span>Port Mapping</span><span class=\"session-value\"><span>{}</span><span>{}</span></span></div>",
-            escape_html(&state.natpmp_status),
-            escape_html(&state.upnp_status)
+            "<div class=\"session-row stack\"><span>Port Mapping</span><span class=\"session-value\">{mapping_html}</span></div>"
         ));
     }
     out.push_str(&format!(
@@ -5980,6 +5993,20 @@ mod tests {
             )
         );
         assert!(full_html.contains(".session-row.stack{"));
+    }
+
+    #[test]
+    fn successful_port_mapping_hides_failed_alternative() {
+        let state = UiState {
+            incoming_port: 6881,
+            natpmp_status: "failed nat-pmp on port 6881: unsupported".to_string(),
+            upnp_status: "mapped upnp on port 6881".to_string(),
+            ..UiState::default()
+        };
+
+        let body_html = app_body_html(&state);
+        assert!(body_html.contains("<span>mapped upnp on port 6881</span>"));
+        assert!(!body_html.contains("failed nat-pmp"));
     }
 
     #[test]
