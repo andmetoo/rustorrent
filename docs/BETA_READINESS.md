@@ -52,6 +52,7 @@ Review protocol parsing and networking, storage and durable state, runtime lifec
 - A 120-second TCP/uTP transport soak passed. This is a transport soak, not a claim of a multi-hour torrent swarm test.
 - Five fuzz targets each ran 2,000 coverage-guided inputs without a sanitizer. No crashes were observed in these finite smoke runs.
 - Rust 1.89 and strict all-feature Clippy checks passed. Both dependency lockfiles passed cargo-audit. Cross-platform CI and final artifact validation are required before publication.
+- The Rust 1.98 CI run exposed new chunk-iteration and slice-fill lints. Equivalent `as_chunks`/`fill` forms keep the build warning-free while retaining Rust 1.89 compatibility.
 - The adversarial process harness now uses file-backed logs and RAII child cleanup, and allocates distinct ports across parallel tests. This fixes output-pipe stalls, leaked children on failed assertions, and port-reuse collisions in the test infrastructure.
 
 ## Beta boundaries

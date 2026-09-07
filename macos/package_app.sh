@@ -160,7 +160,7 @@ else
   # those do not seal the surrounding app bundle. Sign the helper and then
   # the bundle for local integrity verification. Ad-hoc signatures alone do
   # not guarantee stable Local Network permission across rebuilds, nor replace
-  # for Developer ID signing or notarization.
+  # Developer ID signing or notarization.
   echo "==> Ad-hoc signing app bundle"
   codesign --force --sign - --identifier "com.rustorrent.app.backend" \
     "$APP_BUNDLE/Contents/MacOS/rustorrent-bin"

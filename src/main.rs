@@ -5869,7 +5869,7 @@ fn decode_hex_20(value: &str) -> Option<[u8; 20]> {
         return None;
     }
     let mut out = [0u8; 20];
-    for (idx, chunk) in bytes.chunks_exact(2).enumerate() {
+    for (idx, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = (chunk[0] as char).to_digit(16)? as u8;
         let lo = (chunk[1] as char).to_digit(16)? as u8;
         out[idx] = (hi << 4) | lo;
@@ -5883,7 +5883,7 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (idx, chunk) in bytes.chunks_exact(2).enumerate() {
+    for (idx, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = (chunk[0] as char).to_digit(16)? as u8;
         let lo = (chunk[1] as char).to_digit(16)? as u8;
         out[idx] = (hi << 4) | lo;
@@ -7287,7 +7287,7 @@ impl V2HashStore {
                         .last()
                         .ok_or_else(|| "v2 piece layer disappeared".to_string())?;
                     let mut next = Vec::with_capacity(previous.len() / 2);
-                    for pair in previous.chunks_exact(2) {
+                    for pair in previous.as_chunks::<2>().0 {
                         next.push(v2_hash_parent(pair[0], pair[1]));
                     }
                     layers.push(next);
@@ -12647,7 +12647,7 @@ fn decode_compact_peers(bytes: &[u8]) -> Vec<SocketAddr> {
     if !bytes.len().is_multiple_of(6) {
         return peers;
     }
-    for chunk in bytes.chunks_exact(6) {
+    for chunk in bytes.as_chunks::<6>().0 {
         let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         peers.push(SocketAddr::new(ip.into(), port));
@@ -12660,7 +12660,7 @@ fn decode_compact_peers6(bytes: &[u8]) -> Vec<SocketAddr> {
     if !bytes.len().is_multiple_of(18) {
         return peers;
     }
-    for chunk in bytes.chunks_exact(18) {
+    for chunk in bytes.as_chunks::<18>().0 {
         let ip = std::net::Ipv6Addr::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
             chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],

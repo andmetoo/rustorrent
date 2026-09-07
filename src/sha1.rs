@@ -83,7 +83,7 @@ impl Sha1 {
 
     fn process_block(&mut self, block: &[u8]) {
         let mut w = [0u32; 80];
-        for (i, chunk) in block.chunks_exact(4).take(16).enumerate() {
+        for (i, chunk) in block.as_chunks::<4>().0.iter().take(16).enumerate() {
             w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         for i in 16..80 {

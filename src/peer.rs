@@ -560,7 +560,7 @@ fn decode_hashes(data: &[u8]) -> Result<Message, Error> {
     }
     let request = decode_hash_request(&data[..HASH_REQUEST_PAYLOAD_LEN])?;
     let mut hashes = Vec::with_capacity((data.len() - HASH_REQUEST_PAYLOAD_LEN) / 32);
-    for chunk in data[HASH_REQUEST_PAYLOAD_LEN..].chunks_exact(32) {
+    for chunk in data[HASH_REQUEST_PAYLOAD_LEN..].as_chunks::<32>().0 {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(chunk);
         hashes.push(hash);

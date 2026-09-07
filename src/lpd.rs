@@ -198,7 +198,7 @@ fn decode_hex_20(value: &str) -> Option<[u8; 20]> {
         return None;
     }
     let mut out = [0u8; 20];
-    for (idx, chunk) in bytes.chunks_exact(2).enumerate() {
+    for (idx, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = (chunk[0] as char).to_digit(16)? as u8;
         let lo = (chunk[1] as char).to_digit(16)? as u8;
         out[idx] = (hi << 4) | lo;
