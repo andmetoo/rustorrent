@@ -1,6 +1,10 @@
 # Rustorrent Test Coverage and Scope
 
-Last inventory refresh: 2026-07-13
+Last inventory refresh: 2026-09-06 (first beta)
+
+The first beta also has 8 Python wire/process tests, 3 Transmission interoperability tests, and
+5 browser interaction/accessibility tests. Run them using the commands in README.md. The full
+findings and practical limits are in [BETA_READINESS.md](BETA_READINESS.md).
 
 ## Purpose
 
@@ -19,13 +23,13 @@ cargo test --all-features -- --list
 
 | Suite | Defined tests |
 |---|---:|
-| Unit and local-fixture tests (`src/main.rs` and modules) | 450 |
+| Unit and local-fixture tests (`src/main.rs` and modules, macOS full build) | 454 |
 | Adversarial process tests (`tests/process_release_gate.rs`) | 9 |
 | Swarm/uTP tests (`tests/soak_swarm.rs`) | 18 |
-| **Total** | **477** |
+| **Total Rust tests** | **481** |
 
 One long-running mixed-swarm soak test is ignored by default. A normal full run therefore executes
-476 tests and reports one ignored test.
+480 Rust tests and reports one ignored test.
 
 Exact totals will grow as coverage is added. Treat the commands below—not hard-coded module
 counts—as the authoritative release gates.
@@ -125,12 +129,13 @@ RUSTORRENT_SOAK_SECS=300 \
   are not yet scheduled.
 - Search plugins are executable third-party Python code running with the current user's authority;
   the application warns before installation but does not sandbox them.
-- Crash/restart tests validate state-file integrity; they do not yet kill and resume a guaranteed
-  active piece transfer at randomized checkpoints.
+- The Python transfer gate kills and resumes a known active transfer, compares the recovered
+  bytes, and rejects corrupt peer data. Randomized multi-hour crash campaigns remain separate.
 - Windows-specific handle-relative filesystem behavior cannot run on Unix hosts; the Windows CI
   job therefore runs the full feature/process suite in addition to both compile configurations.
-- Credential-free CI does not execute Developer ID signing/notarization, the DMG path, or a full
-  launched macOS app flow. Linux aarch64 does not have a continuous runtime gate.
+- CI verifies ad-hoc bundle signatures and DMG integrity. It cannot execute Developer ID
+  signing/notarization. The native Mac window was also smoke-tested locally; Linux aarch64 does
+  not have a continuous runtime gate.
 
 These gaps should remain explicit in release notes until corresponding automated or manual gates
 exist.

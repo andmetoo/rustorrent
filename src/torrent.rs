@@ -160,6 +160,12 @@ impl From<bencode::Error> for Error {
     }
 }
 
+pub fn info_bytes(data: &[u8]) -> Result<&[u8], Error> {
+    let (_, span) = parse_top_dict(data)?;
+    let (start, end) = span.ok_or(Error::MissingField("info"))?;
+    Ok(&data[start..end])
+}
+
 pub fn parse_torrent(data: &[u8]) -> Result<TorrentMeta, Error> {
     let (top_dict, info_span) = parse_top_dict(data)?;
     let info_span = info_span.ok_or(Error::MissingField("info"))?;
@@ -314,7 +320,7 @@ fn parse_info_dict(value: &Value, has_v2: bool, has_v1: bool) -> Result<InfoDict
                 return Err(Error::InvalidPiecesLength);
             }
             let mut pieces = Vec::with_capacity(pieces_bytes.len() / 20);
-            for chunk in pieces_bytes.chunks_exact(20) {
+            for chunk in pieces_bytes.as_chunks::<20>().0 {
                 let mut hash = [0u8; 20];
                 hash.copy_from_slice(chunk);
                 pieces.push(hash);
@@ -529,7 +535,7 @@ fn parse_piece_layers(value: &Value) -> Result<PieceLayerHashes, Error> {
             return Err(Error::InvalidPieceLayers);
         }
         let mut hashes = Vec::with_capacity(hashes_bytes.len() / 32);
-        for chunk in hashes_bytes.chunks_exact(32) {
+        for chunk in hashes_bytes.as_chunks::<32>().0 {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(chunk);
             hashes.push(hash);

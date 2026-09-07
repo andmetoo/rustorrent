@@ -428,16 +428,10 @@ impl PieceManager {
     pub fn reset_verified(&mut self) {
         for piece in &mut self.pieces {
             piece.verified = false;
-            for block in &mut piece.blocks {
-                *block = BlockState::Missing;
-            }
+            piece.blocks.fill(BlockState::Missing);
         }
-        for slot in &mut self.reserved_by {
-            *slot = None;
-        }
-        for slot in &mut self.reservation_time {
-            *slot = None;
-        }
+        self.reserved_by.fill(None);
+        self.reservation_time.fill(None);
     }
 
     #[allow(dead_code)]
@@ -816,9 +810,7 @@ impl PieceManager {
         let piece = self.pieces.get_mut(idx).ok_or(Error::InvalidPiece)?;
         let was_new = !piece.verified;
         piece.verified = true;
-        for state in &mut piece.blocks {
-            *state = BlockState::Complete;
-        }
+        piece.blocks.fill(BlockState::Complete);
         self.reserved_by[idx] = None;
         self.reservation_time[idx] = None;
         Ok(was_new)
@@ -846,9 +838,7 @@ impl PieceManager {
         let idx = index as usize;
         let piece = self.pieces.get_mut(idx).ok_or(Error::InvalidPiece)?;
         piece.verified = false;
-        for state in &mut piece.blocks {
-            *state = BlockState::Missing;
-        }
+        piece.blocks.fill(BlockState::Missing);
         self.reserved_by[idx] = None;
         self.reservation_time[idx] = None;
         Ok(())

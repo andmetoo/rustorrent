@@ -27,6 +27,11 @@ macos/rustorrent-bin
 
 # Test output
 output/
+node_modules/
+.playwright-cli/
+test-results/
+playwright-report/
+__pycache__/
 
 # Downloaded content directories
 Top_150_Super-Nintendo*/

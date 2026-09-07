@@ -1049,7 +1049,7 @@ fn parse_compact_peers(bytes: &[u8], limit: usize) -> Result<Vec<SocketAddr>, Er
     }
     let peer_count = (bytes.len() / 6).min(limit);
     let mut peers = Vec::with_capacity(peer_count);
-    for chunk in bytes.chunks_exact(6).take(peer_count) {
+    for chunk in bytes.as_chunks::<6>().0.iter().take(peer_count) {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         if port == 0 {
@@ -1074,7 +1074,7 @@ fn parse_compact_peers6(bytes: &[u8], limit: usize) -> Result<Vec<SocketAddr>, E
     }
     let peer_count = (bytes.len() / 18).min(limit);
     let mut peers = Vec::with_capacity(peer_count);
-    for chunk in bytes.chunks_exact(18).take(peer_count) {
+    for chunk in bytes.as_chunks::<18>().0.iter().take(peer_count) {
         let ip = Ipv6Addr::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
             chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],

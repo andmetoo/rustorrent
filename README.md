@@ -2,7 +2,8 @@
 
 A compact BitTorrent client implemented in Rust, with console, terminal, and built-in web
 interfaces. The CLI builds as one executable; macOS is also distributed as a native app bundle.
-It is still prerelease software, so keep a backup of important data.
+The first beta adds complete transfer and browser tests, independent Transmission interoperability,
+reliable encrypted peer connections, and a simpler interface. It remains prerelease software.
 
 Works on **macOS 11 or newer** and **Linux**. Windows support is partial (builds, but NAT-PMP gateway detection is not implemented).
 
@@ -10,11 +11,11 @@ Works on **macOS 11 or newer** and **Linux**. Windows support is partial (builds
 
 ### Library overview
 
-![Rustorrent library overview](docs/screenshots/library-overview.png)
+![Rustorrent beta library](docs/screenshots/beta-library.png)
 
-### Search plugin catalog
+### Dark appearance
 
-![Rustorrent search plugin catalog](docs/screenshots/search-workspace.png)
+![Rustorrent beta dark appearance](docs/screenshots/beta-dark.png)
 
 ## Features
 
@@ -203,6 +204,7 @@ rustorrent --port 51413 ubuntu.torrent
 ```
 
 Default listen port is 6881. The client uses NAT-PMP and UPnP to automatically map the port on your router when possible.
+Mappings are refreshed while the app runs. Pass `--no-port-mapping` to leave router configuration alone.
 
 ### IP blocklist
 
@@ -246,6 +248,31 @@ Profiles adjust `--max-peers`, `--max-peers-torrent`, `--numwant`, and the magne
 `balanced` is the default and matches the previous behavior. If you also pass `--max-peers`, `--max-peers-torrent`, or `--numwant`, those explicit flags override the preset.
 
 The web UI exposes the same setting in the Transfer panel.
+
+File choices and **Start immediately** are applied before a transfer starts. Paused transfers
+remain paused after restarting. Removing a transfer keeps its files unless you explicitly select
+**Also delete downloaded files**. Expand a transfer to inspect files, trackers, and advanced actions.
+
+## Beta validation
+
+The release gate runs Rust unit and process tests, a real-process transfer suite (including crash
+recovery, corruption rejection, seeding, and file removal), browser interaction and accessibility
+checks, and interoperability with Transmission, including required encryption.
+
+```sh
+cargo test --locked --all-features -- --test-threads=1
+cargo build --locked
+python3 tests/e2e_transfer.py
+# Requires transmission-daemon on PATH
+python3 tests/e2e_transmission.py
+npm ci
+npx playwright install chromium
+npm run test:e2e
+```
+
+The browser dependencies are development tools only. The distributed application still embeds
+its own HTML, CSS, JavaScript, icons, and system fonts without Node.js or a web framework.
+See [beta readiness](docs/BETA_READINESS.md) for findings, validation, and limits.
 
 ### Write cache
 

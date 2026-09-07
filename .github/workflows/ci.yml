@@ -98,14 +98,15 @@ jobs:
           rustup toolchain install 1.89.0 --profile minimal
           cargo +1.89.0 check --locked --all-targets --all-features
           cargo +1.89.0 check --locked --all-targets --no-default-features
-      - name: Run the Windows filesystem and process suite
-        if: runner.os == 'Windows'
+      - name: Run platform filesystem and process tests
         run: cargo test --locked --all-features -- --test-threads=1
       - name: Build and inspect the universal macOS app
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          ./macos/package_app.sh --universal --output "$RUNNER_TEMP/rustorrent-dist"
+          ./macos/package_app.sh --universal --dmg --output "$RUNNER_TEMP/rustorrent-dist"
+          hdiutil verify "$RUNNER_TEMP/rustorrent-dist/"*.dmg
+          codesign --verify --deep --strict target/macos-app/build/Rustorrent.app
           test -f target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent
           test -f target/macos-app/build/Rustorrent.app/Contents/MacOS/rustorrent-bin
           test -f target/macos-app/build/Rustorrent.app/Contents/Resources/AppIcon.icns
@@ -130,3 +131,29 @@ jobs:
         run: rustup toolchain install 1.89.0 --profile minimal
       - name: Check every target and feature
         run: cargo +1.89.0 check --locked --all-targets --all-features
+
+  end-to-end:
+    name: Browser and client interoperability
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y transmission-daemon
+          sudo systemctl stop transmission-daemon || true
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Build the tested application
+        run: cargo build --locked
+      - name: Transfer, integrity, crash recovery, and upload tests
+        run: python3 tests/e2e_transfer.py
+      - name: Transmission interoperability, including required encryption
+        run: python3 tests/e2e_transmission.py
+      - name: Browser flows and accessibility
+        run: npm run test:e2e

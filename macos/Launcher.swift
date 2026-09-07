@@ -537,7 +537,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         )
         window.center()
         window.title = "Rustorrent"
-        window.minSize = NSSize(width: 960, height: 640)
+        window.minSize = NSSize(width: 680, height: 520)
         window.isReleasedWhenClosed = false
         window.delegate = self
         if #available(macOS 11.0, *) {
@@ -553,7 +553,7 @@ final class RustorrentLauncher: NSObject, NSApplicationDelegate, NSWindowDelegat
         window.toolbar = toolbar
 
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
+        configuration.websiteDataStore = .default()
         let webView = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.uiDelegate = self

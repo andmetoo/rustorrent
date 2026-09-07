@@ -17,12 +17,14 @@ pub enum UiCommand {
         data: Vec<u8>,
         download_dir: String,
         preallocate: bool,
+        options: AddOptions,
         reply: mpsc::Sender<UiCommandResult>,
     },
     AddMagnet {
         magnet: String,
         download_dir: String,
         preallocate: bool,
+        options: AddOptions,
         reply: mpsc::Sender<UiCommandResult>,
     },
     PauseTorrent {
@@ -109,6 +111,35 @@ pub enum UiCommand {
         name: String,
         reply: mpsc::Sender<UiCommandResult>,
     },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AddOptions {
+    pub paused: bool,
+    pub skip_files: Vec<usize>,
+}
+
+fn add_options(form: &[(String, String)]) -> Result<AddOptions, String> {
+    let skip = query_value(form, "skip").unwrap_or("");
+    let mut skip_files = Vec::new();
+    if !skip.is_empty() {
+        for value in skip.split(',') {
+            if skip_files.len() >= 4096 {
+                return Err("too many selected files".to_string());
+            }
+            skip_files.push(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid file selection".to_string())?,
+            );
+        }
+        skip_files.sort_unstable();
+        skip_files.dedup();
+    }
+    Ok(AddOptions {
+        paused: query_value(form, "paused").is_some_and(parse_bool),
+        skip_files,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +437,7 @@ pub fn start(
     let active_connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let _ = stream.set_write_timeout(Some(UI_WRITE_TIMEOUT));
             let Some(slot_guard) = try_acquire_ui_connection_slot(&active_connections) else {
                 let _ = send_api_error_with_status(stream, 503, "ui busy");
                 continue;
@@ -1265,10 +1297,12 @@ fn handle_add_torrent(
         .map(parse_bool)
         .unwrap_or(false);
 
+    let options = add_options(query)?;
     let command_result = dispatch_command(cmd_tx, |reply| UiCommand::AddTorrent {
         data: request.body.clone(),
         download_dir,
         preallocate,
+        options,
         reply,
     })?;
     let torrent_id = match command_result {
@@ -1301,10 +1335,12 @@ fn handle_add_magnet(
         .map(parse_bool)
         .unwrap_or(false);
 
+    let options = add_options(&form)?;
     let command_result = dispatch_command(cmd_tx, |reply| UiCommand::AddMagnet {
         magnet,
         download_dir,
         preallocate,
+        options,
         reply,
     })?;
     let torrent_id = match command_result {
@@ -1642,6 +1678,7 @@ fn handle_search_add_result(
                 magnet,
                 download_dir,
                 preallocate,
+                options: AddOptions::default(),
                 reply,
             })?
         }
@@ -1650,6 +1687,7 @@ fn handle_search_add_result(
                 data,
                 download_dir,
                 preallocate,
+                options: AddOptions::default(),
                 reply,
             })?
         }
@@ -2273,2051 +2311,23 @@ fn write_sse_comment(stream: &mut TcpStream, comment: &str) -> std::io::Result<(
 
 fn status_html(state: &UiState) -> String {
     let mut out = String::with_capacity(5200 + state.torrents.len() * 2200);
-    out.push_str("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    out.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"data:,\">");
     out.push_str("<title>rustorrent</title>");
     out.push_str(&format!(
         "<meta name=\"rustorrent-api-token\" content=\"{}\">",
         escape_html(api_token())
     ));
     out.push_str("<script>try{var t=localStorage.getItem('rustorrent-theme');if(t!=='light'&&t!=='dark'){t='light';}document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>");
-    out.push_str(r#"<style>
-/* rustorrent UI — clean, light-default, self-contained (system fonts + inline SVG icons) */
-.material-symbols-rounded{width:1em;height:1em;display:inline-block;flex:0 0 auto;vertical-align:-.15em;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.material-symbols-rounded use{pointer-events:none}
-:root{
-  color-scheme:light;
-  --f:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji",sans-serif;
-  --bg:#f5f6f8;
-  --surface:#ffffff;
-  --surface-cont:#f4f5f7;
-  --surface-cont-high:#eceef1;
-  --surface-cont-highest:#e3e6ea;
-  --on-surface:#0f172a;
-  --on-surface-var:#576070;
-  --primary:#2563eb;
-  --on-primary:#ffffff;
-  --primary-cont:#dce8fd;
-  --on-primary-cont:#1742a3;
-  --secondary:#475569;
-  --on-secondary:#ffffff;
-  --secondary-cont:#e6eaf0;
-  --on-secondary-cont:#26303f;
-  --tertiary:#7c3aed;
-  --error:#bb1b1b;
-  --on-error:#ffffff;
-  --error-cont:#fde7e7;
-  --on-error-cont:#8e1414;
-  --outline:#cdd3dc;
-  --outline-var:#e7eaee;
-  --success:#07692f;
-  --success-cont:#ddf3e4;
-  --warning:#85500a;
-  --warning-cont:#fbeed0;
-  --danger-cont:#fde7e7;
-  --inverse-surface:#26303f;
-  --inverse-on-surface:#f6f8fb;
-  --elevation-1:0 1px 2px rgba(15,23,42,.06);
-  --elevation-2:0 6px 16px -6px rgba(15,23,42,.16);
-  --elevation-3:0 16px 40px -12px rgba(15,23,42,.22);
-  --state-hover:rgba(15,23,42,.045);
-  --state-press:rgba(15,23,42,.08);
-  --ease-out:cubic-bezier(.2,0,0,1);
-  --ease-in-out:cubic-bezier(.4,0,.2,1);
-  --fast:140ms;
-  --standard:200ms;
-  --card-accent:var(--primary);
-}
-:root[data-theme="dark"]{
-  color-scheme:dark;
-  --bg:#0b0e14;
-  --surface:#10151d;
-  --surface-cont:#161c26;
-  --surface-cont-high:#1d2531;
-  --surface-cont-highest:#26303d;
-  --on-surface:#e6ecf3;
-  --on-surface-var:#93a1b5;
-  --primary:#69a5ff;
-  --on-primary:#04101f;
-  --primary-cont:#1a3354;
-  --on-primary-cont:#cfe0fb;
-  --secondary:#94a3b8;
-  --on-secondary:#0b0e14;
-  --secondary-cont:#27313f;
-  --on-secondary-cont:#dbe3ee;
-  --tertiary:#a78bfa;
-  --error:#f87171;
-  --on-error:#1c0707;
-  --error-cont:#3a1a1a;
-  --on-error-cont:#fecdcd;
-  --outline:#384556;
-  --outline-var:#1e2733;
-  --success:#48d07f;
-  --success-cont:rgba(34,197,94,.16);
-  --warning:#f0b03e;
-  --warning-cont:rgba(240,176,62,.16);
-  --danger-cont:rgba(248,113,113,.16);
-  --inverse-surface:#e6ecf3;
-  --inverse-on-surface:#1d2531;
-  --elevation-1:0 1px 2px rgba(0,0,0,.4);
-  --elevation-2:0 8px 20px -8px rgba(0,0,0,.6);
-  --elevation-3:0 20px 48px -12px rgba(0,0,0,.7);
-  --state-hover:rgba(255,255,255,.05);
-  --state-press:rgba(255,255,255,.09);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;overflow:hidden}
-body{font:14px/1.55 var(--f);color:var(--on-surface);background:var(--bg);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
-.app{width:100%;max-width:1600px;height:100svh;max-height:100svh;margin:0 auto;display:flex;flex-direction:column;overflow:hidden;padding:16px 24px 24px}
-.appbar{position:relative;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 24px;background:var(--surface);border-bottom:1px solid var(--outline-var);margin:-16px -24px 0}
-.brand{display:flex;align-items:center;gap:12px}
-.brand-icon{width:34px;height:34px;border-radius:10px;background:var(--primary);color:var(--on-primary);display:grid;place-items:center}
-.brand-icon .material-symbols-rounded{font-size:20px}
-.brand .title{font:700 18px/1 var(--f);letter-spacing:-.02em}
-.brand .sub{font:500 12px/1 var(--f);color:var(--on-surface-var);margin-top:3px}
-.app-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.chip{display:inline-flex;align-items:center;gap:5px;height:30px;padding:0 12px;border-radius:8px;background:var(--surface-cont);color:var(--on-surface-var);font:500 12px var(--f);border:1px solid var(--outline-var)}
-.chip .material-symbols-rounded{font-size:16px}
-.appbar-main{display:flex;align-items:center;gap:18px;min-width:0;flex:1 1 auto}
-.toolbar{display:flex;gap:8px;flex-wrap:wrap}
-.app-tabs{display:flex;align-items:center;gap:4px;background:var(--surface-cont);padding:4px;border-radius:11px;border:1px solid var(--outline-var)}
-.tab-btn{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 14px;border-radius:8px;border:none;background:transparent;color:var(--on-surface-var);font:600 12px/1 var(--f);letter-spacing:.01em;cursor:pointer;transition:background var(--fast),color var(--fast),box-shadow var(--fast)}
-.tab-btn .material-symbols-rounded{font-size:17px}
-.tab-btn:hover{color:var(--on-surface)}
-.tab-btn.active{background:var(--surface);color:var(--primary);box-shadow:var(--elevation-1)}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:10px;border:1px solid transparent;font:600 13px/1 var(--f);letter-spacing:.01em;cursor:pointer;transition:background var(--fast) var(--ease-out),color var(--fast),border-color var(--fast),box-shadow var(--fast),transform var(--fast);background:var(--surface-cont);color:var(--on-surface);border-color:var(--outline-var)}
-.btn .material-symbols-rounded{font-size:18px}
-.btn:hover{background:var(--surface-cont-high)}
-.btn:active{transform:translateY(.5px)}
-.btn:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
-.btn.primary{background:var(--primary);color:var(--on-primary);border-color:transparent}
-.btn.primary:hover{background:color-mix(in srgb,var(--primary),#000 9%)}
-.btn.danger{background:transparent;color:var(--error);border-color:transparent}
-.btn.danger:hover{background:var(--danger-cont)}
-.btn.ghost{background:transparent;color:var(--on-surface-var);border-color:transparent}
-.btn.ghost:hover{background:var(--state-hover);color:var(--on-surface)}
-.btn.active{background:var(--primary-cont);color:var(--on-primary-cont);border-color:transparent}
-.btn.icon-btn{width:36px;height:36px;padding:0;border-radius:10px;justify-content:center}
-.btn.icon-btn .material-symbols-rounded{font-size:20px}
-:root.theme-switching,:root.theme-switching *{transition:none!important;animation:none!important}
-.layout{display:flex;align-items:stretch;gap:24px;margin-top:24px;flex:1 1 auto;min-height:0;overflow:hidden}
-.fleet-panel{position:relative;overflow:hidden;display:grid;grid-template-columns:minmax(240px,1.15fr) repeat(4,minmax(120px,.65fr));gap:1px;padding:0;background:var(--outline-var);border-radius:14px;border:1px solid var(--outline-var)}
-.fleet-hero,.fleet-metric{position:relative;background:var(--surface);padding:18px 20px}
-.fleet-hero{min-width:0}
-.fleet-eyebrow{display:flex;align-items:center;gap:8px;font:600 11px/1 var(--f);letter-spacing:.02em;color:var(--on-surface-var)}
-.signal-dot{width:8px;height:8px;border-radius:999px;background:var(--outline)}
-.signal-dot.live{background:var(--success)}
-.signal-dot.warn{background:var(--warning)}
-.signal-dot.error{background:var(--error)}
-.fleet-title{margin-top:10px;font:700 22px/1.15 var(--f);letter-spacing:-.02em}
-.fleet-copy{margin-top:6px;color:var(--on-surface-var);font:400 13px/1.5 var(--f);max-width:58ch}
-.fleet-metric{display:flex;flex-direction:column;justify-content:space-between;min-height:100px}
-.fleet-metric .label{font:600 11px/1 var(--f);letter-spacing:.02em;color:var(--on-surface-var)}
-.fleet-metric .value{margin-top:12px;font:700 20px/1 var(--f);letter-spacing:-.02em}
-.fleet-metric .hint{margin-top:6px;font:400 12px/1.3 var(--f);color:var(--on-surface-var)}
-.workspace{display:none}
-.workspace.active{display:flex}
-.panel{background:var(--surface);border:1px solid var(--outline-var);border-radius:14px;padding:16px}
-.panel-title{font:600 12px/1 var(--f);letter-spacing:.01em;color:var(--on-surface-var)}
-.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
-.panel-toggle{height:30px;padding:0 10px;border-radius:8px;font-size:12px;flex-shrink:0}
-.transfer-panel .transfer-panel-body{margin-top:14px}
-.transfer-panel[data-collapsed="true"] .transfer-panel-body{display:none}
-.sidebar{flex:0 0 260px;width:260px;position:sticky;top:0;max-height:100%;align-self:start;display:flex;flex-direction:column;gap:16px;overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
-.search-sidebar{flex-basis:340px;width:340px}
-.nav{display:flex;flex-direction:column;gap:2px;margin-top:12px}
-.nav-item{display:flex;align-items:center;justify-content:space-between;height:38px;padding:0 12px;border-radius:9px;color:var(--on-surface-var);text-decoration:none;border:none;background:transparent;font:500 13px/1 var(--f);cursor:pointer;width:100%;text-align:left;transition:background var(--fast),color var(--fast)}
-.nav-item .nav-label{display:flex;align-items:center;gap:10px}
-.nav-item .material-symbols-rounded{font-size:19px}
-.nav-item:focus-visible{outline:2px solid var(--primary);outline-offset:-2px;border-radius:9px}
-.nav-item:hover{background:var(--state-hover);color:var(--on-surface)}
-.nav-item.active{background:var(--primary-cont);color:var(--on-primary-cont);font-weight:600}
-.count{min-width:22px;height:20px;display:inline-flex;align-items:center;justify-content:center;border-radius:7px;padding:0 6px;font:600 11px var(--f);background:var(--surface-cont-high);color:var(--on-surface-var)}
-.nav-item.active .count{background:color-mix(in srgb,var(--primary),transparent 82%);color:var(--on-primary-cont)}
-.small{font:400 12px/1.5 var(--f);color:var(--on-surface-var)}
-.small + .small{margin-top:2px}
-.session-stats{display:flex;flex-direction:column;gap:2px;margin-top:10px}
-.session-row{display:flex;align-items:center;justify-content:space-between;font:400 12px var(--f);color:var(--on-surface-var);padding:4px 0}
-.session-row .session-value{font-weight:600;color:var(--on-surface)}
-.session-row.stack{align-items:flex-start;flex-direction:column;gap:2px}
-.session-row.stack .session-value{display:flex;flex-direction:column;gap:2px;align-items:flex-start;text-align:left;line-height:1.35;overflow-wrap:anywhere}
-.limit-controls{margin-top:14px;padding-top:14px;border-top:1px solid var(--outline-var)}
-.limit-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.limit-label{font:500 11px var(--f);letter-spacing:.02em;color:var(--on-surface-var)}
-.limit-value{font:600 12px var(--f);color:var(--on-surface)}
-.limit-slider{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:2px;background:var(--surface-cont-highest);outline:none;margin:10px 0;cursor:pointer}
-.limit-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--primary);border:2px solid var(--surface);box-shadow:var(--elevation-1);cursor:pointer;transition:transform var(--fast)}
-.limit-slider::-webkit-slider-thumb:hover{transform:scale(1.15)}
-.limit-slider:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
-.torrent-list{flex:1 1 0;display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:8px}
-.torrent-card{position:relative;padding:18px 20px;overflow:hidden;background:var(--surface);border:1px solid var(--outline-var);border-radius:14px;transition:box-shadow var(--standard),border-color var(--standard)}
-.torrent-card:hover{box-shadow:var(--elevation-2);border-color:var(--outline)}
-.torrent-card::before{content:"";position:absolute;inset:0 0 auto;height:3px;background:var(--card-accent)}
-.torrent-card[data-status="downloading"]{--card-accent:var(--primary)}
-.torrent-card[data-status="complete"]{--card-accent:var(--success)}
-.torrent-card[data-status="seeding"]{--card-accent:var(--success)}
-.torrent-card[data-status="paused"]{--card-accent:var(--warning)}
-.torrent-card[data-status="queued"]{--card-accent:var(--outline)}
-.torrent-card[data-status="error"]{--card-accent:var(--error)}
-.torrent-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.torrent-title{font:600 16px/1.35 var(--f);letter-spacing:-.01em;word-break:break-word}
-.torrent-sub{margin-top:6px;font-size:12px;color:var(--on-surface-var);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.status-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:7px;font:600 11px var(--f);letter-spacing:.01em;text-transform:capitalize}
-.status-pill::before{content:"";width:6px;height:6px;border-radius:999px;background:currentColor}
-.status-pill .material-symbols-rounded{font-size:14px}
-.status-pill.status-downloading{background:var(--primary-cont);color:var(--on-primary-cont)}
-.status-pill.status-complete,.status-pill.status-seeding{background:var(--success-cont);color:var(--success)}
-.status-pill.status-paused{background:var(--warning-cont);color:var(--warning)}
-.status-pill.status-queued{background:var(--surface-cont-high);color:var(--on-surface-var)}
-.status-pill.status-error{background:var(--danger-cont);color:var(--error)}
-.torrent-size{font:500 13px var(--f);color:var(--on-surface-var)}
-.torrent-actions{display:flex;gap:4px;flex-wrap:wrap}
-.torrent-progress{margin-top:14px}
-.torrent-progress-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.torrent-progress-note{font:600 11px/1 var(--f);color:var(--on-surface-var)}
-.meta{font:400 12px var(--f);color:var(--on-surface-var)}
-.meta.error{color:var(--error)}
-.progress{margin-top:8px;height:6px;background:var(--surface-cont-highest);border-radius:999px;overflow:hidden}
-.progress .fill{height:100%;background:var(--primary);border-radius:999px;transition:width .4s var(--ease-out)}
-.progress.good .fill{background:var(--success)}
-.torrent-quick{display:none;margin-top:10px;gap:16px;flex-wrap:wrap;font:500 12px var(--f);color:var(--on-surface-var)}
-.torrent-quick .material-symbols-rounded{font-size:16px;vertical-align:-3px;margin-right:2px;opacity:.7}
-.torrent-vitals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:14px}
-.vital{min-width:0;border:1px solid var(--outline-var);background:var(--surface-cont);border-radius:11px;padding:11px 12px}
-.vital-label{display:flex;align-items:center;gap:5px;font:600 11px/1 var(--f);letter-spacing:.01em;color:var(--on-surface-var)}
-.vital-label .material-symbols-rounded{font-size:14px}
-.vital-value{margin-top:7px;font:600 14px/1.25 var(--f);color:var(--on-surface);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.vital-help{margin-top:4px;font:400 11px/1.35 var(--f);color:var(--on-surface-var)}
-.torrent-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:14px}
-.stat{border-radius:11px;padding:10px 14px;background:var(--surface-cont);border:1px solid var(--outline-var);transition:background var(--fast),border-color var(--fast)}
-.stat:hover{background:var(--surface-cont-high);border-color:var(--outline)}
-.stat .k{display:flex;align-items:center;gap:4px;color:var(--on-surface-var);font:600 11px var(--f);margin-bottom:4px}
-.stat .k .material-symbols-rounded{font-size:14px}
-.stat .v{font:600 14px var(--f);color:var(--on-surface)}
-.torrent-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px;max-height:60vh;overflow:auto;overscroll-behavior:contain;padding-right:6px}
-.detail-actions{grid-column:1 / -1;display:flex;gap:8px;flex-wrap:wrap}
-.detail-actions .btn{height:32px;padding:0 12px;border-radius:9px;font-size:12px}
-.speed-panel{grid-column:1 / -1}
-.speed-chart{margin-top:12px;border-radius:11px;border:1px solid var(--outline-var);background:var(--surface-cont);padding:10px 12px 12px}
-.speed-chart svg{display:block;width:100%;height:120px}
-.speed-chart-empty{min-height:120px;display:grid;place-items:center;color:var(--on-surface-var);font:500 12px var(--f)}
-.speed-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font:500 11px var(--f);color:var(--on-surface-var)}
-.speed-legend .item{display:inline-flex;align-items:center;gap:6px}
-.speed-legend .swatch{width:10px;height:10px;border-radius:999px;display:inline-block}
-.speed-legend .swatch.down{background:var(--primary)}
-.speed-legend .swatch.up{background:var(--tertiary)}
-.subpanel{background:var(--surface-cont);border:1px solid var(--outline-var);border-radius:11px;padding:14px 16px}
-.tracker-list{margin-top:10px;max-height:240px;overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
-.tracker-list::-webkit-scrollbar{width:8px}
-.tracker-list::-webkit-scrollbar-thumb{background:var(--outline-var);border-radius:999px}
-.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 12px;font:400 13px var(--f);margin-top:10px}
-.k{color:var(--on-surface-var);font:600 11px var(--f);padding-top:2px}
-.table{width:100%;border-collapse:collapse;font:400 13px var(--f)}
-.table th,.table td{padding:10px 8px;border-bottom:1px solid var(--outline-var);text-align:left;vertical-align:middle}
-.table th{font:600 11px var(--f);color:var(--on-surface-var)}
-.file-bar{height:4px;background:var(--surface-cont-highest);border-radius:999px;overflow:hidden}
-.file-bar .fill{height:100%;background:var(--success);border-radius:999px}
-.input{width:100%;height:38px;padding:0 12px;border:1px solid var(--outline);border-radius:10px;background:var(--surface);color:var(--on-surface);font:400 14px var(--f);transition:border-color var(--fast),box-shadow var(--fast)}
-.input::placeholder{color:var(--on-surface-var)}
-.input:hover{border-color:var(--on-surface-var)}
-.input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary),transparent 80%)}
-.btn:focus-visible,.tab-btn:focus-visible,.search-result-link:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
-.input:disabled{opacity:.5;cursor:not-allowed}
-.modal{position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;background:rgba(15,23,42,.5);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);padding:24px}
-.modal.open{display:flex;animation:modalFade .2s var(--ease-out)}
-.modal-card{width:min(560px,100%);max-height:85vh;overflow-y:auto;background:var(--surface);border:1px solid var(--outline-var);border-radius:18px;box-shadow:var(--elevation-3);padding:24px}
-.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
-.modal-title{font:700 18px/1.2 var(--f);letter-spacing:-.02em}
-.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:20px;padding-top:16px;border-top:1px solid var(--outline-var)}
-.add-grid{display:flex;flex-direction:column;gap:16px}
-.drop-zone{position:relative;border:1.5px dashed var(--outline);border-radius:12px;padding:30px 24px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;cursor:pointer;transition:border-color var(--fast),background var(--fast)}
-.drop-zone:hover{border-color:var(--primary);background:var(--state-hover)}
-.drop-zone.drag-over{border-color:var(--primary);border-style:solid;background:color-mix(in srgb,var(--primary),transparent 90%)}
-.drop-zone.has-file{border-style:solid;border-color:var(--primary);padding:16px 20px}
-.drop-zone .dz-icon{font-size:34px;color:var(--on-surface-var)}
-.drop-zone.has-file .dz-icon{font-size:22px;color:var(--primary)}
-.drop-zone .dz-text{font:500 14px var(--f);color:var(--on-surface-var)}
-.drop-zone .dz-hint{font:400 12px var(--f);color:var(--on-surface-var);opacity:.7}
-.drop-zone.has-file .dz-hint{display:none}
-.drop-zone .dz-file-info{display:none;align-items:center;gap:10px;width:100%}
-.drop-zone.has-file .dz-file-info{display:flex}
-.drop-zone.has-file .dz-text{display:none}
-.dz-file-name{flex:1;font:500 13px var(--f);color:var(--on-surface);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}
-.dz-file-remove{background:none;border:none;cursor:pointer;padding:4px;border-radius:50%;color:var(--on-surface-var);display:flex;align-items:center;transition:background var(--fast)}
-.dz-file-remove:hover{background:var(--surface-cont-high)}
-.drop-zone input[type="file"]{position:absolute;inset:0;opacity:0;cursor:pointer}
-.add-divider{display:flex;align-items:center;gap:12px;color:var(--on-surface-var);font:500 11px var(--f);letter-spacing:.02em}
-.add-divider::before,.add-divider::after{content:'';flex:1;height:1px;background:var(--outline-var)}
-.add-summary{padding:10px 14px;border-radius:10px;background:var(--surface-cont);font:400 13px var(--f);color:var(--on-surface-var)}
-.add-review{border:1px solid var(--outline-var);border-radius:12px;padding:14px;background:var(--surface)}
-.add-review-title{font:600 14px var(--f);color:var(--on-surface)}
-.add-review-meta{display:flex;gap:12px;flex-wrap:wrap;color:var(--on-surface-var);font-size:12px;margin-top:4px}
-.add-file-list{margin-top:10px;max-height:220px;overflow:auto;border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont)}
-.add-file-head,.add-file-row{display:grid;grid-template-columns:32px 1fr 80px;gap:6px;align-items:center;padding:6px 12px}
-.add-file-head{position:sticky;top:0;background:var(--surface-cont-high);border-bottom:1px solid var(--outline-var);font:600 10px var(--f);letter-spacing:.02em;color:var(--on-surface-var)}
-.add-file-row{border-bottom:1px solid var(--outline-var)}
-.add-file-row:last-child{border-bottom:none}
-.add-file-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}
-.add-file-size{text-align:right;color:var(--on-surface-var);font-size:11px}
-.add-file-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
-.add-opts{display:flex;flex-direction:column;gap:12px}
-.add-field-label{font:500 12px var(--f);color:var(--on-surface-var);margin-bottom:4px;letter-spacing:.02em}
-.add-download-row{display:flex;gap:8px;align-items:center}
-.add-download-row .input{flex:1;min-width:0}
-.add-prefs{display:flex;gap:16px;flex-wrap:wrap}
-.add-check{display:flex;align-items:center;gap:6px;font:400 13px var(--f);color:var(--on-surface-var);cursor:pointer}
-.add-check input[type="checkbox"]{width:16px;height:16px;accent-color:var(--primary);cursor:pointer}
-.page-drop-overlay{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;background:rgba(15,23,42,.55);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);pointer-events:none}
-.page-drop-overlay.active{display:flex}
-.page-drop-overlay-inner{display:flex;flex-direction:column;align-items:center;gap:12px;padding:48px 64px;border:2px dashed var(--primary);border-radius:20px;background:var(--surface)}
-.page-drop-overlay-inner .material-symbols-rounded{font-size:52px;color:var(--primary)}
-.page-drop-overlay-inner p{font:600 18px var(--f);color:var(--on-surface)}
-.torrent-card[data-collapsed="true"] .torrent-grid,.torrent-card[data-collapsed="true"] .torrent-stats{display:none}
-.torrent-card[data-collapsed="true"] .torrent-quick{display:flex}
-.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:72px 24px;text-align:center;min-height:360px;background:var(--surface)}
-.empty-state .material-symbols-rounded{font-size:48px;color:var(--primary);opacity:.8;margin-bottom:12px}
-.empty-state p{font:400 14px var(--f);color:var(--on-surface-var);max-width:340px}
-.rss-form{display:flex;gap:6px;margin-top:10px}
-.rss-form .input{height:34px;padding:0 10px;font-size:12px;flex:1;min-width:0}
-.rss-form .btn{height:34px;padding:0 12px;font-size:12px;flex-shrink:0}
-.rss-list{margin-top:10px;display:flex;flex-direction:column;gap:2px}
-.rss-item{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;border-radius:8px;font-size:12px;background:var(--surface-cont);transition:background var(--fast)}
-.rss-item:hover{background:var(--surface-cont-high)}
-.rss-item-info{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rss-item-meta{color:var(--on-surface-var);font-size:11px;margin-left:8px;flex-shrink:0}
-.rss-item .remove-btn{background:none;border:none;color:var(--on-surface-var);cursor:pointer;padding:2px 6px;border-radius:6px;font-size:14px;line-height:1;margin-left:4px;transition:color var(--fast),background var(--fast)}
-.rss-item .remove-btn:hover{color:var(--error);background:var(--danger-cont)}
-.rss-section-label{font:600 11px var(--f);letter-spacing:.02em;color:var(--on-surface-var);margin-top:12px;margin-bottom:4px}
-.search-form{display:flex;flex-direction:column;gap:8px;margin-top:10px}
-.search-form .input,.search-form select{height:34px;padding:0 10px;font-size:12px;border-radius:9px}
-.search-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.search-actions .btn{height:32px;padding:0 12px;font-size:12px;border-radius:9px}
-.search-warning{margin-top:8px;padding:12px;border-radius:12px;border:1px solid color-mix(in srgb,var(--primary),transparent 76%);background:color-mix(in srgb,var(--primary),transparent 92%)}
-.search-warning-title{font:700 12px var(--f);color:var(--on-surface);letter-spacing:.01em}
-.search-warning-copy{margin-top:6px;font-size:12px;line-height:1.5;color:var(--on-surface-var)}
-.search-warning .btn{margin-top:10px;height:32px;padding:0 12px;font-size:12px;border-radius:9px}
-.search-plugin-list{margin-top:8px;border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont)}
-.search-plugin-table{width:100%;border-collapse:collapse;font-size:12px}
-.search-plugin-table td{padding:6px 8px;vertical-align:middle;border-bottom:1px solid var(--outline-var)}
-.search-plugin-table tr:last-child td{border-bottom:none}
-.search-plugin-table td:first-child{width:24px;text-align:center}
-.search-plugin-table td:last-child{width:36px;text-align:center;padding:2px}
-.search-plugin-table input[type="checkbox"]{accent-color:var(--primary)}
-.search-remove-btn{padding:2px!important;min-width:0!important;height:auto!important;color:var(--on-surface-var)}
-.search-remove-btn:hover{color:var(--error)}
-.search-plugin-meta{flex:1;min-width:0}
-.search-plugin-name{font:600 12px var(--f);color:var(--on-surface);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.search-plugin-badge{display:inline-flex;align-items:center;height:18px;padding:0 6px;border-radius:999px;font:600 10px var(--f);letter-spacing:.02em;background:var(--surface-cont-high);color:var(--on-surface-var)}
-.search-plugin-badge.ready{background:var(--success-cont);color:var(--success)}
-.search-plugin-url{font-size:11px;color:var(--on-surface-var);word-break:break-all;margin-top:2px}
-.search-plugin-cats{font-size:11px;color:var(--on-surface-var);margin-top:2px}
-.search-install-upload{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-.search-install-upload .btn{height:32px;padding:0 12px;font-size:12px;border-radius:9px}
-.search-upload-label{position:relative;overflow:hidden}
-.search-upload-label input[type="file"]{position:absolute;inset:0;opacity:0;cursor:pointer}
-.search-catalog{margin-top:10px}
-.search-catalog-list{max-height:300px;overflow:auto;border:1px solid var(--outline-var);border-radius:10px;background:var(--surface-cont)}
-.search-catalog-table{width:100%;border-collapse:collapse;font-size:12px}
-.search-catalog-table td{padding:6px 8px;vertical-align:middle;border-bottom:1px solid var(--outline-var)}
-.search-catalog-table tr:last-child td{border-bottom:none}
-.search-catalog-table td:last-child{width:70px;text-align:right;white-space:nowrap}
-.search-catalog-btn{padding:2px 10px!important;font-size:11px!important;height:auto!important}
-.search-recommended-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:8px}
-.search-recommended-card{border:1px solid var(--outline-var);border-radius:11px;background:var(--surface-cont);padding:12px;display:flex;flex-direction:column;gap:8px}
-.search-recommended-name{font:600 13px var(--f);color:var(--on-surface);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.search-recommended-copy{font-size:11px;color:var(--on-surface-var);line-height:1.5}
-.search-recommended-meta{font-size:11px;color:var(--on-surface-var)}
-.search-recommended-card .btn{align-self:flex-start;height:30px;padding:0 12px;font-size:12px;border-radius:8px}
-.search-catalog-item{padding:10px;border-bottom:1px solid var(--outline-var);display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
-.search-catalog-item:last-child{border-bottom:none}
-.search-catalog-info{flex:1;min-width:0}
-.search-catalog-name{font:600 12px var(--f);color:var(--on-surface)}
-.search-catalog-meta{font-size:11px;color:var(--on-surface-var);margin-top:2px}
-.search-catalog-comment{font-size:11px;color:var(--on-surface-var);margin-top:4px}
-.search-catalog-item .btn{height:28px;padding:0 10px;font-size:11px;border-radius:8px;flex-shrink:0}
-.search-alert{margin-top:8px;padding:8px 10px;border-radius:9px;background:var(--danger-cont);color:var(--error);font-size:12px}
-.search-note{margin-top:8px;font-size:11px;color:var(--on-surface-var)}
-.search-selection-summary{padding:10px 12px;border-radius:11px;background:var(--surface-cont);border:1px solid var(--outline-var);color:var(--on-surface-var);font:500 12px var(--f);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
-.search-selection-text{min-width:0;flex:1}
-.search-panel-actions{display:flex;gap:8px;flex-wrap:wrap}
-.search-panel-actions .btn{height:32px;padding:0 12px;font-size:12px;border-radius:9px}
-.search-results-panel{min-height:0}
-.search-main-panel{display:none}
-.search-main-panel.active{display:flex;flex-direction:column;gap:12px}
-.search-plugin-manager{min-height:0}
-.search-plugin-manager-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
-.search-plugin-manager-copy{max-width:620px}
-.search-plugin-manager-copy .small{margin-top:6px}
-.search-plugin-manager-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.search-plugin-manager-tools .btn{height:32px;padding:0 12px;font-size:12px;border-radius:9px}
-.search-results-grid{display:flex;flex-direction:column;gap:10px}
-.search-results-empty{font-size:12px;color:var(--on-surface-var)}
-.search-results-table-wrap{overflow:auto;border:1px solid var(--outline-var);border-radius:12px;background:var(--surface-cont)}
-.search-results-table{width:100%;border-collapse:collapse;min-width:860px;font:400 12px var(--f)}
-.search-results-table th,.search-results-table td{padding:10px 12px;border-bottom:1px solid var(--outline-var);vertical-align:top;text-align:left}
-.search-results-table th{position:sticky;top:0;background:var(--surface-cont-high);z-index:1;font:600 10px var(--f);letter-spacing:.02em;color:var(--on-surface-var);white-space:nowrap}
-.search-results-table tbody tr:hover{background:var(--state-hover)}
-.search-sort-btn{display:inline-flex;align-items:center;gap:4px;border:none;background:none;color:inherit;font:inherit;letter-spacing:inherit;padding:0;cursor:pointer}
-.search-result-title{font:600 14px/1.35 var(--f);color:var(--on-surface);word-break:break-word}
-.search-result-link{display:inline-block;margin-top:6px;font-size:11px;color:var(--primary);text-decoration:none;word-break:break-all}
-.search-result-link:hover{text-decoration:underline}
-.search-results-table .btn{height:30px;padding:0 12px;font-size:12px;border-radius:8px;flex-shrink:0}
-.search-results-table .btn.added{background:var(--surface-cont-high);border-color:var(--outline-var);color:var(--on-surface-var);box-shadow:none;pointer-events:none}
-.country-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.country-tag{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:var(--surface-cont-high);border:1px solid var(--outline-var);border-radius:8px;font-size:12px}
-.country-tag b{font-weight:700;color:var(--on-surface)}
-.toast-stack{position:fixed;right:24px;bottom:24px;z-index:90;display:flex;flex-direction:column;gap:10px;pointer-events:none}
-.toast{min-width:240px;max-width:360px;padding:12px 14px;border-radius:12px;border:1px solid var(--outline-var);background:var(--surface);box-shadow:var(--elevation-3);color:var(--on-surface);display:flex;align-items:flex-start;gap:10px;opacity:0;transform:translateY(14px) scale(.98);transition:opacity .22s var(--ease-out),transform .26s var(--ease-out)}
-.toast.show{opacity:1;transform:translateY(0) scale(1)}
-.toast-icon{width:24px;height:24px;border-radius:999px;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;background:var(--primary-cont);color:var(--primary)}
-.toast-icon .material-symbols-rounded{font-size:16px}
-.toast-copy{min-width:0}
-.toast-title{font:700 13px/1.2 var(--f);color:var(--on-surface)}
-.toast-body{margin-top:4px;font-size:12px;line-height:1.4;color:var(--on-surface-var)}
-.inline-form{display:flex;gap:6px;align-items:center;margin-top:8px}
-.inline-form .input{flex:1;min-width:0;height:30px;padding:0 8px;font-size:12px;border-radius:8px}
-.inline-form .btn{height:30px;padding:0 10px;font-size:12px;border-radius:8px;flex-shrink:0}
-.tracker-item{display:flex;align-items:center;justify-content:space-between;padding:5px 0;font-size:12px;word-break:break-all}
-.tracker-item .remove-btn{background:none;border:none;color:var(--on-surface-var);cursor:pointer;padding:2px 6px;border-radius:6px;font-size:14px;line-height:1;flex-shrink:0;margin-left:8px;transition:color var(--fast),background var(--fast)}
-.tracker-item .remove-btn:hover{color:var(--error);background:var(--danger-cont)}
-@keyframes modalFade{from{opacity:0;transform:scale(.98)}to{opacity:1;transform:scale(1)}}
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.001ms!important}}
-@media(max-width:1024px){.fleet-panel{grid-template-columns:1fr 1fr}.fleet-hero{grid-column:1 / -1}}
-@media(max-width:900px){.layout{gap:16px}.sidebar{flex-basis:240px;width:240px}.search-sidebar{flex-basis:300px;width:300px}.fleet-panel{grid-template-columns:1fr 1fr}.fleet-hero{grid-column:1 / -1}}
-@media(max-width:520px){.layout{flex-direction:column;align-items:stretch;overflow-y:auto;padding-right:0}.sidebar{position:static;flex:0 0 auto;width:100%;max-height:none;overflow:visible;padding-right:0}.torrent-list{flex:0 0 auto;overflow:visible;padding-right:0}.torrent-grid{grid-template-columns:1fr}.torrent-vitals{grid-template-columns:1fr}.appbar{flex-direction:column;align-items:flex-start;gap:12px;width:100%;min-width:0}.appbar-main{width:100%;min-width:0;flex-direction:column;align-items:stretch;gap:12px}.app-tabs{width:100%;min-width:0}.tab-btn{flex:1 1 0;min-width:0;justify-content:center;padding:0 10px;overflow:hidden;white-space:nowrap}.app-actions{width:100%;min-width:0;align-items:stretch}.app-actions .chip{flex:1 1 calc(50% - 4px);min-width:0;justify-content:center;overflow:hidden;white-space:nowrap}.toolbar{width:100%;min-width:0;flex:1 0 100%;display:flex}.toolbar .btn.primary{flex:1;justify-content:center}.toolbar .icon-btn{flex:0 0 40px}}
-@media(max-width:700px){.app{padding:0 16px 16px}.appbar{margin:0 -16px;padding:12px 16px;border-radius:0}.torrent-title{font-size:16px}.add-prefs{flex-direction:column}.add-download-row{flex-direction:column}.torrent-stats{grid-template-columns:repeat(2,1fr)}.fleet-panel{grid-template-columns:1fr}.toast-stack{left:16px;right:16px;bottom:16px}.toast{min-width:0;max-width:none}}
-</style></head><body>"#);
+    out.push_str("<style>");
+    out.push_str(include_str!("../assets/ui/app.css"));
+    out.push_str(include_str!("../assets/ui/beta.css"));
+    out.push_str("</style></head><body>");
     out.push_str(r##"<svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true"><defs><symbol id="i-add" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="i-archive" viewBox="0 0 24 24"><path d="M4 8.5h16V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/><path d="M3.5 4.5h17v4h-17z"/><path d="M10 12h4"/></symbol><symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2.5 4.5 13.5H11l-1 8 8.5-11.5H12z"/></symbol><symbol id="i-check" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></symbol><symbol id="i-check_circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.4 2.4L15.6 9"/></symbol><symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M6 18 18 6"/></symbol><symbol id="i-cloud_download" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.6-7.96 5.5 5.5 0 0 1 10.7-1.05A4 4 0 0 1 17.2 18"/><path d="M12 11.5v6.5m0 0-2.4-2.4M12 18l2.4-2.4"/></symbol><symbol id="i-cloud_upload" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.6-7.96 5.5 5.5 0 0 1 10.7-1.05A4 4 0 0 1 17.2 18"/><path d="M12 18.5V12m0 0-2.4 2.4M12 12l2.4 2.4"/></symbol><symbol id="i-dark_mode" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4 7 7 0 1 0 20 14.5z"/></symbol><symbol id="i-delete" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 12.1a1 1 0 0 0 1 .9h8a1 1 0 0 0 1-.9L18 7"/><path d="M10 11v5M14 11v5"/></symbol><symbol id="i-description" viewBox="0 0 24 24"><path d="M14 3.5v5h5"/><path d="M14 3.5H6.5a1 1 0 0 0-1 1v15a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V8.5z"/><path d="M9 13h6M9 16.5h4"/></symbol><symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4-4m4 4 4-4"/><path d="M5 20h14"/></symbol><symbol id="i-downloading" viewBox="0 0 24 24"><path d="M12 3.5v8m0 0-3-3m3 3 3-3"/><path d="M5.2 14a7 7 0 0 0 13.6 0"/></symbol><symbol id="i-error" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5h.01"/></symbol><symbol id="i-extension" viewBox="0 0 24 24"><path d="M9 5.2a2 2 0 1 1 4 0V6h2.8a1 1 0 0 1 1 1v2.8h.7a2 2 0 1 1 0 4h-.7V17a1 1 0 0 1-1 1H13v-.8a2 2 0 1 0-4 0V18H6.2a1 1 0 0 1-1-1v-3h-.7a2 2 0 1 1 0-4h.7V7.2a1 1 0 0 1 1-1H9z"/></symbol><symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 6.5a1 1 0 0 1 1-1H10l2 2h7.5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/></symbol><symbol id="i-folder_open" viewBox="0 0 24 24"><path d="M3.5 7a1 1 0 0 1 1-1H10l2 2h7.5a1 1 0 0 1 1 1v1.5H7a1 1 0 0 0-.95.68"/><path d="m3.6 18.5 2.2-7a1 1 0 0 1 .95-.7H21l-2.2 7a1 1 0 0 1-.95.7H4.5a1 1 0 0 1-1-1z"/></symbol><symbol id="i-grid_view" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/></symbol><symbol id="i-group" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 19a6 6 0 0 1 12 0"/><path d="M16 5.2a3 3 0 0 1 0 5.6"/><path d="M18 19a6 6 0 0 0-3-5.2"/></symbol><symbol id="i-hub" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.3"/><circle cx="12" cy="4.2" r="1.8"/><circle cx="12" cy="19.8" r="1.8"/><circle cx="5" cy="8" r="1.8"/><circle cx="19" cy="8" r="1.8"/><path d="M12 6v3.7M10.2 11 6.5 8.9M13.8 11l3.7-2.1M12 14.3v3.7"/></symbol><symbol id="i-label" viewBox="0 0 24 24"><path d="M4 6.5a1 1 0 0 1 1-1h9.3a1 1 0 0 1 .78.37l4.6 5.5a1 1 0 0 1 0 1.26l-4.6 5.5a1 1 0 0 1-.78.37H5a1 1 0 0 1-1-1z"/><circle cx="8" cy="12" r="1.1"/></symbol><symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12"/><path d="M3.6 6h.01M3.6 12h.01M3.6 18h.01"/></symbol><symbol id="i-manage_search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m20 20-5.2-5.2"/></symbol><symbol id="i-pause_circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/></symbol><symbol id="i-queue" viewBox="0 0 24 24"><path d="M4 7h11M4 12h11M4 17h7"/><path d="M18 13v6M15 16h6"/></symbol><symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 4v5h-5"/></symbol><symbol id="i-rss_feed" viewBox="0 0 24 24"><circle cx="6" cy="18" r="1.6"/><path d="M4.5 11a8.5 8.5 0 0 1 8.5 8.5"/><path d="M4.5 5a14.5 14.5 0 0 1 14.5 14.5"/></symbol><symbol id="i-schedule" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5l3.4 2"/></symbol><symbol id="i-stop" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="2.5"/></symbol><symbol id="i-swap_vert" viewBox="0 0 24 24"><path d="M7 4.5v15m0 0-3-3m3 3 3-3"/><path d="M17 19.5v-15m0 0-3 3m3-3 3 3"/></symbol><symbol id="i-system_update" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2"/><path d="M12 7v6m0 0-2.2-2.2M12 13l2.2-2.2"/></symbol><symbol id="i-travel_explore" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M4 10.5h13"/><path d="M10.5 4a12 12 0 0 1 0 13M10.5 4a12 12 0 0 0 0 13"/><path d="m19.5 19.5-2.4-2.4"/></symbol><symbol id="i-unfold_less" viewBox="0 0 24 24"><path d="m8 5.5 4 4 4-4"/><path d="m8 18.5 4-4 4 4"/></symbol><symbol id="i-unfold_more" viewBox="0 0 24 24"><path d="m8 9.5 4-4 4 4"/><path d="m8 14.5 4 4 4-4"/></symbol><symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 20V9m0 0-4 4m4-4 4 4"/><path d="M5 4.5h14"/></symbol><symbol id="i-upload_file" viewBox="0 0 24 24"><path d="M14 3.5v5h5"/><path d="M14 3.5H6.5a1 1 0 0 0-1 1v15a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V8.5z"/><path d="M12 18v-5m0 0-2 2m2-2 2 2"/></symbol><symbol id="i-verified" viewBox="0 0 24 24"><path d="M12 3.2 5 6v6c0 4 3 6.7 7 8 4-1.3 7-4 7-8V6z"/><path d="m9 12 2 2 4-4"/></symbol><symbol id="i-play_arrow" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M8 5.6v12.8a1 1 0 0 0 1.52.86l10.5-6.4a1 1 0 0 0 0-1.72L9.52 4.74A1 1 0 0 0 8 5.6z"/></symbol><symbol id="i-pause" viewBox="0 0 24 24"><rect x="7" y="5" width="3.4" height="14" rx="1.1" fill="currentColor" stroke="none"/><rect x="13.6" y="5" width="3.4" height="14" rx="1.1" fill="currentColor" stroke="none"/></symbol><symbol id="i-light_mode" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6"/></symbol><symbol id="i-arrow_upward" viewBox="0 0 24 24"><path d="M12 20V5m0 0-6 6m6-6 6 6"/></symbol><symbol id="i-arrow_downward" viewBox="0 0 24 24"><path d="M12 4v15m0 0-6-6m6 6 6-6"/></symbol></defs></svg>"##);
     out.push_str("<div class=\"app\" id=\"appRoot\">");
     out.push_str(&app_body_html(state));
     out.push_str("</div>");
     out.push_str("<script>");
-    out.push_str(r#"const themeKey='rustorrent-theme';
-const filterKey='rustorrent-library-filter';
-const searchKey='rustorrent-library-search';
-const mainTabKey='rustorrent-main-tab';
-const searchPluginSelectionKey='rustorrent-search-plugins';
-const searchCategoryKey='rustorrent-search-category';
-const searchSortStorageKey='rustorrent-search-sort';
-const collapsePrefix='rustorrent-collapse:';
-const panelCollapsePrefix='rustorrent-panel:';
-let pendingHtml=null;
-let activeTheme=null;
-let queuedLiveHtml=null;
-let liveRenderTimer=null;
-let searchStateCache=null;
-let searchCatalogCache=[];
-let searchPollTimer=null;
-let searchPollActive=false;
-let searchCatalogLoading=false;
-let searchCatalogFetchedAt=0;
-let activeSearchPanelView='results';
-const addedSearchResults=new Set();
-let lastSearchStartedAt=0;
-let activeSearchSort={key:'seeds',dir:'desc'};
-const liveRenderIntervalMs=450;
-const MAX_RATE_LIMIT_KBPS=102400;
-const apiTokenMeta=document.querySelector('meta[name="rustorrent-api-token"]');
-let apiToken=apiTokenMeta?String(apiTokenMeta.getAttribute('content')||'').trim():'';
-function syncApiTokenMeta(){
-  if(!apiTokenMeta){return;}
-  const value=String(apiTokenMeta.getAttribute('content')||'').trim();
-  if(value){apiToken=value;}
-}
-async function refreshApiToken(){
-  try{
-    const res=await fetch('/api-token',{cache:'no-store',headers:{'Accept':'application/json'}});
-    if(!res.ok){return false;}
-    const data=await res.json();
-    const token=data&&typeof data.token==='string'?data.token.trim():'';
-    if(!token){return false;}
-    apiToken=token;
-    if(apiTokenMeta){apiTokenMeta.setAttribute('content',token);}
-    return true;
-  }catch(e){
-    return false;
-  }
-}
-syncApiTokenMeta();
-function resolveTheme(){
-  let theme='light';
-  try{
-    const stored=localStorage.getItem(themeKey);
-    if(stored==='light'||stored==='dark'){theme=stored;}
-  }catch(e){}
-  return theme;
-}
-function applyTheme(theme){
-  const root=document.documentElement;
-  if(activeTheme!==theme){
-    root.classList.add('theme-switching');
-    root.setAttribute('data-theme',theme);
-    activeTheme=theme;
-    requestAnimationFrame(()=>requestAnimationFrame(()=>root.classList.remove('theme-switching')));
-  }
-  const themeBtn=document.getElementById('themeToggle');
-  if(themeBtn){themeBtn.innerHTML='<svg class="material-symbols-rounded"><use href=#i-'+(theme==='light'?'light_mode':'dark_mode')+'></use></svg>';}
-}
-function resolveMainTab(){
-  try{
-    const value=localStorage.getItem(mainTabKey)||'library';
-    if(value==='search'){return 'search';}
-  }catch(e){}
-  return 'library';
-}
-function applyMainTab(tab){
-  const next=tab==='search'?'search':'library';
-  const tabs=Array.from(document.querySelectorAll('[data-main-tab-target]'));
-  tabs.forEach(btn=>btn.classList.toggle('active',btn.dataset.mainTabTarget===next));
-  const workspaces=Array.from(document.querySelectorAll('.workspace[data-main-tab]'));
-  workspaces.forEach(view=>view.classList.toggle('active',view.dataset.mainTab===next));
-  if(next==='search'&&searchCatalogCache.length===0&&!searchCatalogLoading){
-    loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
-  }
-}
-function resolveSearchPanelView(){return activeSearchPanelView;}
-function applySearchPanelView(view){
-  const next=view==='plugins'?'plugins':'results';
-  activeSearchPanelView=next;
-  const panels=Array.from(document.querySelectorAll('[data-search-view]'));
-  panels.forEach(panel=>panel.classList.toggle('active',panel.dataset.searchView===next));
-  const toggles=Array.from(document.querySelectorAll('[data-search-view-target]'));
-  toggles.forEach(btn=>btn.classList.toggle('active',btn.dataset.searchViewTarget===next));
-  if(next==='plugins'&&searchCatalogCache.length===0&&!searchCatalogLoading){
-    loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
-  }
-}
-function resolveFilter(){
-  let filter='all';
-  try{const stored=localStorage.getItem(filterKey);if(stored){filter=stored;}}catch(e){}
-  return filter;
-}
-function resolveSearch(){
-  try{return localStorage.getItem(searchKey)||'';}catch(e){}
-  return '';
-}
-function applyFilter(filter){
-  const searchRaw=resolveSearch();
-  const search=searchRaw.trim().toLowerCase();
-  const searchInput=document.getElementById('librarySearch');
-  if(searchInput&&searchInput.value!==searchRaw){searchInput.value=searchRaw;}
-  const buttons=Array.from(document.querySelectorAll('.nav-item[data-filter]'));
-  buttons.forEach(btn=>{const active=btn.dataset.filter===filter;btn.classList.toggle('active',active);});
-  const cards=Array.from(document.querySelectorAll('.torrent-card'));
-  cards.forEach(card=>{
-    const status=card.dataset.status||'downloading';
-    const name=(card.dataset.name||'').toLowerCase();
-    const cardLabel=card.dataset.label||'';
-    let matchesFilter;
-    if(filter==='all'){matchesFilter=true;}
-    else if(filter.startsWith('label:')){matchesFilter=cardLabel===filter.slice(6);}
-    else{matchesFilter=status===filter;}
-    const matchesSearch=!search||name.includes(search);
-    if(matchesFilter&&matchesSearch){card.style.display='';}else{card.style.display='none';}
-  });
-}
-function collapseKey(hash){return collapsePrefix+hash;}
-function panelCollapseKey(name){return panelCollapsePrefix+name;}
-function defaultPanelCollapsed(name){return name==='transfer';}
-function isPanelCollapsed(name){
-  try{
-    const stored=localStorage.getItem(panelCollapseKey(name));
-    if(stored==='1'){return true;}
-    if(stored==='0'){return false;}
-  }catch(e){}
-  return defaultPanelCollapsed(name);
-}
-function applyCollapseState(){
-  const cards=Array.from(document.querySelectorAll('.torrent-card'));
-  cards.forEach(card=>{
-    const hash=card.dataset.infoHash||'';
-    let collapsed=true;
-    try{
-      const stored=localStorage.getItem(collapseKey(hash));
-      if(stored==='0'){collapsed=false;}
-      if(stored==='1'){collapsed=true;}
-    }catch(e){}
-    card.dataset.collapsed=collapsed?'true':'false';
-    const toggle=card.querySelector("[data-action='toggle-expand']");
-    if(toggle){toggle.innerHTML=collapsed?'<svg class="material-symbols-rounded"><use href=#i-unfold_more></use></svg>Expand':'<svg class="material-symbols-rounded"><use href=#i-unfold_less></use></svg>Collapse';toggle.setAttribute('aria-expanded',collapsed?'false':'true');}
-  });
-}
-function applyPanelState(){
-  const panels=Array.from(document.querySelectorAll('[data-panel]'));
-  panels.forEach(panel=>{
-    const name=panel.dataset.panel||'';
-    const collapsed=isPanelCollapsed(name);
-    panel.dataset.collapsed=collapsed?'true':'false';
-    const toggle=panel.querySelector('[data-action="toggle-panel"]');
-    if(toggle){
-      toggle.innerHTML=collapsed?'<svg class="material-symbols-rounded"><use href=#i-unfold_more></use></svg>Expand':'<svg class="material-symbols-rounded"><use href=#i-unfold_less></use></svg>Collapse';
-      toggle.setAttribute('aria-expanded',collapsed?'false':'true');
-    }
-  });
-}
-function syncAttributes(current,next){
-  const isModal=current.id==='addModal';
-  const hadOpen=isModal&&current.classList.contains('open');
-  const isDz=current.id==='dropZone';
-  const dzHasFile=isDz&&current.classList.contains('has-file');
-  const toRemove=[];
-  for(const attr of Array.from(current.attributes||[])){
-    if(!next.hasAttribute(attr.name)){toRemove.push(attr.name);}
-  }
-  toRemove.forEach(name=>current.removeAttribute(name));
-  for(const attr of Array.from(next.attributes||[])){
-    if(current.getAttribute(attr.name)!==attr.value){current.setAttribute(attr.name,attr.value);}
-  }
-  if(hadOpen){current.classList.add('open');}
-  if(dzHasFile){current.classList.add('has-file');}
-}
-function syncElementValue(current,next){
-  if(current===document.activeElement){return;}
-  const tag=current.tagName;
-  if(tag==='INPUT'){
-    const type=String(current.type||'').toLowerCase();
-    if(type==='checkbox'||type==='radio'){
-      if(current.checked!==next.checked){current.checked=next.checked;}
-    }else if(current.value!==next.value){
-      current.value=next.value;
-    }
-    return;
-  }
-  if(tag==='TEXTAREA'){
-    if(current.value!==next.value){current.value=next.value;}
-    return;
-  }
-  if(tag==='SELECT'){
-    if(current.value!==next.value){current.value=next.value;}
-  }
-}
-function morphNode(current,next){
-  if(!current||!next){return;}
-  if(current.nodeType!==next.nodeType||current.nodeName!==next.nodeName){
-    current.replaceWith(next.cloneNode(true));
-    return;
-  }
-  if(current.nodeType===Node.TEXT_NODE||current.nodeType===Node.COMMENT_NODE){
-    if(current.nodeValue!==next.nodeValue){current.nodeValue=next.nodeValue;}
-    return;
-  }
-  syncAttributes(current,next);
-  syncElementValue(current,next);
-  morphChildren(current,next);
-}
-function morphChildren(current,next){
-  const currentChildren=Array.from(current.childNodes);
-  const nextChildren=Array.from(next.childNodes);
-  const max=Math.max(currentChildren.length,nextChildren.length);
-  for(let i=0;i<max;i+=1){
-    const curr=current.childNodes[i];
-    const nxt=nextChildren[i];
-    if(!curr&&nxt){
-      current.appendChild(nxt.cloneNode(true));
-      continue;
-    }
-    if(curr&&!nxt){
-      curr.remove();
-      continue;
-    }
-    morphNode(curr,nxt);
-  }
-}
-function renderApp(html){
-  const root=document.getElementById('appRoot');
-  if(!root){return;}
-  if(!root.firstChild){
-    root.innerHTML=html;
-  }else{
-    const tpl=document.createElement('template');
-    tpl.innerHTML=html;
-    morphChildren(root,tpl.content);
-  }
-  applyTheme(activeTheme||resolveTheme());
-  applyMainTab(resolveMainTab());
-  applySearchPanelView(resolveSearchPanelView());
-  applyFilter(resolveFilter());
-  applyCollapseState();
-  applyPanelState();
-  updateRateLimitLabels();
-  if(searchStateCache){renderSearchStatus(searchStateCache);}
-  if(searchCatalogCache.length>0){renderSearchCatalog(searchCatalogCache);}
-}
-function scheduleLiveRender(html){
-  queuedLiveHtml=html;
-  if(liveRenderTimer!==null){return;}
-  liveRenderTimer=setTimeout(()=>{
-    liveRenderTimer=null;
-    const nextHtml=queuedLiveHtml;
-    queuedLiveHtml=null;
-    if(nextHtml){
-      if(isAddModalOpen()){pendingHtml=nextHtml;return;}
-      renderApp(nextHtml);
-    }
-  },liveRenderIntervalMs);
-}
-function isAddModalOpen(){
-  const modal=document.getElementById('addModal');
-  return !!(modal&&modal.classList.contains('open'));
-}
-function applyUpdate(html){
-  if(isAddModalOpen()){pendingHtml=html;return;}
-  scheduleLiveRender(html);
-  pendingHtml=null;
-}
-let addParseToken=0;
-let addDraft={kind:'none',name:'',fileName:'',files:[],totalBytes:0,infoHash:'',bytes:null,parseError:'',parsing:false};
-const textDecoder=new TextDecoder();
-function resetAddDraft(){
-  addParseToken+=1;
-  addDraft={kind:'none',name:'',fileName:'',files:[],totalBytes:0,infoHash:'',bytes:null,parseError:'',parsing:false};
-}
-function openAdd(){
-  const modal=document.getElementById('addModal');
-  if(!modal){return;}
-  modal.classList.add('open');
-  resetAddDraft();
-  const fileInput=document.getElementById('torrentFile');
-  const magnetInput=document.getElementById('magnet');
-  const startWhenAdded=document.getElementById('startWhenAdded');
-  if(fileInput){fileInput.value='';}
-  if(magnetInput){magnetInput.value='';}
-  if(startWhenAdded){startWhenAdded.checked=true;}
-  updateDropZoneState();
-  renderAddReview();
-}
-function closeAdd(){
-  const modal=document.getElementById('addModal');
-  if(modal){modal.classList.remove('open')}
-  resetAddDraft();
-  if(pendingHtml){
-    const html=pendingHtml;
-    pendingHtml=null;
-    queuedLiveHtml=null;
-    if(liveRenderTimer!==null){
-      clearTimeout(liveRenderTimer);
-      liveRenderTimer=null;
-    }
-    renderApp(html);
-  }
-}
-function maybeClose(e){if(e.target&&e.target.id==='addModal'){closeAdd()}}
-document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeAdd()}});
-async function chooseDownloadDir(){
-  const input=document.getElementById('downloadDir');
-  if(!input){return;}
-  const current=(input.value||'').trim();
-  try{
-    const data=await apiPostJson('/select-download-dir');
-    const path=data&&typeof data.path==='string'?data.path.trim():'';
-    if(path){input.value=path;}
-    return;
-  }catch(err){
-    const message=actionErrorMessage(err);
-    const unsupported=message.toLowerCase().includes('not available on this platform');
-    if(!unsupported){
-      alert('Folder picker failed: '+message);
-      return;
-    }
-  }
-  const next=prompt('Download directory path:',current||'');
-  if(next===null){return;}
-  const value=next.trim();
-  if(value){input.value=value;}
-}
-function actionErrorMessage(err){
-  if(err&&err.message){return err.message;}
-  return String(err||'unknown error');
-}
-function toastStack(){
-  let stack=document.querySelector('.toast-stack');
-  if(stack){return stack;}
-  stack=document.createElement('div');
-  stack.className='toast-stack';
-  document.body.appendChild(stack);
-  return stack;
-}
-function showToast(title,message){
-  const stack=toastStack();
-  const toast=document.createElement('div');
-  toast.className='toast';
-  toast.innerHTML=''
-    +'<div class="toast-icon"><svg class="material-symbols-rounded" style="font-size:16px"><use href=#i-check></use></svg></div>'
-    +'<div class="toast-copy">'
-    +'<div class="toast-title">'+escapeHtml(title||'Done')+'</div>'
-    +(message?('<div class="toast-body">'+escapeHtml(message)+'</div>'):'')
-    +'</div>';
-  stack.appendChild(toast);
-  requestAnimationFrame(()=>toast.classList.add('show'));
-  setTimeout(()=>{
-    toast.classList.remove('show');
-    setTimeout(()=>toast.remove(),260);
-  },2600);
-}
-function showActionError(err){
-  alert('Action failed: '+actionErrorMessage(err));
-}
-async function apiPost(url,options){
-  if(!apiToken){await refreshApiToken();}
-  let attemptedRefresh=false;
-  while(true){
-    const req=Object.assign({method:'POST',cache:'no-store'},options||{});
-    const headers=new Headers(req.headers||{});
-    if(apiToken){headers.set('X-Rustorrent-Token',apiToken);}
-    req.headers=headers;
-
-    const res=await fetch(url,req);
-    if(res.ok){return res;}
-
-    let message='HTTP '+res.status;
-    try{
-      const type=(res.headers.get('content-type')||'').toLowerCase();
-      if(type.includes('application/json')){
-        const data=await res.json();
-        if(data&&typeof data.error==='string'&&data.error.trim()){message=data.error.trim();}
-      }else{
-        const text=(await res.text()).trim();
-        if(text){message=text;}
-      }
-    }catch(e){}
-
-    const lower=String(message||'').toLowerCase();
-    const tokenError=lower.includes('invalid api token')||(lower.includes('missing')&&lower.includes('api token'));
-    if(!attemptedRefresh&&res.status===403&&tokenError){
-      attemptedRefresh=true;
-      if(await refreshApiToken()){continue;}
-    }
-    throw new Error(message);
-  }
-}
-async function apiPostJson(url,options){
-  const res=await apiPost(url,options);
-  const type=(res.headers.get('content-type')||'').toLowerCase();
-  if(type.includes('application/json')){
-    try{
-      const data=await res.json();
-      if(data&&typeof data==='object'){return data;}
-    }catch(e){}
-  }
-  return {ok:true};
-}
-async function fetchJson(url){
-  if(!apiToken){await refreshApiToken();}
-  const headers=new Headers({'Accept':'application/json'});
-  if(apiToken){headers.set('X-Rustorrent-Token',apiToken);}
-  const res=await fetch(url,{cache:'no-store',headers:headers});
-  if(!res.ok){
-    let message='HTTP '+res.status;
-    try{
-      const data=await res.json();
-      if(data&&typeof data.error==='string'&&data.error.trim()){message=data.error.trim();}
-    }catch(e){}
-    throw new Error(message);
-  }
-  return res.json();
-}
-function loadStoredSearchPlugins(){
-  try{
-    const raw=localStorage.getItem(searchPluginSelectionKey)||'[]';
-    const parsed=JSON.parse(raw);
-    if(Array.isArray(parsed)){return parsed.map(v=>String(v||'')).filter(Boolean);}
-  }catch(e){}
-  return [];
-}
-function saveStoredSearchPlugins(modules){
-  try{localStorage.setItem(searchPluginSelectionKey,JSON.stringify(modules||[]));}catch(e){}
-}
-function resolveSearchCategory(){
-  try{
-    const value=localStorage.getItem(searchCategoryKey)||'all';
-    return value||'all';
-  }catch(e){}
-  return 'all';
-}
-function saveSearchCategory(value){
-  try{localStorage.setItem(searchCategoryKey,String(value||'all'));}catch(e){}
-}
-function resolveSearchSort(){
-  try{
-    const raw=localStorage.getItem(searchSortStorageKey)||'';
-    const [key,dir]=raw.split(':');
-    if(key&&dir&&(dir==='asc'||dir==='desc')){
-      return {key:String(key),dir:String(dir)};
-    }
-  }catch(e){}
-  return {key:'seeds',dir:'desc'};
-}
-function saveSearchSort(sort){
-  try{localStorage.setItem(searchSortStorageKey,String(sort.key||'seeds')+':'+String(sort.dir||'desc'));}catch(e){}
-}
-function setSearchSort(key){
-  const nextKey=String(key||'seeds');
-  const nextDir=(activeSearchSort.key===nextKey&&activeSearchSort.dir==='desc')?'asc':'desc';
-  activeSearchSort={key:nextKey,dir:nextDir};
-  saveSearchSort(activeSearchSort);
-  renderSearchResults(searchStateCache&&Array.isArray(searchStateCache.results)?searchStateCache.results:[]);
-}
-function activeSearchPlugins(plugins){
-  const available=(Array.isArray(plugins)?plugins:[]).filter(plugin=>plugin&&plugin.healthy).map(plugin=>String(plugin.module||'')).filter(Boolean);
-  const stored=loadStoredSearchPlugins().filter(module=>available.indexOf(module)!==-1);
-  if(stored.length>0){return stored;}
-  return available;
-}
-function selectedSearchPluginsFromDom(){
-  return Array.from(document.querySelectorAll('input[data-search-plugin]'))
-    .filter(input=>input.checked&&!input.disabled)
-    .map(input=>String(input.getAttribute('data-search-plugin')||''))
-    .filter(Boolean);
-}
-function persistSearchPluginSelectionFromDom(){
-  saveStoredSearchPlugins(selectedSearchPluginsFromDom());
-}
-function recommendedCatalogModules(){
-  return ['piratebay','1337x','bitsearch','limetorrents','torlock','nyaasi','eztv','yts'];
-}
-function recommendedCatalogEntries(entries){
-  const preferred=recommendedCatalogModules();
-  const excluded=new Set(['magnetdl']);
-  const byModule=new Map();
-  const byName=new Map();
-  for(const entry of (Array.isArray(entries)?entries:[])){
-    if(!entry){continue;}
-    const module=String(entry.module||'').toLowerCase();
-    const name=String(entry.name||'').toLowerCase();
-    if(excluded.has(module)||name.includes('magnetdl')){continue;}
-    if(module){byModule.set(module,entry);}
-    if(name){byName.set(name,entry);}
-  }
-  const picked=[];
-  for(const key of preferred){
-    const normalized=String(key||'').toLowerCase();
-    const entry=byModule.get(normalized)||Array.from(byName.values()).find(item=>String(item.name||'').toLowerCase().includes(normalized));
-    if(entry&&!picked.some(item=>item.module===entry.module)){
-      picked.push(entry);
-    }
-  }
-  return picked;
-}
-function useAllReadyPlugins(){
-  const plugins=Array.isArray(searchStateCache&&searchStateCache.plugins)?searchStateCache.plugins:[];
-  const all=plugins.filter(plugin=>plugin&&plugin.healthy).map(plugin=>String(plugin.module||'')).filter(Boolean);
-  saveStoredSearchPlugins(all);
-  renderSearchStatus(searchStateCache||{plugins:plugins||[]});
-}
-function renderSearchPluginList(plugins){
-  const list=document.getElementById('searchPluginList');
-  if(!list){return;}
-  const visiblePlugins=(Array.isArray(plugins)?plugins:[]).filter(plugin=>plugin&&String(plugin.module||'')!=='__init__');
-  const selected=activeSearchPlugins(visiblePlugins);
-  saveStoredSearchPlugins(selected);
-  if(visiblePlugins.length===0){
-    list.innerHTML='<div class="rss-item"><span class="rss-item-info">No search plugins installed yet.</span></div>';
-    return;
-  }
-  list.innerHTML='<table class="search-plugin-table"><tbody>'+visiblePlugins.map(plugin=>{
-    const module=escapeHtml(plugin.module||'');
-    const checked=selected.indexOf(plugin.module)!==-1;
-    const healthy=!!plugin.healthy;
-    const badge=healthy?'<span class="search-plugin-badge ready">Ready</span>':'<span class="search-plugin-badge">Broken</span>';
-    const version=plugin.version?(' v'+escapeHtml(plugin.version)):'';
-    const cats=Array.isArray(plugin.categories)&&plugin.categories.length>0?escapeHtml(plugin.categories.join(', ')):'all';
-    const reason=plugin.broken_reason?'<div style="color:var(--error);font-size:11px;margin-top:2px">'+escapeHtml(plugin.broken_reason)+'</div>':'';
-    return '<tr>'
-      +'<td><input type="checkbox" data-search-plugin="'+module+'" '+(checked&&healthy?'checked ':'')+(healthy?'':'disabled ')+'title="Enable for search"></td>'
-      +'<td><div style="font-weight:600">'+escapeHtml(plugin.display_name||plugin.module||'plugin')+version+' '+badge+'</div>'
-      +'<div style="opacity:0.6;font-size:11px">'+cats+'</div>'+reason+'</td>'
-      +'<td><button class="btn ghost search-remove-btn" type="button" data-action="search-remove-plugin" data-module="'+module+'" title="Uninstall plugin"><svg class="material-symbols-rounded" style="font-size:16px"><use href=#i-delete></use></svg></button></td>'
-      +'</tr>';
-  }).join('')+'</tbody></table>';
-}
-function renderRecommendedCatalog(entries){
-  const container=document.getElementById('searchRecommended');
-  if(!container){return;}
-  const recommended=recommendedCatalogEntries(entries);
-  if(recommended.length===0){
-    container.innerHTML='<div class="rss-item"><span class="rss-item-info">Recommended public plugins will appear here when they are available in the live catalog.</span></div>';
-    return;
-  }
-  container.innerHTML='<div class="search-recommended-list">'+recommended.map(entry=>''
-    +'<div class="search-recommended-card">'
-    +'<div class="search-recommended-name">'+escapeHtml(entry.name||entry.module||'plugin')
-      +(entry.installed?(' <span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+(entry.installed_healthy?'Installed':'Needs fix')+'</span>'):'')
-      +'</div>'
-    +'<div class="search-recommended-copy">'+escapeHtml(entry.comment||'Popular public search source.')+'</div>'
-    +'<div class="search-recommended-meta">'+escapeHtml([entry.author||'',entry.version?('wiki v'+entry.version):'',entry.updated||''].filter(Boolean).join(' / '))+'</div>'
-    +'<button class="btn primary" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+(entry.installed?'Update':'Install')+'</button>'
-    +'</div>'
-  ).join('')+'</div>';
-}
-function renderSearchResults(results){
-  const container=document.getElementById('searchResults');
-  if(!container){return;}
-  if(!activeSearchSort||!activeSearchSort.key){
-    activeSearchSort=resolveSearchSort();
-  }
-  if(!Array.isArray(results)||results.length===0){
-    container.innerHTML='<div class="search-results-empty"><div>Results will appear here after you search.</div><div class="small" style="margin-top:6px">Enter a query on the left, click Search, and use Manage Plugins if you want to enable or install providers.</div></div>';
-    return;
-  }
-  const sortKey=String(activeSearchSort&&activeSearchSort.key||'seeds');
-  const sortDir=String(activeSearchSort&&activeSearchSort.dir||'desc');
-  const multiplier=sortDir==='asc'?1:-1;
-  const sorted=results.slice().sort((left,right)=>{
-    const key=sortKey;
-    let cmp=0;
-    if(key==='name'){
-      cmp=String(left.name||'').localeCompare(String(right.name||''));
-    }else if(key==='plugin'){
-      cmp=String(left.plugin||left.site_url||'').localeCompare(String(right.plugin||right.site_url||''));
-    }else if(key==='size'){
-      cmp=(Number(left.size)||0)-(Number(right.size)||0);
-    }else if(key==='leech'){
-      cmp=(Number(left.leech)||0)-(Number(right.leech)||0);
-    }else if(key==='updated'){
-      cmp=(Number(left.pub_date)||0)-(Number(right.pub_date)||0);
-    }else{
-      cmp=(Number(left.seeds)||0)-(Number(right.seeds)||0);
-    }
-    if(cmp===0){
-      cmp=String(left.name||'').localeCompare(String(right.name||''));
-    }
-    return cmp*multiplier;
-  });
-  const sortIcon=(key)=>{
-    if(sortKey!==key){return 'unfold_more';}
-    return sortDir==='asc'?'arrow_upward':'arrow_downward';
-  };
-  const sortHeader=(key,label)=>'<button class="search-sort-btn" type="button" data-search-sort="'+key+'">'+label+'<svg class="material-symbols-rounded" style="font-size:14px"><use href=#i-'+sortIcon(key)+'></use></svg></button>';
-  const formatUpdated=(value)=>{
-    const ts=Number(value)||0;
-    if(ts<=0){return '—';}
-    const date=new Date(ts*1000);
-    if(Number.isNaN(date.getTime())){return '—';}
-    return date.toLocaleDateString();
-  };
-  container.innerHTML=''
-    +'<div class="search-results-table-wrap"><table class="search-results-table">'
-    +'<thead><tr>'
-    +'<th>'+sortHeader('name','Name')+'</th>'
-    +'<th>'+sortHeader('plugin','Plugin')+'</th>'
-    +'<th>'+sortHeader('size','Size')+'</th>'
-    +'<th>'+sortHeader('seeds','Seeds')+'</th>'
-    +'<th>'+sortHeader('leech','Leech')+'</th>'
-    +'<th>'+sortHeader('updated','Updated')+'</th>'
-    +'<th>Action</th>'
-    +'</tr></thead><tbody>'
-    +sorted.map(result=>{
-      const added=addedSearchResults.has(String(result.index));
-      const pluginLabel=result.plugin?escapeHtml(result.plugin):escapeHtml(result.site_url||'plugin');
-      const size=Number(result.size);
-      const seeds=Number(result.seeds);
-      const leech=Number(result.leech);
-      const safeDesc=safeExternalUrl(result.desc_link||'');
-      const desc=safeDesc?'<a class="search-result-link" href="'+escapeHtml(safeDesc)+'" target="_blank" rel="noopener noreferrer">Open description</a>':'';
-      return ''
-        +'<tr>'
-        +'<td><div class="search-result-title">'+escapeHtml(result.name||'result')+'</div>'+desc+'</td>'
-        +'<td>'+pluginLabel+'</td>'
-        +'<td>'+(size>0?formatBytes(size):'size unknown')+'</td>'
-        +'<td>'+(seeds>=0?seeds:'?')+'</td>'
-        +'<td>'+(leech>=0?leech:'?')+'</td>'
-        +'<td>'+formatUpdated(result.pub_date)+'</td>'
-        +'<td><button class="btn primary'+(added?' added':'')+'" type="button" data-action="search-add-result" data-index="'+escapeHtml(String(result.index))+'" data-name="'+escapeHtml(result.name||'Search result')+'" '+(added?'disabled aria-disabled="true"':'')+'>'+(added?'Added':'Add')+'</button></td>'
-        +'</tr>';
-    }).join('')
-    +'</tbody></table></div>';
-}
-function renderSearchStatus(data){
-  searchStateCache=data||null;
-  if(!activeSearchSort||!activeSearchSort.key){
-    activeSearchSort=resolveSearchSort();
-  }
-  const startedAt=Number(data&&data.last_started_at)||0;
-  if(startedAt>0&&startedAt!==lastSearchStartedAt){
-    lastSearchStartedAt=startedAt;
-    addedSearchResults.clear();
-  }
-  const category=document.getElementById('searchCategory');
-  if(category&&category.value!==resolveSearchCategory()){category.value=resolveSearchCategory();}
-  const pluginError=document.getElementById('searchPluginError');
-  if(pluginError){
-    const message=(data&&data.plugin_error?String(data.plugin_error):'').trim();
-    pluginError.textContent=message;
-    pluginError.style.display=message?'block':'none';
-  }
-  renderSearchPluginList(data&&Array.isArray(data.plugins)?data.plugins:[]);
-  renderSearchResults(data&&Array.isArray(data.results)?data.results:[]);
-  const summary=document.getElementById('searchSelectionSummary');
-  const warning=document.getElementById('searchPluginWarning');
-  if(summary){
-    const plugins=Array.isArray(data&&data.plugins)?data.plugins:[];
-    const selected=activeSearchPlugins(plugins);
-    const healthyCount=plugins.filter(plugin=>plugin&&plugin.healthy).length;
-    let summaryHtml='';
-    if(healthyCount===0){
-      summaryHtml='<span class="search-selection-text">No ready plugins installed yet.</span>';
-    }else if(selected.length===healthyCount){
-      summaryHtml='<span class="search-selection-text">Using all '+healthyCount+' ready plugins.</span>';
-    }else{
-      summaryHtml='<span class="search-selection-text">Using '+selected.length+' of '+healthyCount+' ready plugins. Some providers are disabled in Plugins.</span>'
-        +'<button class="btn ghost" type="button" onclick="useAllReadyPlugins()">Use All</button>';
-    }
-    summary.innerHTML=summaryHtml;
-  }
-  if(warning){
-    const plugins=Array.isArray(data&&data.plugins)?data.plugins:[];
-    const healthyCount=plugins.filter(plugin=>plugin&&plugin.healthy).length;
-    if(healthyCount===0){
-      warning.style.display='block';
-      warning.innerHTML=''
-        +'<div class="search-warning-title">No Search Plugins Installed</div>'
-        +'<div class="search-warning-copy">Install at least one public plugin before searching. rustorrent does not ship with active public search providers by default.</div>'
-        +'<button class="btn primary" type="button" data-search-view-target="plugins"><svg class="material-symbols-rounded"><use href=#i-extension></use></svg>Manage Plugins</button>';
-    }else{
-      warning.style.display='none';
-      warning.innerHTML='';
-    }
-  }
-  const queryInput=document.getElementById('searchQuery');
-  if(queryInput&&!queryInput.matches(':focus')){
-    const next=data&&typeof data.query==='string'?data.query:'';
-    if(queryInput.value!==next){queryInput.value=next;}
-  }
-  const status=document.getElementById('searchStatusText');
-  if(status){
-    let message='Enter a query on the left and click Search. Use Manage Plugins to change providers.';
-    if(data&&data.busy){message='Searching across installed plugins...';}
-    else if(data&&data.last_error){message=String(data.last_error);}
-    else if(data&&Array.isArray(data.results)&&data.results.length>0){message='Found '+data.results.length+' search results.';}
-    else if(data&&data.plugin_error){message=String(data.plugin_error);}
-    else if(data&&Array.isArray(data.plugins)&&data.plugins.length>0){message='Installed plugins are ready. Enter a query to search.';}
-    else if(data&&data.python_available){message='No search plugins are installed yet. Open Plugins or Community Catalog to add one.';}
-    status.textContent=message;
-  }
-  if(!(data&&data.busy)){
-    searchPollActive=false;
-    if(searchPollTimer!==null){
-      clearTimeout(searchPollTimer);
-      searchPollTimer=null;
-    }
-  }else{
-    scheduleSearchStatusPoll(900);
-  }
-}
-async function loadSearchStatus(_forceRefresh){
-  const data=await fetchJson('/search/status');
-  renderSearchStatus(data);
-  return data;
-}
-function scheduleSearchStatusPoll(delayMs){
-  if(searchPollActive){return;}
-  if(searchPollTimer!==null){
-    clearTimeout(searchPollTimer);
-  }
-  searchPollTimer=setTimeout(()=>pumpSearchStatus().catch(err=>console.warn(err)),delayMs);
-}
-async function pumpSearchStatus(){
-  if(searchPollActive){return;}
-  searchPollActive=true;
-  if(searchPollTimer!==null){
-    clearTimeout(searchPollTimer);
-    searchPollTimer=null;
-  }
-  try{
-    while(true){
-      const data=await fetchJson('/search/status');
-      renderSearchStatus(data);
-      if(!(data&&data.busy)){break;}
-      await sleep(900);
-    }
-  }finally{
-    searchPollActive=false;
-  }
-}
-function renderSearchCatalog(entries){
-  const container=document.getElementById('searchCatalog');
-  if(!container){return;}
-  renderRecommendedCatalog(entries);
-  const meta=document.getElementById('searchCatalogMeta');
-  const filter=document.getElementById('searchCatalogFilter');
-  const search=filter?String(filter.value||'').trim().toLowerCase():'';
-  const sorted=(Array.isArray(entries)?entries:[]).slice().sort((a,b)=>{
-    const installedA=!!(a&&a.installed);
-    const installedB=!!(b&&b.installed);
-    if(installedA!==installedB){return installedA?-1:1;}
-    return String(a&&a.name||'').localeCompare(String(b&&b.name||''));
-  });
-  const filtered=sorted.filter(entry=>{
-    if(!search){return true;}
-    const haystack=[entry.name,entry.author,entry.comment,entry.version,entry.module].join(' ').toLowerCase();
-    return haystack.includes(search);
-  });
-  if(meta){
-    if(searchCatalogLoading){
-      meta.textContent='Loading latest qBittorrent unofficial plugin list...';
-    }else if(searchCatalogFetchedAt>0){
-      meta.textContent='Live list loaded from the qBittorrent unofficial search plugin wiki.';
-    }else{
-      meta.textContent='Latest unofficial qBittorrent search plugins.';
-    }
-  }
-  if(filtered.length===0){
-    container.innerHTML='<div class="rss-item"><span class="rss-item-info">'+(search?'No community plugins match that filter.':'Load the community list to install unofficial qBittorrent plugins with one click.')+'</span></div>';
-    return;
-  }
-  container.innerHTML='<table class="search-catalog-table"><tbody>'+filtered.map(entry=>{
-    const name=escapeHtml(entry.name||entry.module||'plugin');
-    const author=entry.author?escapeHtml(entry.author):'';
-    const version=entry.version?'v'+escapeHtml(entry.version):'';
-    const status=entry.installed
-      ?'<span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+
-       (entry.installed_healthy?'Installed':'Needs fix')+'</span>'
-      :'';
-    const meta=[author,version,entry.updated||''].filter(Boolean).join(' \u00b7 ');
-    const btnLabel=entry.installed?'Update':'Install';
-    return '<tr>'
-      +'<td><div style="font-weight:600">'+name+' '+status+'</div>'
-      +'<div style="opacity:0.6;font-size:11px">'+escapeHtml(meta)+'</div></td>'
-      +'<td><button class="btn '+(entry.installed?'ghost':'primary')+' search-catalog-btn" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+btnLabel+'</button></td>'
-      +'</tr>';
-  }).join('')+'</tbody></table>';
-}
-async function loadSearchCatalog(force){
-  if(searchCatalogLoading){return {entries:searchCatalogCache};}
-  searchCatalogLoading=true;
-  renderSearchCatalog(searchCatalogCache);
-  const suffix=force?'?refresh=1':'';
-  try{
-    const data=await fetchJson('/search/catalog'+suffix);
-    searchCatalogCache=Array.isArray(data&&data.entries)?data.entries:[];
-    searchCatalogFetchedAt=Number(data&&data.fetched_at)||0;
-    renderSearchCatalog(searchCatalogCache);
-    if(data&&data.error){
-      const box=document.getElementById('searchPluginError');
-      if(box){
-        box.textContent=String(data.error);
-        box.style.display='block';
-      }
-    }
-    return data;
-  }finally{
-    searchCatalogLoading=false;
-    renderSearchCatalog(searchCatalogCache);
-  }
-}
-function safeExternalUrl(value){
-  if(!value){return '';}
-  try{
-    const parsed=new URL(String(value),window.location.href);
-    return parsed.protocol==='http:'||parsed.protocol==='https:'?parsed.href:'';
-  }catch(e){return '';}
-}
-function confirmSearchPluginInstall(name){
-  return confirm('Search plugins run third-party Python code on this computer. Install '+(name||'this plugin')+' only if you trust its source. Continue?');
-}
-async function installCatalogPlugin(url,skipConfirmation){
-  if(!url){return;}
-  if(!skipConfirmation&&!confirmSearchPluginInstall('the selected plugin')){return;}
-  await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)});
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function updateInstalledCatalogPlugins(){
-  const installed=(searchCatalogCache||[]).filter(entry=>entry&&entry.installed&&entry.download_url);
-  if(installed.length===0){
-    alert('No installed community plugins are linked to the live catalog.');
-    return;
-  }
-  if(!confirmSearchPluginInstall('updates for all installed community plugins')){return;}
-  for(const entry of installed){
-    await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(entry.download_url)});
-  }
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function submitSearchQuery(e){
-  if(e){e.preventDefault();}
-  const queryInput=document.getElementById('searchQuery');
-  const categoryInput=document.getElementById('searchCategory');
-  const query=queryInput?String(queryInput.value||'').trim():'';
-  const category=categoryInput?String(categoryInput.value||'all'):'all';
-  const engines=selectedSearchPluginsFromDom();
-  if(!query){alert('Enter a search query.');return false;}
-  saveStoredSearchPlugins(engines);
-  saveSearchCategory(category);
-  addedSearchResults.clear();
-  lastSearchStartedAt=0;
-  const submitBtn=document.querySelector('.search-form button[type=\"submit\"]');
-  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Searching\u2026';}
-  const status=document.getElementById('searchStatusText');
-  if(status){status.textContent='Searching across installed plugins\u2026';}
-  const resultsList=document.getElementById('searchResults');
-  if(resultsList){resultsList.innerHTML='<div style=\"text-align:center;padding:32px 0;opacity:0.6\">Searching\u2026</div>';}
-  const body='query='+encodeURIComponent(query)+'&category='+encodeURIComponent(category)+'&engines='+encodeURIComponent(engines.join(','));
-  try{
-    await apiPost('/search/run',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-  }finally{
-    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='Search';}
-  }
-  applySearchPanelView('results');
-  scheduleSearchStatusPoll(100);
-  await loadSearchStatus(false);
-  return false;
-}
-async function installSearchPluginUrl(e){
-  if(e){e.preventDefault();}
-  const input=document.getElementById('searchPluginUrl');
-  const url=input?String(input.value||'').trim():'';
-  if(!url){return false;}
-  await installCatalogPlugin(url);
-  if(input){input.value='';}
-  return false;
-}
-async function installSearchPluginFile(e){
-  const input=e&&e.target?e.target:null;
-  const file=input&&input.files&&input.files[0]?input.files[0]:null;
-  if(!file){return;}
-  if(!confirmSearchPluginInstall(file.name)){
-    if(input){input.value='';}
-    return;
-  }
-  const bytes=new Uint8Array(await file.arrayBuffer());
-  await apiPost('/search/install-plugin?filename='+encodeURIComponent(file.name),{headers:{'Content-Type':'text/x-python'},body:bytes});
-  if(input){input.value='';}
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function removeSearchPlugin(module){
-  if(!module){return;}
-  const ok=confirm('Remove search plugin '+module+'?');
-  if(!ok){return;}
-  await apiPost('/search/remove-plugin',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'module='+encodeURIComponent(module)});
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function addSearchResult(index,name){
-  const downloadDir=document.getElementById('downloadDir');
-  const preallocate=document.getElementById('preallocate');
-  const body='index='+encodeURIComponent(index)
-    +'&dir='+encodeURIComponent(downloadDir?String(downloadDir.value||'').trim():'')
-    +'&prealloc='+(preallocate&&preallocate.checked?'1':'0');
-  await apiPostJson('/search/add-result',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-  addedSearchResults.add(String(index));
-  if(searchStateCache&&Array.isArray(searchStateCache.results)){
-    renderSearchResults(searchStateCache.results);
-  }
-  showToast('Torrent added',name||'The search result was queued in rustorrent.');
-  scheduleRefreshFallback();
-}
-function escapeHtml(value){
-  return String(value||'')
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;')
-    .replace(/'/g,'&#39;');
-}
-function formatBytes(value){
-  const units=['B','KB','MB','GB','TB'];
-  let size=Math.max(0,Number(value)||0);
-  let unit=0;
-  while(size>=1024&&unit+1<units.length){size/=1024;unit+=1;}
-  if(unit===0){return Math.round(size)+' '+units[unit];}
-  return size.toFixed(2)+' '+units[unit];
-}
-function formatRateLimitKbps(kbps){
-  const value=Math.max(0,Number(kbps)||0);
-  if(value===0){return 'Unlimited';}
-  return formatBytes(value*1024)+'/s';
-}
-function updateRateLimitLabels(){
-  const down=document.getElementById('downloadLimit');
-  const up=document.getElementById('uploadLimit');
-  const downLabel=document.getElementById('downloadLimitValue');
-  const upLabel=document.getElementById('uploadLimitValue');
-  if(down&&downLabel){
-    const next=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Number(down.value)||0));
-    down.value=String(next);
-    downLabel.textContent=formatRateLimitKbps(next);
-  }
-  if(up&&upLabel){
-    const next=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Number(up.value)||0));
-    up.value=String(next);
-    upLabel.textContent=formatRateLimitKbps(next);
-  }
-}
-function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
-function decodeUtf8(bytes){
-  try{return textDecoder.decode(bytes);}catch(e){return '';}
-}
-function parseBencode(bytes){
-  function parseAt(offset){
-    if(offset>=bytes.length){throw new Error('unexpected end of file');}
-    const marker=bytes[offset];
-    if(marker===100){
-      let idx=offset+1;
-      const dict={};
-      while(idx<bytes.length&&bytes[idx]!==101){
-        const keyNode=parseAt(idx);
-        if(keyNode.t!=='bytes'){throw new Error('invalid dictionary key');}
-        const key=decodeUtf8(keyNode.v);
-        const valueNode=parseAt(keyNode.end);
-        dict[key]=valueNode;
-        idx=valueNode.end;
-      }
-      if(bytes[idx]!==101){throw new Error('unterminated dictionary');}
-      return {t:'dict',v:dict,start:offset,end:idx+1};
-    }
-    if(marker===108){
-      let idx=offset+1;
-      const list=[];
-      while(idx<bytes.length&&bytes[idx]!==101){
-        const valueNode=parseAt(idx);
-        list.push(valueNode);
-        idx=valueNode.end;
-      }
-      if(bytes[idx]!==101){throw new Error('unterminated list');}
-      return {t:'list',v:list,start:offset,end:idx+1};
-    }
-    if(marker===105){
-      let idx=offset+1;
-      while(idx<bytes.length&&bytes[idx]!==101){idx+=1;}
-      if(bytes[idx]!==101){throw new Error('unterminated integer');}
-      const raw=String.fromCharCode.apply(null,Array.from(bytes.slice(offset+1,idx)));
-      const value=Number(raw);
-      if(!Number.isFinite(value)){throw new Error('invalid integer');}
-      return {t:'int',v:value,start:offset,end:idx+1};
-    }
-    if(marker>=48&&marker<=57){
-      let colon=offset;
-      while(colon<bytes.length&&bytes[colon]!==58){
-        if(bytes[colon]<48||bytes[colon]>57){throw new Error('invalid byte string length');}
-        colon+=1;
-      }
-      if(bytes[colon]!==58){throw new Error('invalid byte string');}
-      const lenRaw=String.fromCharCode.apply(null,Array.from(bytes.slice(offset,colon)));
-      const len=Number(lenRaw);
-      if(!Number.isInteger(len)||len<0){throw new Error('invalid byte string length');}
-      const start=colon+1;
-      const end=start+len;
-      if(end>bytes.length){throw new Error('byte string exceeds buffer');}
-      return {t:'bytes',v:bytes.slice(start,end),start:offset,end:end};
-    }
-    throw new Error('invalid bencode token');
-  }
-  const root=parseAt(0);
-  if(root.end!==bytes.length){throw new Error('trailing data');}
-  return root;
-}
-function nodeString(node){
-  if(!node||node.t!=='bytes'){return '';}
-  return decodeUtf8(node.v);
-}
-function nodeInt(node){
-  if(!node||node.t!=='int'){return 0;}
-  return Math.max(0,Math.floor(node.v));
-}
-function extractInfoHashFromMagnet(magnet){
-  const match=/[?&]xt=urn:btih:([^&]+)/i.exec(String(magnet||''));
-  if(!match){return '';}
-  let value='';
-  try{value=decodeURIComponent(match[1]);}catch(e){value=match[1];}
-  if(/^[a-f0-9]{40}$/i.test(value)){return value.toLowerCase();}
-  return '';
-}
-async function sha1Hex(bytes){
-  const digest=await crypto.subtle.digest('SHA-1',bytes);
-  return Array.from(new Uint8Array(digest)).map(v=>v.toString(16).padStart(2,'0')).join('');
-}
-async function parseTorrentPreview(bytes,fallbackName){
-  const root=parseBencode(bytes);
-  if(!root||root.t!=='dict'){throw new Error('invalid torrent file');}
-  const info=root.v.info;
-  if(!info||info.t!=='dict'){throw new Error('missing info dictionary');}
-  const name=nodeString(info.v['name.utf-8']||info.v.name)||fallbackName||'torrent';
-  const files=[];
-  const fileList=info.v.files;
-  if(fileList&&fileList.t==='list'&&fileList.v.length>0){
-    fileList.v.forEach((entry,idx)=>{
-      if(!entry||entry.t!=='dict'){return;}
-      const length=nodeInt(entry.v.length);
-      const pathNode=entry.v['path.utf-8']||entry.v.path;
-      const segments=(pathNode&&pathNode.t==='list')?pathNode.v.map(nodeString).filter(Boolean):[];
-      const relPath=segments.join('/');
-      files.push({index:idx,path:relPath?name+'/'+relPath:name,length:length,selected:true});
-    });
-  }else{
-    files.push({index:0,path:name,length:nodeInt(info.v.length),selected:true});
-  }
-  const totalBytes=files.reduce((acc,file)=>acc+file.length,0);
-  const infoHash=await sha1Hex(bytes.slice(info.start,info.end));
-  return {name:name,files:files,totalBytes:totalBytes,infoHash:infoHash};
-}
-function renderAddReview(){
-  const summary=document.getElementById('addSummary');
-  const review=document.getElementById('addReview');
-  const fileInput=document.getElementById('torrentFile');
-  const magnetInput=document.getElementById('magnet');
-  const addBtn=document.querySelector('#addModal .btn.primary');
-  if(!summary||!review||!addBtn){return;}
-  const hasFile=!!(fileInput&&fileInput.files&&fileInput.files[0]);
-  const magnet=magnetInput?magnetInput.value.trim():'';
-  if(addDraft.parsing){
-    summary.textContent='Reading torrent metadata...';
-    review.style.display='none';
-    addBtn.disabled=true;
-    return;
-  }
-  if(hasFile){
-    if(addDraft.parseError){
-      summary.textContent='Could not read this .torrent file. '+addDraft.parseError;
-      review.style.display='none';
-      addBtn.disabled=true;
-      return;
-    }
-    if(addDraft.kind==='file'&&addDraft.bytes&&addDraft.files.length>0){
-      const selected=addDraft.files.filter(file=>file.selected).length;
-      summary.textContent='Adding 1 torrent';
-      const rows=addDraft.files.map((file,idx)=>(
-        '<div class=\"add-file-row\">'
-        +'<div><input type=\"checkbox\" '+(file.selected?'checked ':'')+'onchange=\"toggleReviewFile('+idx+',this.checked)\"></div>'
-        +'<div class=\"add-file-name\" title=\"'+escapeHtml(file.path)+'\">'+escapeHtml(file.path)+'</div>'
-        +'<div class=\"add-file-size\">'+formatBytes(file.length)+'</div>'
-        +'</div>'
-      )).join('');
-      review.innerHTML=''
-        +'<div class=\"add-review-title\">'+escapeHtml(addDraft.name||addDraft.fileName||'torrent')+'</div>'
-        +'<div class=\"add-review-meta\"><span>'+addDraft.files.length+' files</span><span>'+formatBytes(addDraft.totalBytes)+'</span><span>'+selected+' selected</span></div>'
-        +'<div class=\"add-file-actions\"><button class=\"btn\" type=\"button\" onclick=\"toggleAllReviewFiles(true)\">Select all</button><button class=\"btn\" type=\"button\" onclick=\"toggleAllReviewFiles(false)\">Clear all</button></div>'
-        +'<div class=\"add-file-list\"><div class=\"add-file-head\"><div></div><div>Name</div><div class=\"add-file-size\">Size</div></div>'+rows+'</div>';
-      review.style.display='block';
-      addBtn.disabled=selected===0;
-      return;
-    }
-    summary.textContent='Select a valid .torrent file.';
-    review.style.display='none';
-    addBtn.disabled=true;
-    return;
-  }
-  if(magnet){
-    summary.textContent='Magnet link ready to add.';
-    review.style.display='none';
-    addBtn.disabled=false;
-    return;
-  }
-  summary.textContent='Select a .torrent file or paste a magnet link.';
-  review.style.display='none';
-  addBtn.disabled=true;
-}
-function toggleReviewFile(index,checked){
-  if(addDraft.kind!=='file'||!addDraft.files[index]){return;}
-  addDraft.files[index].selected=!!checked;
-  renderAddReview();
-}
-function toggleAllReviewFiles(checked){
-  if(addDraft.kind!=='file'){return;}
-  addDraft.files.forEach(file=>{file.selected=!!checked;});
-  renderAddReview();
-}
-async function handleTorrentInputChange(){
-  const fileInput=document.getElementById('torrentFile');
-  const magnetInput=document.getElementById('magnet');
-  const file=fileInput&&fileInput.files?fileInput.files[0]:null;
-  if(file&&magnetInput){magnetInput.value='';}
-  const token=addParseToken+1;
-  addParseToken=token;
-  updateDropZoneState();
-  if(!file){
-    resetAddDraft();
-    renderAddReview();
-    return;
-  }
-  addDraft={kind:'file',name:file.name,fileName:file.name,files:[],totalBytes:file.size||0,infoHash:'',bytes:null,parseError:'',parsing:true};
-  renderAddReview();
-  try{
-    const bytes=new Uint8Array(await file.arrayBuffer());
-    if(token!==addParseToken){return;}
-    const parsed=await parseTorrentPreview(bytes,file.name);
-    if(token!==addParseToken){return;}
-    addDraft={kind:'file',name:parsed.name,fileName:file.name,files:parsed.files,totalBytes:parsed.totalBytes,infoHash:parsed.infoHash,bytes:bytes,parseError:'',parsing:false};
-  }catch(err){
-    if(token!==addParseToken){return;}
-    addDraft={kind:'file',name:file.name,fileName:file.name,files:[],totalBytes:file.size||0,infoHash:'',bytes:null,parseError:actionErrorMessage(err),parsing:false};
-  }
-  renderAddReview();
-}
-function handleMagnetInput(){
-  const magnetInput=document.getElementById('magnet');
-  const fileInput=document.getElementById('torrentFile');
-  const magnet=magnetInput?magnetInput.value.trim():'';
-  addParseToken+=1;
-  if(magnet&&fileInput){fileInput.value='';}
-  if(magnet){
-    addDraft={kind:'magnet',name:'',fileName:'',files:[],totalBytes:0,infoHash:extractInfoHashFromMagnet(magnet),bytes:null,parseError:'',parsing:false};
-  }else{
-    resetAddDraft();
-  }
-  updateDropZoneState();
-  renderAddReview();
-}
-function clearTorrentFile(){
-  const fileInput=document.getElementById('torrentFile');
-  if(fileInput){fileInput.value='';}
-  resetAddDraft();
-  updateDropZoneState();
-  renderAddReview();
-}
-function updateDropZoneState(){
-  const dz=document.getElementById('dropZone');
-  const nameEl=document.getElementById('dzFileName');
-  if(!dz){return;}
-  const fileInput=document.getElementById('torrentFile');
-  const hasFile=!!(fileInput&&fileInput.files&&fileInput.files[0]);
-  if(hasFile){
-    dz.classList.add('has-file');
-    if(nameEl){nameEl.textContent=fileInput.files[0].name;}
-  }else{
-    dz.classList.remove('has-file');
-    if(nameEl){nameEl.textContent='';}
-  }
-}
-(function initDragDrop(){
-  let dragCount=0;
-  const overlay=()=>document.getElementById('pageDropOverlay');
-  function isTorrentDrag(e){
-    if(!e.dataTransfer||!e.dataTransfer.types){return false;}
-    return e.dataTransfer.types.indexOf('Files')!==-1;
-  }
-  document.addEventListener('dragenter',e=>{
-    if(!isTorrentDrag(e)){return;}
-    e.preventDefault();
-    dragCount+=1;
-    const ov=overlay();
-    if(ov){ov.classList.add('active');}
-  });
-  document.addEventListener('dragleave',e=>{
-    dragCount-=1;
-    if(dragCount<=0){
-      dragCount=0;
-      const ov=overlay();
-      if(ov){ov.classList.remove('active');}
-    }
-  });
-  document.addEventListener('dragover',e=>{
-    if(!isTorrentDrag(e)){return;}
-    e.preventDefault();
-    e.dataTransfer.dropEffect='copy';
-  });
-  document.addEventListener('drop',e=>{
-    e.preventDefault();
-    dragCount=0;
-    const ov=overlay();
-    if(ov){ov.classList.remove('active');}
-    const files=e.dataTransfer&&e.dataTransfer.files;
-    if(!files||files.length===0){return;}
-    let torrentFile=null;
-    for(let i=0;i<files.length;i+=1){
-      if(files[i].name.endsWith('.torrent')){torrentFile=files[i];break;}
-    }
-    if(!torrentFile){return;}
-    const modal=document.getElementById('addModal');
-    if(!modal||!modal.classList.contains('open')){openAdd();}
-    const fileInput=document.getElementById('torrentFile');
-    if(fileInput){
-      const dt=new DataTransfer();
-      dt.items.add(torrentFile);
-      fileInput.files=dt.files;
-      updateDropZoneState();
-      handleTorrentInputChange();
-    }
-  });
-  const dzEl=document.getElementById('dropZone');
-  if(dzEl){
-    dzEl.addEventListener('dragenter',e=>{e.preventDefault();dzEl.classList.add('drag-over');});
-    dzEl.addEventListener('dragleave',e=>{dzEl.classList.remove('drag-over');});
-    dzEl.addEventListener('dragover',e=>{e.preventDefault();e.dataTransfer.dropEffect='copy';});
-    dzEl.addEventListener('drop',e=>{dzEl.classList.remove('drag-over');});
-  }
-})();
-async function fetchStatusJson(){
-  const response=await fetch('/status',{cache:'no-store'});
-  if(!response.ok){throw new Error('status request failed');}
-  return response.json();
-}
-async function waitForTorrentIdByHash(infoHash,timeoutMs){
-  const target=String(infoHash||'').toLowerCase();
-  if(!target){return null;}
-  const endAt=Date.now()+timeoutMs;
-  while(Date.now()<endAt){
-    try{
-      const status=await fetchStatusJson();
-      if(status&&Array.isArray(status.torrents)){
-        const match=status.torrents.find(t=>String(t.info_hash||'').toLowerCase()===target);
-        if(match&&typeof match.id!=='undefined'){return match.id;}
-      }
-    }catch(e){}
-    await sleep(250);
-  }
-  return null;
-}
-document.addEventListener('click',e=>{
-  const target=e.target;
-  const mainTabBtn=target&&target.closest('[data-main-tab-target]');
-  if(mainTabBtn){
-    const tab=mainTabBtn.dataset.mainTabTarget==='search'?'search':'library';
-    try{localStorage.setItem(mainTabKey,tab);}catch(e){}
-    applyMainTab(tab);
-    if(tab==='search'){
-      loadSearchCatalog(true).catch(showActionError);
-    }
-    return;
-  }
-  const searchViewBtn=target&&target.closest('[data-search-view-target]');
-  if(searchViewBtn){
-    const view=searchViewBtn.dataset.searchViewTarget==='plugins'?'plugins':'results';
-    applySearchPanelView(view);
-    return;
-  }
-  const searchSortBtn=target&&target.closest('[data-search-sort]');
-  if(searchSortBtn){
-    setSearchSort(searchSortBtn.dataset.searchSort||'seeds');
-    return;
-  }
-  if(target&&target.closest('#themeToggle')){
-    let theme=activeTheme||resolveTheme();
-    theme=theme==='dark'?'light':'dark';
-    try{localStorage.setItem(themeKey,theme);}catch(e){}
-    applyTheme(theme);
-  }
-  const navItem=target.closest('.nav-item[data-filter]');
-  if(navItem){
-    const filter=navItem.dataset.filter||'all';
-    try{localStorage.setItem(filterKey,filter);}catch(e){}
-    applyFilter(filter);
-  }
-  const actionBtn=target.closest('[data-action]');
-  if(actionBtn){
-    const action=actionBtn.dataset.action;
-    if(action==='toggle-panel'){
-      const name=actionBtn.dataset.panel||'';
-      try{
-        const collapsed=isPanelCollapsed(name);
-        localStorage.setItem(panelCollapseKey(name),collapsed?'0':'1');
-      }catch(e){}
-      applyPanelState();
-      return;
-    }
-    if(action==='search-remove-plugin'){
-      removeSearchPlugin(actionBtn.dataset.module||'').catch(showActionError);
-      return;
-    }
-    if(action==='search-install-catalog'){
-      const url=actionBtn.dataset.url||'';
-      if(!url){return;}
-      actionBtn.disabled=true;
-      const origLabel=actionBtn.textContent;
-      actionBtn.textContent='Installing\u2026';
-      installCatalogPlugin(url).catch(showActionError).finally(()=>{actionBtn.disabled=false;actionBtn.textContent=origLabel;});
-      return;
-    }
-    if(action==='search-add-result'){
-      addSearchResult(actionBtn.dataset.index||'',actionBtn.dataset.name||'Search result').catch(showActionError);
-      return;
-    }
-    const card=actionBtn.closest('.torrent-card');
-    const id=card?card.dataset.id:'';
-    if(!id){return;}
-    const paused=card.dataset.paused==='true';
-      if(action==='toggle-pause'){togglePause(id,paused).catch(showActionError);}
-      else if(action==='stop'){torrentAction('stop',id).catch(showActionError);}
-      else if(action==='archive'){torrentAction('archive',id).catch(showActionError);}
-      else if(action==='delete'){confirmDelete(id,card.dataset.name||'torrent').catch(showActionError);}
-      else if(action==='open-folder'){torrentAction('open-folder',id).catch(showActionError);}
-      else if(action==='recheck'){torrentAction('recheck',id).catch(showActionError);}
-    else if(action==='toggle-expand'){toggleExpand(card);}
-    else if(action==='add-tracker'){
-      const input=card.querySelector('.tracker-add-input');
-      if(input&&input.value.trim()){
-        apiPost('/torrent/add-tracker',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&url='+encodeURIComponent(input.value.trim())}).then(()=>{input.value='';}).catch(showActionError);
-      }
-    }
-    else if(action==='remove-tracker'){
-      const url=actionBtn.dataset.url||'';
-      if(url){apiPost('/torrent/remove-tracker',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&url='+encodeURIComponent(url)}).catch(showActionError);}
-    }
-    else if(action==='set-label'){
-      const input=card.querySelector('.label-input');
-      if(input){apiPost('/torrent/set-label',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&label='+encodeURIComponent(input.value.trim())}).catch(showActionError);}
-    }
-  }
-});
-document.addEventListener('input',e=>{
-  const target=e.target;
-  if(target&&target.id==='librarySearch'){
-    const search=String(target.value||'');
-    try{localStorage.setItem(searchKey,search);}catch(e){}
-    applyFilter(resolveFilter());
-    return;
-  }
-  if(target&&target.id==='searchCatalogFilter'){
-    renderSearchCatalog(searchCatalogCache);
-    return;
-  }
-  if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
-    updateRateLimitLabels();
-  }
-  if(target&&target.id==='seedRatio'){
-    const v=Number(target.value)/10;
-    const label=document.getElementById('seedRatioValue');
-    if(label){label.textContent=v>0?v.toFixed(2):'unlimited';}
-  }
-});
-document.addEventListener('change',e=>{
-  const target=e.target;
-  if(target&&target.matches('input[data-search-plugin]')){
-    persistSearchPluginSelectionFromDom();
-    return;
-  }
-  if(target&&target.id==='searchCategory'){
-    saveSearchCategory(target.value||'all');
-    return;
-  }
-  if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
-    setGlobalRateLimits().catch(showActionError);
-  }
-  if(target&&target.id==='seedRatio'){
-    const v=Number(target.value)/10;
-    const body='ratio='+encodeURIComponent(v);
-    apiPost('/settings/seed-ratio',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).catch(showActionError);
-  }
-  if(target&&target.id==='peerProfile'){
-    setPeerProfile().catch(showActionError);
-  }
-});
-function toggleExpand(card){
-  if(!card){return;}
-  const collapsed=card.dataset.collapsed==='true';
-  const nextCollapsed=!collapsed;
-  card.dataset.collapsed=nextCollapsed?'true':'false';
-  const toggle=card.querySelector("[data-action='toggle-expand']");
-  if(toggle){toggle.innerHTML=nextCollapsed?'<svg class="material-symbols-rounded"><use href=#i-unfold_more></use></svg>Expand':'<svg class="material-symbols-rounded"><use href=#i-unfold_less></use></svg>Collapse';toggle.setAttribute('aria-expanded',nextCollapsed?'false':'true');}
-  try{localStorage.setItem(collapseKey(card.dataset.infoHash||''),nextCollapsed?'1':'0');}catch(e){}
-}
-async function setGlobalRateLimits(){
-  const down=document.getElementById('downloadLimit');
-  const up=document.getElementById('uploadLimit');
-  if(!down||!up){return;}
-  const downloadKbps=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Math.round(Number(down.value)||0)));
-  const uploadKbps=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Math.round(Number(up.value)||0)));
-  down.value=String(downloadKbps);
-  up.value=String(uploadKbps);
-  updateRateLimitLabels();
-  const body='download_kbps='+encodeURIComponent(downloadKbps)+'&upload_kbps='+encodeURIComponent(uploadKbps);
-  await apiPost('/rate-limits',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-}
-async function setPeerProfile(){
-  const select=document.getElementById('peerProfile');
-  if(!select){return;}
-  const profile=String(select.value||'balanced').trim().toLowerCase();
-  const body='profile='+encodeURIComponent(profile);
-  await apiPost('/settings/peer-profile',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-}
-async function applyPostAddPlan(plan){
-  if(!plan){return;}
-  let torrentId=Number(plan.torrentId);
-  if(!Number.isFinite(torrentId)||torrentId<=0){
-    if(plan.infoHash){
-      torrentId=await waitForTorrentIdByHash(plan.infoHash,12000);
-    }
-  }
-  if(!Number.isFinite(torrentId)||torrentId<=0){
-    throw new Error('torrent appeared too late for follow-up actions');
-  }
-  for(const fileIndex of (plan.skipFiles||[])){
-    await setPriorityRequest(torrentId,fileIndex,0);
-  }
-  if(plan.startPaused){
-    await torrentAction('pause',torrentId);
-  }
-}
-async function submitAdd(){
-  const fileInput=document.getElementById('torrentFile');
-  const file=fileInput&&fileInput.files?fileInput.files[0]:null;
-  const magnet=document.getElementById('magnet').value.trim();
-  const dir=document.getElementById('downloadDir').value.trim();
-  const prealloc=document.getElementById('preallocate').checked?'1':'0';
-  const startWhenAdded=document.getElementById('startWhenAdded').checked;
-  const addBtn=document.querySelector('#addModal .btn.primary');
-  if(addBtn){addBtn.disabled=true;addBtn.textContent='Adding...';}
-  try{
-    if(file){
-      if(addDraft.parsing){
-        alert('Please wait until torrent metadata is loaded.');
-        return false;
-      }
-      if(addDraft.kind==='file'&&addDraft.files.length>0&&addDraft.files.every(file=>!file.selected)){
-        alert('Select at least one file to download.');
-        return false;
-      }
-      const bytes=(addDraft.kind==='file'&&addDraft.bytes)?addDraft.bytes:new Uint8Array(await file.arrayBuffer());
-      const postPlan={
-        torrentId:null,
-        infoHash:addDraft.infoHash||'',
-        skipFiles:(addDraft.kind==='file'&&addDraft.files.length>0)?addDraft.files.filter(file=>!file.selected).map(file=>file.index):[],
-        startPaused:!startWhenAdded,
-      };
-      const addResponse=await apiPostJson('/add-torrent?dir='+encodeURIComponent(dir)+'&prealloc='+prealloc,{headers:{'Content-Type':'application/x-bittorrent'},body:bytes});
-      const torrentId=Number(addResponse&&addResponse.torrent_id);
-      postPlan.torrentId=Number.isFinite(torrentId)&&torrentId>0?torrentId:null;
-      closeAdd();
-      showToast(
-        'Torrent added',
-        (!startWhenAdded)
-          ? ((addDraft.name||file.name||'Torrent')+' was added and will be paused.')
-          : ((addDraft.name||file.name||'Torrent')+' was added to rustorrent.')
-      );
-      scheduleRefreshFallback();
-      if((postPlan.torrentId!==null||postPlan.infoHash)&&(postPlan.skipFiles.length>0||postPlan.startPaused)){
-        applyPostAddPlan(postPlan).catch(err=>alert('Torrent added, but follow-up settings failed: '+actionErrorMessage(err)));
-      }
-      return false;
-    }
-    if(magnet){
-      const infoHash=extractInfoHashFromMagnet(magnet);
-      const body='magnet='+encodeURIComponent(magnet)+'&dir='+encodeURIComponent(dir)+'&prealloc='+prealloc;
-      const addResponse=await apiPostJson('/add-magnet',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-      const torrentId=Number(addResponse&&addResponse.torrent_id);
-      closeAdd();
-      showToast(
-        'Magnet added',
-        !startWhenAdded
-          ? 'The magnet was added and will be paused after it appears.'
-          : 'The magnet was added to rustorrent.'
-      );
-      scheduleRefreshFallback();
-      if(!startWhenAdded){
-        const plan={torrentId:Number.isFinite(torrentId)&&torrentId>0?torrentId:null,infoHash:infoHash,skipFiles:[],startPaused:true};
-        if(plan.torrentId!==null||plan.infoHash){
-          applyPostAddPlan(plan).catch(err=>alert('Magnet added, but auto-pause failed: '+actionErrorMessage(err)));
-        }else{
-          showToast('Magnet added','Pause it after metadata is available.');
-        }
-      }
-      return false;
-    }
-    alert('Select a .torrent file or paste a magnet link.');
-    return false;
-  }catch(err){
-    alert('Add failed: '+(err&&err.message?err.message:String(err)));
-    return false;
-  }finally{
-    if(addBtn){addBtn.disabled=false;addBtn.textContent='Add';}
-  }
-}
-
-function scheduleRefreshFallback(){
-  setTimeout(()=>{
-    const stale=Date.now()-lastUpdateAt>1200;
-    if(stale&&(!source||source.readyState!==1)){
-      location.reload();
-    }
-  },1200);
-}
-async function torrentAction(action,id){
-  await apiPost('/torrent/'+action+'?id='+encodeURIComponent(id));
-}
-async function togglePause(id,paused){
-  const action=paused?'resume':'pause';
-  await torrentAction(action,id);
-}
-async function confirmDelete(id,name){
-  const safeName=name||'torrent';
-  const ok=confirm('Delete '+safeName+'?');
-  if(!ok){return;}
-  const removeData=confirm('Remove downloaded data for '+safeName+'?');
-  await apiPost('/torrent/delete?id='+encodeURIComponent(id)+'&data='+(removeData?'1':'0'));
-}
-async function setPriorityRequest(torrentId,index,priority){
-  const body='id='+encodeURIComponent(torrentId)+'&index='+encodeURIComponent(index)+'&priority='+encodeURIComponent(priority);
-  await apiPost('/file-priority',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-}
-async function setPriority(torrentId,index,priority){
-  try{
-    await setPriorityRequest(torrentId,index,priority);
-  }catch(err){
-    alert('Priority update failed: '+actionErrorMessage(err));
-  }
-}
-function startRename(torrentId,index,cell){
-  const oldText=cell.textContent;
-  const parts=oldText.split('/');
-  const basename=parts[parts.length-1];
-  const input=document.createElement('input');
-  input.type='text';input.className='input';input.value=basename;
-  input.style.cssText='width:100%;box-sizing:border-box;font-size:12px';
-  cell.textContent='';cell.appendChild(input);input.focus();input.select();
-  let done=false;
-  function finish(save){
-    if(done)return;done=true;
-    const val=input.value.trim();
-    cell.textContent=oldText;
-    if(save&&val&&val!==basename&&!val.includes('/')&&!val.includes('\\\\')&&val!=='.'&&val!=='..'){
-      const newPath=parts.length>1?parts.slice(0,-1).join('/')+'/'+val:val;
-      cell.textContent=newPath;
-      const body='id='+encodeURIComponent(torrentId)+'&index='+encodeURIComponent(index)+'&name='+encodeURIComponent(val);
-      apiPost('/rename-file',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).catch(function(err){
-        cell.textContent=oldText;
-        alert('Rename failed: '+actionErrorMessage(err));
-      });
-    }
-  }
-  input.addEventListener('keydown',function(e){if(e.key==='Enter'){finish(true)}else if(e.key==='Escape'){finish(false)}});
-  input.addEventListener('blur',function(){finish(true)});
-}
-function addRssFeed(e){
-  e.preventDefault();
-  const url=document.getElementById('rssUrl').value.trim();
-  if(!url)return;
-  apiPost('/rss/add-feed',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(()=>location.reload()).catch(err=>alert('Add feed failed: '+actionErrorMessage(err)));
-}
-function removeRssFeed(url){
-  apiPost('/rss/remove-feed',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(()=>location.reload()).catch(err=>alert('Remove feed failed: '+actionErrorMessage(err)));
-}
-function removeRssRule(name){
-  apiPost('/rss/remove-rule',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(name)}).then(()=>location.reload()).catch(err=>alert('Remove rule failed: '+actionErrorMessage(err)));
-}
-function addRssRule(e){
-  e.preventDefault();
-  var name=document.getElementById('rssRuleName').value.trim();
-  var pattern=document.getElementById('rssRulePattern').value.trim();
-  if(!name||!pattern)return;
-  var body='name='+encodeURIComponent(name)+'&pattern='+encodeURIComponent(pattern);
-  apiPost('/rss/add-rule',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(){location.reload()}).catch(function(err){alert('Add rule failed: '+actionErrorMessage(err))});
-}
-applyMainTab(resolveMainTab());
-applyTheme(resolveTheme());
-applySearchPanelView(resolveSearchPanelView());
-activeSearchSort=resolveSearchSort();
-applyFilter(resolveFilter());
-applyCollapseState();
-updateRateLimitLabels();
-renderAddReview();
-const searchCategoryInput=document.getElementById('searchCategory');
-if(searchCategoryInput){searchCategoryInput.value=resolveSearchCategory();}
-loadSearchStatus(false).catch(err=>console.warn('search status failed',err));
-loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
-let lastUpdateAt=Date.now();
-const source=new EventSource('/events');
-source.addEventListener('status',event=>{if(event&&event.data){applyUpdate(event.data);lastUpdateAt=Date.now();}});
-source.onerror=()=>{console.warn('event source disconnected');};
-"#);
+    out.push_str(include_str!("../assets/ui/app.js"));
     out.push_str("</script>");
     out.push_str("</body></html>");
     out
@@ -4406,12 +2416,11 @@ fn render_search_plugin_manager(out: &mut String) {
 
 fn app_body_html(state: &UiState) -> String {
     let mut out = String::with_capacity(4200 + state.torrents.len() * 2000);
-    let queue_len = state.queue_len;
     let _last_added = escape_html(&state.last_added);
     let total_torrents = state.torrents.len();
     let download_dir = escape_html(&state.download_dir);
-    let total_downloaded_bytes: u64 = state.torrents.iter().map(|t| t.downloaded_bytes).sum();
-    let total_uploaded_bytes: u64 = state.torrents.iter().map(|t| t.uploaded_bytes).sum();
+    let total_downloaded_bytes = state.session_downloaded_bytes;
+    let total_uploaded_bytes = state.session_uploaded_bytes;
     let total_downloaded = human_bytes(total_downloaded_bytes);
     let total_uploaded = human_bytes(total_uploaded_bytes);
     let download_limit_kbps = state.global_download_limit_bps / 1024;
@@ -4434,13 +2443,13 @@ fn app_body_html(state: &UiState) -> String {
     };
     let bucket_for = |torrent: &UiTorrent| -> &'static str {
         let status = torrent.status.as_str();
-        if matches!(status, "paused" | "stopped" | "stopping") {
+        if torrent.paused || matches!(status, "paused" | "stopped" | "stopping") {
             return "paused";
         }
         if status == "queued" {
             return "queued";
         }
-        if status == "error" {
+        if status.contains("error") || status.contains("failed") {
             return "error";
         }
         if is_complete_torrent(torrent) {
@@ -4464,11 +2473,11 @@ fn app_body_html(state: &UiState) -> String {
             "error",
             "One or more torrents reported an error. Open the affected item for details.",
         )
-    } else if downloading > 0 {
+    } else if state.download_rate_bps > 0.0 {
         (
-            "Moving data",
+            "Downloading",
             "live",
-            "Downloads are active. The swarm panel shows whether peers are connected or only discovered.",
+            "Receiving files from connected peers.",
         )
     } else if state.upload_rate_bps > 0.0 {
         (
@@ -4476,10 +2485,16 @@ fn app_body_html(state: &UiState) -> String {
             "live",
             "Verified pieces are being served to peers. Upload rate reflects actual peer requests.",
         )
+    } else if downloading > 0 {
+        (
+            "Waiting for peers",
+            "",
+            "Transfers will begin when a reachable peer has the requested pieces.",
+        )
     } else if complete > 0 {
         (
             "Ready to seed",
-            "warn",
+            "live",
             "Completed torrents stay available. Uploads begin when interested peers request pieces.",
         )
     } else if queued > 0 {
@@ -4489,11 +2504,7 @@ fn app_body_html(state: &UiState) -> String {
             "Torrents are waiting for an active slot or metadata before transfer begins.",
         )
     } else if total_torrents == 0 {
-        (
-            "Ready",
-            "",
-            "Add a torrent or search public plugins to start a transfer.",
-        )
+        ("Ready", "", "Your transfers will appear here.")
     } else {
         (
             "Idle",
@@ -4508,8 +2519,8 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str(
         "<div class=\"brand-icon\"><svg class=\"material-symbols-rounded\"><use href=\"#i-downloading\"></use></svg></div>",
     );
-    out.push_str("<div><div class=\"title\">rustorrent</div>");
-    out.push_str("<div class=\"sub\">BitTorrent client</div></div>");
+    out.push_str("<div><div class=\"title\">Rustorrent</div>");
+    out.push_str("<div class=\"sub\">Small app. Shared files.</div></div>");
     out.push_str("</div>");
     out.push_str("<div class=\"app-tabs\">");
     out.push_str("<button class=\"tab-btn active\" type=\"button\" data-main-tab-target=\"library\"><svg class=\"material-symbols-rounded\"><use href=\"#i-folder\"></use></svg>Library</button>");
@@ -4518,9 +2529,9 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str("</div>");
     out.push_str("<div class=\"app-actions\">");
     out.push_str(&format!(
-        "<span class=\"chip\"><svg class=\"material-symbols-rounded\"><use href=\"#i-folder\"></use></svg>{total_torrents} torrents</span>"
+        "<div class=\"header-rate\" aria-label=\"Download speed\"><span>Download</span><strong>↓ {}</strong></div>", human_rate(state.download_rate_bps)
     ));
-    out.push_str(&format!("<span class=\"chip\"><svg class=\"material-symbols-rounded\"><use href=\"#i-queue\"></use></svg>{queue_len} queued</span>"));
+    out.push_str(&format!("<div class=\"header-rate\" aria-label=\"Upload speed\"><span>Upload</span><strong>↑ {}</strong></div>", human_rate(state.upload_rate_bps)));
     out.push_str("<div class=\"toolbar\">");
     out.push_str(
         "<button class=\"btn primary\" type=\"button\" onclick=\"openAdd()\"><svg class=\"material-symbols-rounded\"><use href=\"#i-add\"></use></svg>Add Torrent</button>",
@@ -4664,8 +2675,7 @@ fn app_body_html(state: &UiState) -> String {
     out.push_str("</div>");
     out.push_str("</div>");
 
-    out.push_str("<div class=\"panel\">");
-    out.push_str("<div class=\"panel-title\">Session</div>");
+    out.push_str("<details class=\"panel secondary-panel\" id=\"sessionDetails\"><summary>Session &amp; connection</summary>");
     out.push_str("<div class=\"session-stats\">");
     out.push_str(&format!("<div class=\"session-row\"><span>Downloaded</span><span class=\"session-value\">{total_downloaded}</span></div>"));
     out.push_str(&format!("<div class=\"session-row\"><span>Uploaded</span><span class=\"session-value\">{total_uploaded}</span></div>"));
@@ -4711,10 +2721,10 @@ fn app_body_html(state: &UiState) -> String {
         ));
     }
     out.push_str("</div>");
-    out.push_str("</div>");
+    out.push_str("</details>");
 
     // RSS panel
-    out.push_str("<div class=\"panel\">");
+    out.push_str("<details class=\"panel secondary-panel\" id=\"rssDetails\"><summary>RSS subscriptions</summary>");
     out.push_str("<div class=\"panel-title\"><svg class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\"><use href=\"#i-rss_feed\"></use></svg>RSS Feeds</div>");
     out.push_str("<form class=\"rss-form\" onsubmit=\"addRssFeed(event)\">");
     out.push_str("<input id=\"rssUrl\" class=\"input\" placeholder=\"Feed URL\">");
@@ -4769,41 +2779,27 @@ fn app_body_html(state: &UiState) -> String {
             }
         }
     }
-    out.push_str("</div>");
+    out.push_str("</details>");
 
     out.push_str("</aside>");
 
     out.push_str("<main class=\"torrent-list\">");
-    out.push_str("<section class=\"panel fleet-panel\" aria-label=\"Session overview\">");
-    out.push_str("<div class=\"fleet-hero\">");
     out.push_str(&format!(
-        "<div class=\"fleet-eyebrow\"><span class=\"signal-dot {fleet_signal}\"></span>Swarm state</div><div class=\"fleet-title\">{fleet_state}</div><div class=\"fleet-copy\">{}</div>",
-        escape_html(fleet_copy)
+        "<div class=\"library-heading\"><div><h1>Transfers</h1><p class=\"small\">Your files, from first piece to finished download.</p></div><span class=\"library-count\">{total_torrents} in library</span></div>"
     ));
-    out.push_str("</div>");
-    out.push_str(&format!(
-        "<div class=\"fleet-metric\"><div><div class=\"label\">Down</div><div class=\"value\">{}</div></div><div class=\"hint\">Session rate</div></div>",
-        human_rate(state.download_rate_bps)
-    ));
-    out.push_str(&format!(
-        "<div class=\"fleet-metric\"><div><div class=\"label\">Up</div><div class=\"value\">{}</div></div><div class=\"hint\">Served to peers</div></div>",
-        human_rate(state.upload_rate_bps)
-    ));
-    out.push_str(&format!(
-        "<div class=\"fleet-metric\"><div><div class=\"label\">Peers</div><div class=\"value\">{} / {}</div></div><div class=\"hint\">Connected / known</div></div>",
-        total_active_peers, total_tracker_peers
-    ));
-    out.push_str(&format!(
-        "<div class=\"fleet-metric\"><div><div class=\"label\">Library</div><div class=\"value\">{}</div></div><div class=\"hint\">{} complete</div></div>",
-        total_torrents, complete
-    ));
-    out.push_str("</section>");
+    if !state.torrents.is_empty() {
+        out.push_str(&format!(
+            "<div class=\"library-summary\"><span class=\"signal-dot {fleet_signal}\"></span><strong>{fleet_state}</strong><span>{}</span></div>",
+            escape_html(fleet_copy)
+        ));
+    }
+    out.push_str("<div class=\"filter-empty\" id=\"filterEmpty\" hidden><p>No transfers match this view.</p><button class=\"btn\" type=\"button\" onclick=\"clearLibraryFilters()\">Show all transfers</button></div>");
     if state.torrents.is_empty() {
         out.push_str("<div class=\"panel empty-state\">");
         out.push_str(
             "<svg class=\"material-symbols-rounded\"><use href=\"#i-cloud_download\"></use></svg>",
         );
-        out.push_str("<p>No torrents yet. Add a file, paste a magnet link, or search plugins to start building your library.</p>");
+        out.push_str("<h2>Ready when you are</h2><p>Add a .torrent file or paste a magnet link. Choose where to save it, and we'll take care of the pieces.</p><button class=\"btn primary\" type=\"button\" onclick=\"openAdd()\"><svg class=\"material-symbols-rounded\" aria-hidden=\"true\"><use href=\"#i-add\"></use></svg>Add your first torrent</button><span class=\"small\">You can also drop a .torrent file anywhere.</span>");
         out.push_str("</div>");
     } else {
         for (card_index, torrent) in state.torrents.iter().enumerate() {
@@ -4815,7 +2811,9 @@ fn app_body_html(state: &UiState) -> String {
             let name = escape_html(name);
             let status_raw = torrent.status.as_str();
             let bucket = bucket_for(torrent);
-            let status_display = if bucket == "complete" {
+            let status_display = if torrent.paused {
+                "paused"
+            } else if bucket == "complete" {
                 "seeding"
             } else if matches!(status_raw, "complete" | "seeding") {
                 "downloading"
@@ -4847,10 +2845,19 @@ fn app_body_html(state: &UiState) -> String {
             let eta = format_eta_secs(torrent.eta_secs);
             let pct = percent(completed_bytes, torrent.total_bytes);
             let pct_value = (pct as f64 / 100.0).min(100.0);
-            let peers = format!("{} / {}", torrent.active_peers, torrent.tracker_peers);
+            let peers = format!(
+                "{} connected / {} known",
+                torrent.active_peers, torrent.tracker_peers
+            );
             let pieces = format!("{}/{}", torrent.completed_pieces, torrent.total_pieces);
-            let progress_note = if bucket == "complete" {
-                "Verified payload"
+            let progress_note = if torrent.paused || matches!(status_raw, "stopped" | "stopping") {
+                "Transfer paused"
+            } else if bucket == "complete" {
+                if torrent.upload_rate_bps > 0.0 {
+                    "Sharing with peers"
+                } else {
+                    "Ready to share when peers request pieces"
+                }
             } else if matches!(status_raw, "complete" | "seeding") {
                 "Verification pending"
             } else if torrent.active_peers > 0 {
@@ -4858,40 +2865,7 @@ fn app_body_html(state: &UiState) -> String {
             } else if torrent.tracker_peers > 0 {
                 "Finding reachable peers"
             } else {
-                "Waiting for swarm"
-            };
-            let flow_value = if bucket == "complete" && torrent.upload_rate_bps > 0.0 {
-                "Seeding"
-            } else if torrent.download_rate_bps > 0.0 {
-                "Downloading"
-            } else if bucket == "complete" {
-                "Ready"
-            } else if torrent.active_peers > 0 {
-                "Connected"
-            } else {
-                "Waiting"
-            };
-            let swarm_value = if torrent.active_peers > 0 {
-                format!("{} connected", torrent.active_peers)
-            } else if torrent.tracker_peers > 0 {
-                format!("{} known", torrent.tracker_peers)
-            } else {
-                "No peers".to_string()
-            };
-            let flow_help = format!(
-                "{speed} down / {upload_rate} up / {} requests",
-                torrent.upload_requests_served
-            );
-            let swarm_help = format!(
-                "{} interested / {} connected / known",
-                torrent.interested_peers, peers
-            );
-            let integrity_value = if bucket == "complete" {
-                "Verified".to_string()
-            } else if matches!(status_raw, "complete" | "seeding") {
-                "Checking".to_string()
-            } else {
-                pieces.clone()
+                "Looking for peers"
             };
             let progress_class =
                 if torrent.total_bytes > 0 && completed_bytes >= torrent.total_bytes {
@@ -4955,10 +2929,15 @@ fn app_body_html(state: &UiState) -> String {
                 "<button class=\"btn ghost\" type=\"button\" data-action=\"stop\"{stop_attrs}><svg class=\"material-symbols-rounded\"><use href=\"#i-stop\"></use></svg>{stop_label}</button>"
             ));
             out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"archive\"><svg class=\"material-symbols-rounded\"><use href=\"#i-archive\"></use></svg>Archive</button>");
-            out.push_str("<button class=\"btn danger\" type=\"button\" data-action=\"delete\"><svg class=\"material-symbols-rounded\"><use href=\"#i-delete\"></use></svg>Delete</button>");
+            out.push_str("<button class=\"btn danger\" type=\"button\" data-action=\"delete\"><svg class=\"material-symbols-rounded\"><use href=\"#i-delete\"></use></svg>Remove</button>");
             out.push_str("</div>");
             out.push_str("</div>");
-
+            if !torrent.last_error.is_empty() && bucket == "error" {
+                out.push_str(&format!(
+                    "<div class=\"torrent-error\" role=\"alert\">{}</div>",
+                    escape_html(&torrent.last_error)
+                ));
+            }
             out.push_str(&format!(
                 "<div class=\"torrent-progress\"><div class=\"torrent-progress-top\"><div class=\"meta\">Progress {completed_label} / {total_bytes} ({:.2}%)</div><div class=\"torrent-progress-note\">{progress_note}</div></div>",
                 pct_value
@@ -4970,17 +2949,6 @@ fn app_body_html(state: &UiState) -> String {
             out.push_str(&format!(
                 "<div class=\"torrent-quick\"><span><svg class=\"material-symbols-rounded\"><use href=\"#i-download\"></use></svg>{speed}</span><span><svg class=\"material-symbols-rounded\"><use href=\"#i-upload\"></use></svg>{upload_rate}</span><span><svg class=\"material-symbols-rounded\"><use href=\"#i-group\"></use></svg>{peers}</span><span><svg class=\"material-symbols-rounded\"><use href=\"#i-schedule\"></use></svg>{eta}</span></div>"
             ));
-            out.push_str("<div class=\"torrent-vitals\">");
-            out.push_str(&format!(
-                "<div class=\"vital\"><div class=\"vital-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-bolt\"></use></svg>Flow</div><div class=\"vital-value\">{flow_value}</div><div class=\"vital-help\">{flow_help}</div></div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"vital\"><div class=\"vital-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-hub\"></use></svg>Swarm</div><div class=\"vital-value\">{swarm_value}</div><div class=\"vital-help\">{swarm_help}</div></div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"vital\"><div class=\"vital-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-verified\"></use></svg>Integrity</div><div class=\"vital-value\">{integrity_value}</div><div class=\"vital-help\">{pieces} pieces</div></div>"
-            ));
-            out.push_str("</div>");
             out.push_str("<div class=\"torrent-stats\">");
             out.push_str(&format!(
                 "<div class=\"stat\"><span class=\"k\"><svg class=\"material-symbols-rounded\"><use href=\"#i-download\"></use></svg>Down</span><span class=\"v\">{speed}</span></div>"
@@ -5004,6 +2972,7 @@ fn app_body_html(state: &UiState) -> String {
 
             out.push_str("<div class=\"torrent-grid\">");
             out.push_str("<div class=\"detail-actions\">");
+            out.push_str(&format!("<button class=\"btn ghost\" type=\"button\" data-action=\"stop\"{stop_attrs}><svg class=\"material-symbols-rounded\"><use href=\"#i-stop\"></use></svg>{stop_label}</button>"));
             out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"recheck\"><svg class=\"material-symbols-rounded\"><use href=\"#i-verified\"></use></svg>Recheck</button>");
             out.push_str("</div>");
             out.push_str("<div class=\"subpanel\">");
@@ -5271,7 +3240,8 @@ fn status_json(state: &UiState) -> String {
     }
     torrents_json.push(']');
     format!(
-        "{{\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"status\":\"{}\",\"last_error\":\"{}\",\"total_pieces\":{},\"completed_pieces\":{},\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"percent\":{},\"tracker_peers\":{},\"active_peers\":{},\"interested_peers\":{},\"upload_requests_served\":{},\"preallocate\":{},\"paused\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"incoming_port\":{},\"natpmp_status\":\"{}\",\"upnp_status\":\"{}\",\"queue_len\":{},\"last_added\":\"{}\",\"current_id\":{},\"peer_connected\":{},\"peer_disconnected\":{},\"disk_read_ms_avg\":{:.3},\"disk_write_ms_avg\":{:.3},\"session_downloaded_bytes\":{},\"session_uploaded_bytes\":{},\"global_download_limit_bps\":{},\"global_upload_limit_bps\":{},\"seed_ratio\":{:.2},\"files\":{},\"torrents\":{}}}",
+        "{{\"version\":\"{}\",\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"status\":\"{}\",\"last_error\":\"{}\",\"total_pieces\":{},\"completed_pieces\":{},\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"percent\":{},\"tracker_peers\":{},\"active_peers\":{},\"interested_peers\":{},\"upload_requests_served\":{},\"preallocate\":{},\"paused\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"incoming_port\":{},\"natpmp_status\":\"{}\",\"upnp_status\":\"{}\",\"queue_len\":{},\"last_added\":\"{}\",\"current_id\":{},\"peer_connected\":{},\"peer_disconnected\":{},\"disk_read_ms_avg\":{:.3},\"disk_write_ms_avg\":{:.3},\"session_downloaded_bytes\":{},\"session_uploaded_bytes\":{},\"global_download_limit_bps\":{},\"global_upload_limit_bps\":{},\"seed_ratio\":{:.2},\"files\":{},\"torrents\":{}}}",
+        env!("CARGO_PKG_VERSION"),
         escape_json(&state.name),
         escape_json(&state.info_hash),
         escape_json(&state.download_dir),

@@ -22,6 +22,7 @@ VERSION="$(
 if [[ -z "$VERSION" ]]; then
   VERSION="0.0.0"
 fi
+BUNDLE_VERSION="${VERSION%%-*}"
 
 UNIVERSAL=false
 CREATE_DMG=false
@@ -97,9 +98,9 @@ LAUNCHER_SRC="$SCRIPT_DIR/Launcher.swift"
 if [[ -f "$LAUNCHER_SRC" ]] && command -v xcrun >/dev/null 2>&1; then
   echo "==> Building native macOS launcher"
   if $UNIVERSAL; then
-    xcrun --sdk macosx swiftc -parse-as-library -O -target "arm64-apple-macos$MACOS_MIN_VERSION" \
+    xcrun --sdk macosx swiftc -parse-as-library -Osize -target "arm64-apple-macos$MACOS_MIN_VERSION" \
       "$LAUNCHER_SRC" -o "$BUILD_DIR/rustorrent-launcher-arm64"
-    xcrun --sdk macosx swiftc -parse-as-library -O -target "x86_64-apple-macos$MACOS_MIN_VERSION" \
+    xcrun --sdk macosx swiftc -parse-as-library -Osize -target "x86_64-apple-macos$MACOS_MIN_VERSION" \
       "$LAUNCHER_SRC" -o "$BUILD_DIR/rustorrent-launcher-x86_64"
     lipo -create \
       "$BUILD_DIR/rustorrent-launcher-arm64" \
@@ -107,7 +108,7 @@ if [[ -f "$LAUNCHER_SRC" ]] && command -v xcrun >/dev/null 2>&1; then
       -output "$APP_BUNDLE/Contents/MacOS/rustorrent"
   else
     SWIFT_ARCH="$(uname -m)"
-    xcrun --sdk macosx swiftc -parse-as-library -O \
+    xcrun --sdk macosx swiftc -parse-as-library -Osize \
       -target "$SWIFT_ARCH-apple-macos$MACOS_MIN_VERSION" \
       "$LAUNCHER_SRC" -o "$APP_BUNDLE/Contents/MacOS/rustorrent"
   fi
@@ -116,11 +117,16 @@ else
   cp "$SCRIPT_DIR/rustorrent-launcher" "$APP_BUNDLE/Contents/MacOS/rustorrent"
 fi
 chmod +x "$APP_BUNDLE/Contents/MacOS/rustorrent"
+if file "$APP_BUNDLE/Contents/MacOS/rustorrent" | grep -q 'Mach-O'; then
+  /usr/bin/strip -S -x "$APP_BUNDLE/Contents/MacOS/rustorrent"
+fi
 cp "$SCRIPT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" \
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $BUNDLE_VERSION" \
   "$APP_BUNDLE/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" \
-  "$APP_BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUNDLE_VERSION" \
+    "$APP_BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleGetInfoString string Rustorrent $VERSION" \
+    "$APP_BUNDLE/Contents/Info.plist"
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
 if [[ ! -f "$SCRIPT_DIR/AppIcon.icns" ]]; then
@@ -151,10 +157,10 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
   codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 else
   # Apple Silicon executables receive linker-generated ad-hoc signatures, but
-  # those do not bind the helper binary to the surrounding app bundle. Seal
-  # every executable and then the bundle so macOS can consistently attribute
-  # Local Network permission to CFBundleIdentifier. This is not a substitute
-  # for Developer ID signing or notarization.
+  # those do not seal the surrounding app bundle. Sign the helper and then
+  # the bundle for local integrity verification. Ad-hoc signatures alone do
+  # not guarantee stable Local Network permission across rebuilds, nor replace
+  # Developer ID signing or notarization.
   echo "==> Ad-hoc signing app bundle"
   codesign --force --sign - --identifier "com.rustorrent.app.backend" \
     "$APP_BUNDLE/Contents/MacOS/rustorrent-bin"
