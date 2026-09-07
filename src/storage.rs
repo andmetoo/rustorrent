@@ -176,13 +176,11 @@ impl Storage {
                 open_payload_file(&layout.path, true)?
             };
             opened.file.try_lock().map_err(|_| Error::PayloadInUse)?;
-            if options.preallocate {
-                if let Err(err) = opened.file.set_len(layout.length) {
-                    if err.raw_os_error() == Some(28) {
-                        return Err(Error::InsufficientDiskSpace);
-                    }
-                    return Err(Error::Io(err));
-                }
+            if opened.file.metadata()?.len() > layout.length {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "existing file is larger than the torrent file; choose another download folder",
+                )));
             }
             entries.push(FileEntry {
                 path: layout.path,
@@ -194,6 +192,17 @@ impl Storage {
             });
         }
         validate_distinct_files(&entries)?;
+        // Validate every path and file identity before changing any file size.
+        if options.preallocate {
+            for entry in &entries {
+                if let Err(err) = entry.file.set_len(entry.length) {
+                    if err.raw_os_error() == Some(28) {
+                        return Err(Error::InsufficientDiskSpace);
+                    }
+                    return Err(Error::Io(err));
+                }
+            }
+        }
 
         Ok(Self {
             entries,

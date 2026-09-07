@@ -1,8 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,11 +24,18 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let mut used = USED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap();
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok() && used.insert(port) {
+            return port;
+        }
+    }
 }
 
 fn wait_for_tcp(port: u16, timeout: Duration) -> bool {
@@ -82,23 +92,46 @@ fn build_handshake(info_hash: [u8; 20], peer_id: [u8; 20], extensions: bool) -> 
     out
 }
 
-fn spawn_rustorrent(args: &[String], cwd: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_rustorrent"))
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+struct TestProcess {
+    child: Child,
+    log: PathBuf,
+}
+impl Deref for TestProcess {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+impl DerefMut for TestProcess {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+impl Drop for TestProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
-fn stop_child(mut child: Child) -> String {
+fn spawn_rustorrent(args: &[String], cwd: &Path) -> TestProcess {
+    let log = cwd.join("process-output.log");
+    let output = fs::File::create(&log).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_rustorrent"))
+        .args(args)
+        .arg("--no-port-mapping")
+        .current_dir(cwd)
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::from(output))
+        .spawn()
+        .unwrap();
+    TestProcess { child, log }
+}
+
+fn stop_child(mut child: TestProcess) -> String {
     let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    text
+    let _ = child.wait();
+    fs::read_to_string(&child.log).unwrap_or_default()
 }
 
 fn http_get(port: u16, path: &str) -> Option<String> {
@@ -258,7 +291,8 @@ fn ui_echoes_the_backend_owner_secret_for_launcher_verification() {
         "backend exited after serving owner secret"
     );
 
-    let _ = stop_child(child);
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = fs::remove_dir_all(&root);
 }
 

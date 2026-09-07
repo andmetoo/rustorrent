@@ -160,6 +160,12 @@ impl From<bencode::Error> for Error {
     }
 }
 
+pub fn info_bytes(data: &[u8]) -> Result<&[u8], Error> {
+    let (_, span) = parse_top_dict(data)?;
+    let (start, end) = span.ok_or(Error::MissingField("info"))?;
+    Ok(&data[start..end])
+}
+
 pub fn parse_torrent(data: &[u8]) -> Result<TorrentMeta, Error> {
     let (top_dict, info_span) = parse_top_dict(data)?;
     let info_span = info_span.ok_or(Error::MissingField("info"))?;

@@ -8,15 +8,18 @@ const SSDP_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 2
 const SSDP_ATTEMPTS: usize = 3;
 const SSDP_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub fn map_port(port: u16) -> Result<(), String> {
+pub fn map_port(port: u16) -> Result<Duration, String> {
     let location = discover_gateway()
         .ok_or_else(|| "gateway did not answer UPnP discovery after 3 attempts".to_string())?;
     let description = http::get_same_origin(&location, 512 * 1024)?;
     let control = parse_control_url(&description, &location)
         .ok_or_else(|| "upnp control url not found".to_string())?;
+    let gateway =
+        http::url_host_ip(&control.url).ok_or_else(|| "invalid gateway address".to_string())?;
+    let client = local_ip(gateway).ok_or_else(|| "no local route to the gateway".to_string())?;
 
     for protocol in ["TCP", "UDP"] {
-        let body = build_add_port_mapping(port, protocol, &control.service_type);
+        let body = build_add_port_mapping(port, protocol, &control.service_type, &client);
         let headers = vec![
             ("Content-Type", "text/xml; charset=\"utf-8\"".to_string()),
             (
@@ -26,7 +29,8 @@ pub fn map_port(port: u16) -> Result<(), String> {
         ];
         let _ = http::post(&control.url, &headers, body.as_bytes(), 128 * 1024)?;
     }
-    Ok(())
+    // Permanent leases can disappear after a router restart or network change.
+    Ok(Duration::from_secs(30 * 60))
 }
 
 fn discover_gateway() -> Option<String> {
@@ -115,9 +119,12 @@ fn parse_control_url(xml: &[u8], base: &str) -> Option<ControlEndpoint> {
                 .find(|child| local_name(&child.tag) == "serviceType")?
                 .text
                 .trim();
-            if service_type.contains(":WANIPConnection:")
-                || service_type.contains(":WANPPPConnection:")
-            {
+            if matches!(
+                service_type,
+                "urn:schemas-upnp-org:service:WANIPConnection:1"
+                    | "urn:schemas-upnp-org:service:WANIPConnection:2"
+                    | "urn:schemas-upnp-org:service:WANPPPConnection:1"
+            ) {
                 let control = node
                     .children
                     .iter()
@@ -142,7 +149,7 @@ fn parse_control_url(xml: &[u8], base: &str) -> Option<ControlEndpoint> {
     })
 }
 
-fn build_add_port_mapping(port: u16, protocol: &str, service_type: &str) -> String {
+fn build_add_port_mapping(port: u16, protocol: &str, service_type: &str, client: &str) -> String {
     format!(
         "<?xml version=\"1.0\"?>\
 <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
@@ -159,13 +166,13 @@ fn build_add_port_mapping(port: u16, protocol: &str, service_type: &str) -> Stri
 </u:AddPortMapping>\
 </s:Body>\
 </s:Envelope>",
-        local_ip().unwrap_or_else(|| "0.0.0.0".to_string())
+        client
     )
 }
 
-fn local_ip() -> Option<String> {
+fn local_ip(gateway: IpAddr) -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    let _ = socket.connect("8.8.8.8:53");
+    socket.connect((gateway, 1900)).ok()?;
     socket.local_addr().ok().map(|addr| addr.ip().to_string())
 }
 
@@ -215,6 +222,7 @@ mod tests {
             51413,
             "UDP",
             "urn:schemas-upnp-org:service:WANPPPConnection:1",
+            "192.0.2.2",
         );
         assert!(body.contains("<NewExternalPort>51413</NewExternalPort>"));
         assert!(body.contains("<NewInternalPort>51413</NewInternalPort>"));

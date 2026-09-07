@@ -1,0 +1,12 @@
+{
+  "name": "rustorrent-browser-tests",
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:transfer": "python3 tests/e2e_transfer.py"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.63.0"
+  }
+}

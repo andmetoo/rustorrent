@@ -159,14 +159,14 @@ mod udp_tracker {
 
 #[cfg(not(feature = "natpmp"))]
 mod natpmp {
-    pub fn map_port(_port: u16, _lifetime: u32) -> Result<(), String> {
+    pub fn map_port(_port: u16, _lifetime: u32) -> Result<std::time::Duration, String> {
         Err("natpmp disabled".to_string())
     }
 }
 
 #[cfg(not(feature = "upnp"))]
 mod upnp {
-    pub fn map_port(_port: u16) -> Result<(), String> {
+    pub fn map_port(_port: u16) -> Result<std::time::Duration, String> {
         Err("upnp disabled".to_string())
     }
 }
@@ -445,10 +445,12 @@ struct TorrentRequest {
     download_dir: PathBuf,
     preallocate: bool,
     initial_label: String,
+    initial_options: ui::AddOptions,
 }
 
 #[derive(Clone)]
 struct SessionEntry {
+    paused: bool,
     info_hash: [u8; 20],
     name: String,
     torrent_bytes: Vec<u8>,
@@ -713,6 +715,13 @@ struct PeerSlots {
     active: AtomicUsize,
 }
 
+struct PeerSlotGuard(Arc<PeerSlots>);
+impl Drop for PeerSlotGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 struct ActiveTorrentGuard {
     counter: Arc<AtomicUsize>,
 }
@@ -766,6 +775,13 @@ struct TorrentContext {
     info_hash: [u8; 20],
     hybrid_v2_info_hash: Option<[u8; 20]>,
     peer_id: [u8; 20],
+    metadata: Arc<Vec<u8>>,
+    peer_queue: Arc<Mutex<PeerQueue>>,
+    allow_pex: bool,
+    piece_buffer_budgets: piece::PieceBufferBudgets,
+    ui_state: Option<Arc<Mutex<ui::UiState>>>,
+    global_peer_slots: Arc<PeerSlots>,
+    torrent_peer_slots: Arc<PeerSlots>,
     pieces: Arc<Mutex<piece::PieceManager>>,
     storage: Arc<Mutex<storage::Storage>>,
     completed_log: Arc<Mutex<Vec<u32>>>,
@@ -1569,6 +1585,7 @@ impl SessionStore {
         guard.insert(
             info_hash,
             SessionEntry {
+                paused: false,
                 info_hash,
                 name,
                 torrent_bytes,
@@ -1659,6 +1676,7 @@ impl SessionStore {
                 )
             });
         let proposed = SessionEntry {
+            paused: previous.as_ref().is_some_and(|entry| entry.paused),
             info_hash,
             name,
             torrent_bytes,
@@ -1684,6 +1702,23 @@ impl SessionStore {
                 }
             }
             return Err(format!("session save failed: {err}"));
+        }
+        Ok(())
+    }
+
+    fn set_paused(&self, info_hash: [u8; 20], paused: bool) -> Result<(), String> {
+        let mut guard = lock_or_recover(&self.entries);
+        let previous = guard
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        if previous.paused == paused {
+            return Ok(());
+        }
+        guard.get_mut(&info_hash).unwrap().paused = paused;
+        if let Err(err) = save_session(&self.path, &guard) {
+            guard.insert(info_hash, previous);
+            return Err(err);
         }
         Ok(())
     }
@@ -1910,15 +1945,28 @@ impl RateLimiter {
         }
     }
 
-    fn throttle(&self, bytes: usize) {
+    fn throttle_until(&self, bytes: usize, stop: &AtomicBool) -> bool {
         let limit_bps = self.limit_bps();
         if limit_bps == 0 || bytes == 0 {
-            return;
+            return !torrent_stop_requested(stop);
         }
         let delay = self.reserve_delay(bytes, limit_bps, Instant::now());
-        if !delay.is_zero() {
-            sleep_with_shutdown(delay);
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if torrent_stop_requested(stop) {
+                return false;
+            }
+            if self.limit_bps() != limit_bps {
+                return true;
+            }
+            sleep_with_shutdown_or_stop(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50)),
+                stop,
+            );
         }
+        !torrent_stop_requested(stop)
     }
 
     fn reserve_delay(&self, bytes: usize, limit_bps: u64, now: Instant) -> Duration {
@@ -2031,6 +2079,16 @@ impl PeerSlots {
 
     fn set_max(&self, max: usize) {
         self.max.store(max, Ordering::SeqCst);
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<PeerSlotGuard> {
+        self.active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                let max = self.max.load(Ordering::SeqCst);
+                (max == 0 || active < max).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| PeerSlotGuard(Arc::clone(self)))
     }
 
     fn acquire(&self, stop_flag: &AtomicBool) -> bool {
@@ -2735,16 +2793,14 @@ fn run() -> Result<(), String> {
     }
 
     let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let progress_handle = if !args.daemon && !args.tui {
-        match start_console_progress(state.clone(), registry.clone()) {
+    let progress_handle = {
+        match start_console_progress(state.clone(), registry.clone(), !args.daemon && !args.tui) {
             Ok(handle) => Some(handle),
             Err(err) => {
                 log_warn!("{err}");
                 None
             }
         }
-    } else {
-        None
     };
     let tui_handle = if args.tui {
         match start_tui(state.clone(), cmd_tx.clone()) {
@@ -2864,11 +2920,17 @@ fn run() -> Result<(), String> {
     } else {
         lpd::disabled()
     };
-    if direct_discovery {
+    if direct_discovery && args.port_mapping && inbound_listener_handle.is_some() {
         let port = args.port;
         let mapping_ui = ui_state.clone();
         spawn_detached("nat-pmp-mapping", move || {
-            record_port_mapping_result(&mapping_ui, "nat-pmp", port, natpmp::map_port(port, 3600));
+            run_port_mapping_with_retries(
+                &mapping_ui,
+                "nat-pmp",
+                port,
+                &[Duration::from_secs(10), Duration::from_secs(60)],
+                || natpmp::map_port(port, 3600),
+            );
         });
         let port = args.port;
         let mapping_ui = ui_state.clone();
@@ -2887,8 +2949,15 @@ fn run() -> Result<(), String> {
         });
     } else {
         update_ui(&ui_state, |state| {
-            state.natpmp_status = "disabled while proxy is active".to_string();
-            state.upnp_status = "disabled while proxy is active".to_string();
+            let reason = if direct_discovery && args.port_mapping {
+                "unavailable: incoming peer port could not be opened"
+            } else if direct_discovery {
+                "disabled by settings"
+            } else {
+                "disabled while proxy is active"
+            };
+            state.natpmp_status = reason.to_string();
+            state.upnp_status = reason.to_string();
         });
     }
 
@@ -2907,6 +2976,7 @@ fn run() -> Result<(), String> {
             download_dir: args.download_dir.clone(),
             preallocate: args.preallocate,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         };
         if enqueue_request_if_new(
             &registry,
@@ -2928,6 +2998,7 @@ fn run() -> Result<(), String> {
             download_dir: args.download_dir.clone(),
             preallocate: args.preallocate,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         };
         if enqueue_request_if_new(
             &registry,
@@ -3189,14 +3260,46 @@ fn drain_ui_commands(
                     data,
                     download_dir,
                     preallocate,
+                    options,
                     reply,
                 } => {
+                    if queue
+                        .len()
+                        .saturating_add(lock_or_recover(&session_store.entries).len())
+                        .saturating_add(lock_or_recover(in_flight).len())
+                        >= MAX_SESSION_ENTRIES
+                    {
+                        let _ = reply.send(Err(
+                            "library capacity reached; remove a transfer before adding more"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                    if let Err(err) = torrent::parse_torrent(&data)
+                        .map_err(|err| err.to_string())
+                        .and_then(|meta| {
+                            let spans = build_file_spans(&meta)?;
+                            if options.skip_files.iter().any(|index| *index >= spans.len()) {
+                                return Err("file selection index out of range".to_string());
+                            }
+                            if spans.iter().enumerate().all(|(index, span)| {
+                                span.is_padding || options.skip_files.contains(&index)
+                            }) {
+                                return Err("select at least one file".to_string());
+                            }
+                            Ok(())
+                        })
+                    {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
                     let request = TorrentRequest {
                         id: *next_id,
                         source: TorrentSource::Bytes(data),
                         download_dir: normalize_download_dir(download_dir, &args.download_dir),
                         preallocate,
                         initial_label: String::new(),
+                        initial_options: options,
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
                         if is_duplicate_torrent(
@@ -3228,14 +3331,32 @@ fn drain_ui_commands(
                     magnet,
                     download_dir,
                     preallocate,
+                    options,
                     reply,
                 } => {
+                    if queue
+                        .len()
+                        .saturating_add(lock_or_recover(&session_store.entries).len())
+                        .saturating_add(lock_or_recover(in_flight).len())
+                        >= MAX_SESSION_ENTRIES
+                    {
+                        let _ = reply.send(Err(
+                            "library capacity reached; remove a transfer before adding more"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                    if let Err(err) = parse_magnet(&magnet) {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
                     let request = TorrentRequest {
                         id: *next_id,
                         source: TorrentSource::Magnet(magnet),
                         download_dir: normalize_download_dir(download_dir, &args.download_dir),
                         preallocate,
                         initial_label: String::new(),
+                        initial_options: options,
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
                         if is_duplicate_torrent(
@@ -3259,8 +3380,9 @@ fn drain_ui_commands(
                     let _ = reply.send(Ok(ui::UiCommandSuccess::TorrentAdded { torrent_id }));
                 }
                 ui::UiCommand::PauseTorrent { torrent_id, reply } => {
-                    let result = set_torrent_paused(registry, ui_state, torrent_id, true)
-                        .map(|_| ui::UiCommandSuccess::Ok);
+                    let result =
+                        set_torrent_paused(registry, ui_state, session_store, torrent_id, true)
+                            .map(|_| ui::UiCommandSuccess::Ok);
                     if let Err(err) = result.as_ref() {
                         log_warn!("pause torrent error: {err}");
                         update_ui(ui_state, |state| {
@@ -3580,6 +3702,7 @@ fn restore_session_entries(
             download_dir: entry.download_dir.clone(),
             preallocate: entry.preallocate,
             initial_label: entry.label.clone(),
+            initial_options: ui::AddOptions::default(),
         };
         *next_id = next_id.saturating_add(1);
         enqueue_request_with_label(queue, ui_state, request, label);
@@ -3822,6 +3945,11 @@ fn run_torrent_once(
             file_priorities.clone_from(&resume.file_priorities);
         }
     }
+    for index in &request.initial_options.skip_files {
+        *file_priorities
+            .get_mut(*index)
+            .ok_or_else(|| "file selection index out of range".to_string())? = piece::PRIORITY_SKIP;
+    }
     for (priority, span) in file_priorities.iter_mut().zip(file_spans.iter()) {
         if span.is_padding {
             *priority = piece::PRIORITY_SKIP;
@@ -4045,7 +4173,14 @@ fn run_torrent_once(
     let file_priorities = Arc::new(Mutex::new(file_priorities));
     let downloaded = Arc::new(AtomicU64::new(resume_downloaded));
     let uploaded = Arc::new(AtomicU64::new(resume_uploaded));
-    let paused_flag = Arc::new(AtomicBool::new(false));
+    if request.initial_options.paused {
+        session_store.set_paused(meta.info_hash, true)?;
+    }
+    let paused_flag = Arc::new(AtomicBool::new(
+        session_store
+            .get(meta.info_hash)
+            .is_some_and(|entry| entry.paused),
+    ));
     let stop_flag = Arc::new(AtomicBool::new(false));
     if completion_move_pending {
         stop_flag.store(true, Ordering::SeqCst);
@@ -4167,6 +4302,12 @@ fn run_torrent_once(
         )),
     );
     let peer_tags = Arc::new(AtomicU64::new(1));
+    let metadata = Arc::new(
+        torrent::info_bytes(&data)
+            .map_err(|err| err.to_string())?
+            .to_vec(),
+    );
+    let per_torrent_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_torrent()));
     let upload_manager = Arc::new(UploadManager::new(UPLOAD_SLOTS));
     let active_peers = Arc::new(AtomicUsize::new(0));
     let interested_peers = Arc::new(AtomicUsize::new(0));
@@ -4177,6 +4318,13 @@ fn run_torrent_once(
         info_hash: meta.info_hash,
         hybrid_v2_info_hash,
         peer_id,
+        metadata: Arc::clone(&metadata),
+        peer_queue: Arc::clone(&peer_queue),
+        allow_pex: !meta.info.private,
+        piece_buffer_budgets: piece_buffer_budgets.clone(),
+        ui_state: ui_state.clone(),
+        global_peer_slots: Arc::clone(&peer_slots),
+        torrent_peer_slots: Arc::clone(&per_torrent_slots),
         pieces: Arc::clone(&pieces),
         storage: Arc::clone(&storage),
         completed_log: Arc::clone(&completed_log),
@@ -4242,6 +4390,7 @@ fn run_torrent_once(
         Arc::clone(&downloaded),
         Arc::clone(&stop_flag),
         piece_buffer_budgets.clone(),
+        Arc::clone(&paused_flag),
         ui_state.clone(),
         request.id,
     ) {
@@ -4295,7 +4444,6 @@ fn run_torrent_once(
             std::collections::VecDeque::new();
         // Track per-tracker failures for exponential backoff: url -> (fail_count, last_failure)
         let mut tracker_failures: HashMap<String, (u32, Instant)> = HashMap::new();
-        let per_torrent_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_torrent()));
         let peer_tags = Arc::clone(&peer_tags);
         let torrent_id = request.id;
         let allow_pex = !meta.info.private;
@@ -4387,6 +4535,7 @@ fn run_torrent_once(
                 let ui_clone = ui_state.clone();
                 let info_hash = meta.info_hash;
                 let base_piece_length = meta.info.piece_length;
+                let metadata = Arc::clone(&metadata);
                 let connect_cfg = connect_cfg.clone();
                 let limits = limits.clone();
                 let peer_slots = Arc::clone(&peer_slots);
@@ -4408,6 +4557,7 @@ fn run_torrent_once(
                             &completed_clone,
                             &queue_clone,
                             allow_pex,
+                            &metadata,
                             &active_clone,
                             &interested_clone,
                             &upload_requests_clone,
@@ -5261,6 +5411,7 @@ fn run_torrent_once(
                                         download_dir: dest.clone(),
                                         preallocate: request.preallocate,
                                         initial_label: request.initial_label.clone(),
+                                        initial_options: ui::AddOptions::default(),
                                     });
                                 }
                             }
@@ -6150,11 +6301,9 @@ fn fetch_metadata_from_peer(
                                     continue;
                                 }
                             };
-                            if Some(ext_id) != ut_metadata_id {
-                                log_info!("metadata: peer {addr} ut_metadata override id={ext_id}");
-                                ut_metadata_id = Some(ext_id);
-                                requested.clear();
-                                last_request = Instant::now() - METADATA_REQUEST_RETRY;
+                            // Inbound IDs belong to our handshake, not the peer's.
+                            if ext_id != 1 {
+                                continue;
                             }
                             if msg.msg_type == 2 {
                                 log_warn!("metadata: peer {addr} rejected piece {}", msg.piece);
@@ -6381,6 +6530,47 @@ fn send_metadata_request<W: Write>(
     .map_err(|err| format!("metadata request failed: {err}"))
 }
 
+fn serve_metadata_request<W: Write>(
+    stream: &mut W,
+    request: &[u8],
+    metadata: &[u8],
+    response_id: u8,
+    bytes_served: &mut usize,
+) -> Result<(), String> {
+    let Ok(message) = parse_metadata_message(request) else {
+        return Ok(());
+    };
+    if message.msg_type != 0 || response_id == 0 {
+        return Ok(());
+    }
+    let length = expected_metadata_piece_len(metadata.len(), message.piece as usize);
+    // Bound metadata amplification per connection, including repeat requests.
+    let accepted = length.is_some()
+        && bytes_served.saturating_add(length.unwrap_or(0)) <= metadata.len().saturating_mul(4);
+    let mut payload = format!(
+        "d8:msg_typei{}e5:piecei{}e",
+        if accepted { 1 } else { 2 },
+        message.piece
+    )
+    .into_bytes();
+    if let Some(length) = length.filter(|_| accepted) {
+        payload.extend_from_slice(format!("10:total_sizei{}ee", metadata.len()).as_bytes());
+        let start = message.piece as usize * METADATA_PIECE_LEN;
+        payload.extend_from_slice(&metadata[start..start + length]);
+        *bytes_served += length;
+    } else {
+        payload.push(b'e');
+    }
+    peer::write_message(
+        stream,
+        &peer::Message::Extended {
+            ext_id: response_id,
+            payload,
+        },
+    )
+    .map_err(|err| format!("metadata response failed: {err}"))
+}
+
 fn request_metadata_pieces<W: Write>(
     stream: &mut W,
     ut_metadata_id: u8,
@@ -6421,13 +6611,13 @@ fn parse_extended_handshake(payload: &[u8]) -> Result<ExtendedHandshakeCaps, Str
         for (key, value) in items {
             if key == b"ut_metadata" {
                 if let Value::Int(id) = value {
-                    if *id >= 0 && *id <= u8::MAX as i64 {
+                    if *id > 0 && *id <= u8::MAX as i64 {
                         ut_metadata = Some(*id as u8);
                     }
                 }
             } else if key == b"ut_pex" {
                 if let Value::Int(id) = value {
-                    if *id >= 0 && *id <= u8::MAX as i64 {
+                    if *id > 0 && *id <= u8::MAX as i64 {
                         ut_pex = Some(*id as u8);
                     }
                 }
@@ -7431,8 +7621,17 @@ fn respond_v2_hash_request<W: Write>(
         None => peer::Message::HashReject(request),
     };
     let response_bytes = hash_response_payload_bytes(&response);
-    resources.limits.global_up.throttle(response_bytes);
-    resources.limits.torrent_up.throttle(response_bytes);
+    if !resources
+        .limits
+        .global_up
+        .throttle_until(response_bytes, resources.stop_flag)
+        || !resources
+            .limits
+            .torrent_up
+            .throttle_until(response_bytes, resources.stop_flag)
+    {
+        return Err("torrent stopping".to_string());
+    }
     if torrent_stop_requested(resources.stop_flag) {
         return Err("hash response cancelled".to_string());
     }
@@ -7702,6 +7901,7 @@ fn start_webseed_worker(
     downloaded: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
     piece_buffer_budgets: piece::PieceBufferBudgets,
+    paused_flag: Arc<AtomicBool>,
     ui_state: Option<Arc<Mutex<ui::UiState>>>,
     torrent_id: u64,
 ) -> Result<Option<thread::JoinHandle<()>>, String> {
@@ -7714,13 +7914,21 @@ fn start_webseed_worker(
             if torrent_stop_requested(&stop_flag) {
                 break;
             }
+            if torrent_paused(&paused_flag) {
+                sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, &stop_flag);
+                continue;
+            }
             let (index, piece_start, piece_len, expected) = {
                 let mut p = lock_or_recover(&pieces);
                 let available = vec![u8::MAX; p.bitfield_len()];
                 let index =
                     match p.reserve_piece_for_peer(WEBSEED_RESERVATION_ID, &available, false) {
                         Some(index) => index,
-                        None => break,
+                        None => {
+                            drop(p);
+                            sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, &stop_flag);
+                            continue;
+                        }
                     };
                 let length = match p.piece_length(index) {
                     Some(length) => length,
@@ -7775,6 +7983,13 @@ fn start_webseed_worker(
                 sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
                 continue;
             }
+            if torrent_stop_requested(&stop_flag)
+                || torrent_paused(&paused_flag)
+                || !lock_or_recover(&pieces).is_piece_wanted(index)
+            {
+                lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
+                continue;
+            }
             let write_ok = {
                 let mut s = lock_or_recover(&storage);
                 s.write_at(piece_start, &data).is_ok()
@@ -7794,8 +8009,15 @@ fn start_webseed_worker(
             }
             SESSION_DOWNLOADED_BYTES.fetch_add(piece_len as u64, Ordering::SeqCst);
             downloaded.fetch_add(piece_len as u64, Ordering::SeqCst);
-            limits.global_down.throttle(piece_len as usize);
-            limits.torrent_down.throttle(piece_len as usize);
+            if !limits
+                .global_down
+                .throttle_until(piece_len as usize, &stop_flag)
+                || !limits
+                    .torrent_down
+                    .throttle_until(piece_len as usize, &stop_flag)
+            {
+                break;
+            }
             if let Ok(mut log) = completed_log.lock() {
                 log.push(index);
             }
@@ -7840,6 +8062,7 @@ fn start_webseed_worker(
     _downloaded: Arc<AtomicU64>,
     _stop_flag: Arc<AtomicBool>,
     _piece_buffer_budgets: piece::PieceBufferBudgets,
+    _paused_flag: Arc<AtomicBool>,
     _ui_state: Option<Arc<Mutex<ui::UiState>>>,
     _torrent_id: u64,
 ) -> Result<Option<thread::JoinHandle<()>>, String> {
@@ -8100,6 +8323,7 @@ fn peer_worker_loop(
     completed_log: &Arc<Mutex<Vec<u32>>>,
     peer_queue: &Arc<Mutex<PeerQueue>>,
     allow_pex: bool,
+    metadata: &[u8],
     active_peers: &Arc<AtomicUsize>,
     interested_peers: &Arc<AtomicUsize>,
     upload_requests_served: &Arc<AtomicU64>,
@@ -8163,6 +8387,7 @@ fn peer_worker_loop(
             completed_log,
             peer_queue,
             allow_pex,
+            metadata,
             file_spans,
             base_piece_length,
             v2_hashes,
@@ -8179,6 +8404,7 @@ fn peer_worker_loop(
             stop_flag,
             &piece_buffer_budgets,
             ui_state,
+            None,
         );
 
         peer_slots.release();
@@ -8240,6 +8466,18 @@ fn resume_from_storage(
             && resume.bitfield.len() == pieces.bitfield_len()
             && resume.files.len() == file_spans.len()
         {
+            let current_files = collect_storage_file_stats(storage, file_spans);
+            if !current_files
+                .iter()
+                .zip(&resume.files)
+                .all(|(current, saved)| {
+                    current.length == saved.length && current.mtime == saved.mtime
+                })
+            {
+                // A crash may leave verified pieces on disk newer than the last
+                // resume snapshot. Recover them, not just the saved set bits.
+                return full_recheck(pieces, storage, base_piece_length, Some(&SHUTDOWN));
+            }
             let max_len = base_piece_length
                 .try_into()
                 .map_err(|_| "piece length too large".to_string())?;
@@ -8674,6 +8912,11 @@ fn parse_session_entries(
         entries.insert(
             info_hash,
             SessionEntry {
+                paused: match dict_get(&items, b"paused") {
+                    None | Some(Value::Int(0)) => false,
+                    Some(Value::Int(1)) => true,
+                    _ => return Err("invalid session paused state".to_string()),
+                },
                 info_hash,
                 name,
                 torrent_bytes,
@@ -8771,6 +9014,7 @@ fn save_session(path: &Path, entries: &HashMap<[u8; 20], SessionEntry>) -> Resul
             b"preallocate".to_vec(),
             Value::Int(if entry.preallocate { 1 } else { 0 }),
         ));
+        dict.push((b"paused".to_vec(), Value::Int(i64::from(entry.paused))));
         dict.push((
             b"completion_state".to_vec(),
             Value::Bytes(entry.completion_state.as_bytes().to_vec()),
@@ -9123,6 +9367,7 @@ struct Args {
     numwant: u32,
     metadata_peer_limit: usize,
     port: u16,
+    port_mapping: bool,
     enable_utp: bool,
     encryption: EncryptionMode,
     blocklist_path: Option<PathBuf>,
@@ -9207,6 +9452,7 @@ fn parse_args() -> Result<Args, String> {
     let mut metadata_peer_limit = peer_tuning.metadata_peer_limit;
     let mut port = 6881u16;
     let mut enable_utp = true;
+    let mut port_mapping = true;
     let mut encryption = EncryptionMode::Prefer;
     let mut blocklist_path: Option<PathBuf> = None;
     let mut max_peers_global = peer_tuning.max_peers_global;
@@ -9737,6 +9983,11 @@ fn parse_args() -> Result<Args, String> {
             )?;
             std::process::exit(0);
         }
+        if arg == "--no-port-mapping" {
+            port_mapping = false;
+            idx += 1;
+            continue;
+        }
         if arg == "--move-completed" {
             let value = args_list
                 .get(idx + 1)
@@ -9818,6 +10069,7 @@ fn parse_args() -> Result<Args, String> {
         metadata_peer_limit,
         port,
         enable_utp,
+        port_mapping,
         encryption,
         blocklist_path,
         max_peers_global,
@@ -10484,6 +10736,7 @@ fn download_from_peer_concurrent(
     completed_log: &Arc<Mutex<Vec<u32>>>,
     peer_queue: &Arc<Mutex<PeerQueue>>,
     allow_pex: bool,
+    metadata: &[u8],
     file_spans: &Arc<Vec<FileSpan>>,
     _base_piece_length: u64,
     v2_hashes: &Arc<V2HashStore>,
@@ -10500,58 +10753,65 @@ fn download_from_peer_concurrent(
     stop_flag: &Arc<AtomicBool>,
     piece_buffer_budgets: &piece::PieceBufferBudgets,
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    established: Option<(PeerStream, peer::Handshake)>,
 ) -> Result<(), String> {
-    let mut stream = connect_peer(addr, connect_cfg)?;
-    let cancellation = PeerCancellationGuard::new(peer_cancellations, peer_tag, &stream);
-    if torrent_stop_requested(stop_flag) {
-        return Err("torrent stopping".to_string());
-    }
-    // Use a longer timeout for the handshake phase (peers may be slow to respond)
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|err| format!("read timeout failed: {err}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|err| format!("write timeout failed: {err}"))?;
-
-    let handshake = if connect_cfg.encryption == EncryptionMode::Require {
-        outbound_handshake(
-            &mut stream,
-            info_hash,
-            hybrid_v2_info_hash,
-            peer_id,
-            connect_cfg.encryption,
-        )?
+    let (mut stream, handshake, _cancellation) = if let Some((stream, handshake)) = established {
+        let cancellation = PeerCancellationGuard::new(peer_cancellations, peer_tag, &stream);
+        (stream, handshake, cancellation)
     } else {
-        match plaintext_handshake(&mut stream, info_hash, hybrid_v2_info_hash, peer_id) {
-            Ok(handshake) => handshake,
-            Err(err) if connect_cfg.encryption == EncryptionMode::Prefer => {
-                let _ = err;
-                log_debug!("plaintext failed, retrying mse: {err}");
-                let mut retry = connect_peer(addr, connect_cfg)?;
-                retry
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .map_err(|err| format!("read timeout failed: {err}"))?;
-                retry
-                    .set_write_timeout(Some(Duration::from_secs(5)))
-                    .map_err(|err| format!("write timeout failed: {err}"))?;
-                cancellation.replace_stream(&retry);
-                if torrent_stop_requested(stop_flag) {
-                    return Err("torrent stopping".to_string());
-                }
-                let handshake = outbound_handshake(
-                    &mut retry,
-                    info_hash,
-                    hybrid_v2_info_hash,
-                    peer_id,
-                    EncryptionMode::Prefer,
-                )
-                .map_err(|err| format!("handshake failed: {err}"))?;
-                stream = retry;
-                handshake
-            }
-            Err(err) => return Err(format!("handshake failed: {err}")),
+        let mut stream = connect_peer(addr, connect_cfg)?;
+        let cancellation = PeerCancellationGuard::new(peer_cancellations, peer_tag, &stream);
+        if torrent_stop_requested(stop_flag) {
+            return Err("torrent stopping".to_string());
         }
+        // Use a longer timeout for the handshake phase (peers may be slow to respond)
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|err| format!("read timeout failed: {err}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|err| format!("write timeout failed: {err}"))?;
+
+        let handshake = if connect_cfg.encryption == EncryptionMode::Require {
+            outbound_handshake(
+                &mut stream,
+                info_hash,
+                hybrid_v2_info_hash,
+                peer_id,
+                connect_cfg.encryption,
+            )?
+        } else {
+            match plaintext_handshake(&mut stream, info_hash, hybrid_v2_info_hash, peer_id) {
+                Ok(handshake) => handshake,
+                Err(err) if connect_cfg.encryption == EncryptionMode::Prefer => {
+                    let _ = err;
+                    log_debug!("plaintext failed, retrying mse: {err}");
+                    let mut retry = connect_peer(addr, connect_cfg)?;
+                    retry
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(|err| format!("read timeout failed: {err}"))?;
+                    retry
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .map_err(|err| format!("write timeout failed: {err}"))?;
+                    cancellation.replace_stream(&retry);
+                    if torrent_stop_requested(stop_flag) {
+                        return Err("torrent stopping".to_string());
+                    }
+                    let handshake = outbound_handshake(
+                        &mut retry,
+                        info_hash,
+                        hybrid_v2_info_hash,
+                        peer_id,
+                        EncryptionMode::Prefer,
+                    )
+                    .map_err(|err| format!("handshake failed: {err}"))?;
+                    stream = retry;
+                    handshake
+                }
+                Err(err) => return Err(format!("handshake failed: {err}")),
+            }
+        };
+        (stream, handshake, cancellation)
     };
     // Reduce timeout for the main peer loop (need responsiveness for piece requests)
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
@@ -10599,7 +10859,7 @@ fn download_from_peer_concurrent(
     let mut peer_ut_pex: Option<u8> = None;
     let mut last_pex = Instant::now();
     if handshake.supports_extensions() {
-        let ext_handshake = build_ext_handshake(None, allow_pex);
+        let ext_handshake = build_ext_handshake(Some(metadata.len()), allow_pex);
         peer::write_message(
             &mut stream,
             &peer::Message::Extended {
@@ -10624,6 +10884,8 @@ fn download_from_peer_concurrent(
     let geo_cc = add_active_peer_session(ui_state, torrent_id, active_peers, addr);
 
     let mut reader = peer::MessageReader::new();
+    let mut peer_metadata_id = None;
+    let mut metadata_bytes_served = 0usize;
     let mut bitfield: Option<Vec<u8>> = None;
     let mut choked = true;
     let mut peer_interested = false;
@@ -10878,7 +11140,9 @@ fn download_from_peer_concurrent(
                             });
                             if let Some(index) = selected {
                                 if active_pieces.contains_key(&index) {
-                                    continue;
+                                    // Endgame may return our existing reservation.
+                                    // Yield to reads instead of spinning in the request loop.
+                                    break;
                                 }
                                 let length = {
                                     let p = lock_or_recover(pieces);
@@ -10937,6 +11201,11 @@ fn download_from_peer_concurrent(
                             }
                             break;
                         };
+                        if pending.iter().any(|entry| {
+                            entry.request.index == req.index && entry.request.begin == req.begin
+                        }) {
+                            break;
+                        }
                         peer::write_message(
                             &mut stream,
                             &peer::Message::Request {
@@ -10996,14 +11265,25 @@ fn download_from_peer_concurrent(
                     match message {
                         peer::Message::Extended { ext_id, payload } => {
                             if ext_id == 0 {
-                                if let Ok((_ut_meta, ut_pex, _size)) =
+                                if let Ok((ut_meta, ut_pex, _size)) =
                                     parse_extended_handshake(&payload)
                                 {
+                                    peer_metadata_id = ut_meta;
                                     if allow_pex {
                                         peer_ut_pex = ut_pex;
                                     }
                                 }
-                            } else if allow_pex && Some(ext_id) == peer_ut_pex {
+                            } else if ext_id == 1 {
+                                if let Some(response_id) = peer_metadata_id {
+                                    serve_metadata_request(
+                                        &mut stream,
+                                        &payload,
+                                        metadata,
+                                        response_id,
+                                        &mut metadata_bytes_served,
+                                    )?;
+                                }
+                            } else if allow_pex && ext_id == 2 {
                                 if let Ok(peers) = parse_ut_pex(&payload) {
                                     if !peers.is_empty() {
                                         let mut queue = lock_or_recover(peer_queue);
@@ -11118,6 +11398,7 @@ fn download_from_peer_concurrent(
                                     upload_requests_served,
                                     upload_manager,
                                     peer_tag,
+                                    stop_flag,
                                 ) {
                                     let _ = err;
                                     log_debug!("upload request rejected: {err}");
@@ -11164,8 +11445,11 @@ fn download_from_peer_concurrent(
                                     peer_rate_last_at = Instant::now();
                                     pipeline_depth = request_queue_depth_for_rate(peer_rate_bps);
                                 }
-                                limits.global_down.throttle(block.len());
-                                limits.torrent_down.throttle(block.len());
+                                if !limits.global_down.throttle_until(block.len(), stop_flag)
+                                    || !limits.torrent_down.throttle_until(block.len(), stop_flag)
+                                {
+                                    return Ok(());
+                                }
                                 if let Some(pos) = pending.iter().position(|entry| {
                                     entry.request.index == index && entry.request.begin == begin
                                 }) {
@@ -11819,7 +12103,18 @@ fn inbound_handshake(
     stream
         .read_exact(&mut first)
         .map_err(|err| err.to_string())?;
-    if first[0] == 19 {
+    let plaintext = if first[0] == 19 {
+        let mut protocol = [0u8; 19];
+        stream
+            .read_exact(&mut protocol)
+            .map_err(|err| err.to_string())?;
+        let matches = &protocol == b"BitTorrent protocol";
+        stream.prepend_read_buffer(protocol.to_vec());
+        matches
+    } else {
+        false
+    };
+    if plaintext {
         if encryption == EncryptionMode::Require {
             return Err("plaintext handshake not allowed".to_string());
         }
@@ -11849,7 +12144,10 @@ fn inbound_handshake(
     if !buffered.is_empty() {
         stream.prepend_read_buffer(buffered);
     }
-    let handshake = peer::parse_handshake(&peer_ia).map_err(|err| err.to_string())?;
+    // IA may contain part, all, or none of the BitTorrent handshake.
+    // Preserve any pipelined messages after it in PeerStream's plaintext buffer.
+    stream.prepend_read_buffer(peer_ia);
+    let handshake = peer::read_handshake(stream).map_err(|err| err.to_string())?;
     if handshake.info_hash != info_hash {
         return Err("peer returned wrong info hash".to_string());
     }
@@ -12481,6 +12779,12 @@ fn start_inbound_listener(
             for listener in &listeners {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS can inherit O_NONBLOCK from the listening socket.
+                        // Peer timeout accounting requires blocking reads with a timeout.
+                        if let Err(err) = stream.set_nonblocking(false) {
+                            log_warn!("configure inbound peer: {err}");
+                            continue;
+                        }
                         accepted_connection = true;
                         if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
                             let registry = Arc::clone(&registry);
@@ -12531,7 +12835,7 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
             return;
         }
     }
-    if let Err(err) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
+    if let Err(err) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
         let _ = err;
         log_debug!("peer {addr} timeout failed: {err}");
         return;
@@ -12558,215 +12862,52 @@ fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbou
         return;
     }
     let peer_tag = context.peer_tags.fetch_add(1, Ordering::SeqCst);
-    let _cancellation = PeerCancellationGuard::new(&context.peer_cancellations, peer_tag, &stream);
-    if torrent_stop_requested(&context.stop_requested) {
+    let Some(_torrent_slot) = context.torrent_peer_slots.try_acquire() else {
         return;
-    }
-    context.upload_manager.register(peer_tag);
-    PEER_CONNECTED.fetch_add(1, Ordering::SeqCst);
-    context.active_peers.fetch_add(1, Ordering::SeqCst);
-
-    let mut reader = peer::MessageReader::new();
-    let mut peer_interested = false;
-    let mut am_choking = true;
-    let mut last_sent = Instant::now();
-    let mut idle: u32 = 0;
-    let mut completed_cursor = {
-        let log = lock_or_recover(&context.completed_log);
-        log.len()
     };
-    let mut hash_request_budget = HashRequestBudget::new();
-    let mut last_served_chunk: Option<(u32, u32, u32)> = None;
-
-    let (local_bitfield, have_pieces) = {
-        let p = lock_or_recover(&context.pieces);
-        let bits = build_bitfield(&p);
-        (bits, p.completed_pieces() > 0)
+    let Some(_global_slot) = context.global_peer_slots.try_acquire() else {
+        return;
     };
-    let inbound_super_seed = have_pieces && SUPER_SEED.load(Ordering::SeqCst);
-    if inbound_super_seed {
-        // BEP 16: send single HAVE instead of full bitfield
-        let piece_count = {
-            let p = lock_or_recover(&context.pieces);
-            p.piece_count()
-        };
-        if piece_count > 0 {
-            let mut sv = std::process::id() as u64 ^ peer_tag;
-            sv ^= sv << 13;
-            sv ^= sv >> 7;
-            let idx = (sv % piece_count as u64) as u32;
-            let _ = peer::write_message(&mut stream, &peer::Message::Have(idx));
-        }
-    } else {
-        // BEP 3: always send bitfield as first message after handshake
-        let _ = peer::write_message(&mut stream, &peer::Message::Bitfield(local_bitfield));
+    let connect_cfg = ConnectionConfig {
+        encryption: inbound.encryption,
+        utp: None,
+        ip_filter: inbound.ip_filter.clone(),
+        proxy: None,
+    };
+    if let Err(err) = download_from_peer_concurrent(
+        addr,
+        context.info_hash,
+        context.hybrid_v2_info_hash,
+        context.peer_id,
+        context.id,
+        peer_tag,
+        &context.pieces,
+        &context.storage,
+        &context.completed_log,
+        &context.peer_queue,
+        context.allow_pex,
+        &context.metadata,
+        &context.file_spans,
+        context.base_piece_length,
+        &context.v2_hashes,
+        &connect_cfg,
+        &context.limits,
+        &context.downloaded,
+        &context.uploaded,
+        &context.active_peers,
+        &context.interested_peers,
+        &context.upload_requests_served,
+        &context.upload_manager,
+        &context.peer_cancellations,
+        &context.paused,
+        &context.stop_requested,
+        &context.piece_buffer_budgets,
+        &context.ui_state,
+        Some((stream, handshake)),
+    ) {
+        log_debug!("inbound peer {addr}: {err}");
+        let _ = err;
     }
-
-    // Declare interest status to match outbound handler behavior.
-    if have_pieces {
-        let _ = peer::write_message(&mut stream, &peer::Message::NotInterested);
-    } else {
-        let _ = peer::write_message(&mut stream, &peer::Message::Interested);
-    }
-    let _ = stream.flush();
-
-    loop {
-        if torrent_stop_requested(&context.stop_requested) {
-            break;
-        }
-        if idle > MAX_IDLE_TICKS_SEED {
-            break;
-        }
-
-        let paused = torrent_paused(&context.paused);
-        if paused && !am_choking {
-            if peer::write_message(&mut stream, &peer::Message::Choke).is_ok() {
-                am_choking = true;
-                last_sent = Instant::now();
-            }
-        } else if !paused {
-            let should_unchoke = context.upload_manager.should_unchoke(peer_tag);
-            if should_unchoke && am_choking {
-                if peer::write_message(&mut stream, &peer::Message::Unchoke).is_ok() {
-                    am_choking = false;
-                    last_sent = Instant::now();
-                }
-            } else if !should_unchoke
-                && !am_choking
-                && peer::write_message(&mut stream, &peer::Message::Choke).is_ok()
-            {
-                am_choking = true;
-                last_sent = Instant::now();
-            }
-        }
-
-        if last_sent.elapsed() >= KEEPALIVE_INTERVAL
-            && peer::write_message(&mut stream, &peer::Message::KeepAlive).is_ok()
-        {
-            last_sent = Instant::now();
-            idle = 0;
-        }
-
-        if send_completed_updates(&mut stream, &context.completed_log, &mut completed_cursor)
-            .is_err()
-        {
-            break;
-        }
-
-        match reader.read_message(&mut stream) {
-            Ok(Some(message)) => {
-                idle = 0;
-                let immediately_after_served_chunk = last_served_chunk.take();
-                match message {
-                    peer::Message::Interested => {
-                        set_peer_interest(&context.interested_peers, &mut peer_interested, true);
-                        context.upload_manager.set_interested(peer_tag, true);
-                        // Immediately unchoke if eligible
-                        if am_choking
-                            && !paused
-                            && context.upload_manager.should_unchoke(peer_tag)
-                            && peer::write_message(&mut stream, &peer::Message::Unchoke).is_ok()
-                        {
-                            am_choking = false;
-                            last_sent = Instant::now();
-                        }
-                    }
-                    peer::Message::NotInterested => {
-                        set_peer_interest(&context.interested_peers, &mut peer_interested, false);
-                        context.upload_manager.set_interested(peer_tag, false);
-                    }
-                    peer::Message::Request {
-                        index,
-                        begin,
-                        length,
-                    } => {
-                        if !am_choking && peer_interested {
-                            if let Err(err) = handle_upload_request(
-                                &mut stream,
-                                &context.pieces,
-                                &context.storage,
-                                index,
-                                begin,
-                                length,
-                                &context.limits,
-                                &context.uploaded,
-                                &context.upload_requests_served,
-                                &context.upload_manager,
-                                peer_tag,
-                            ) {
-                                let _ = err;
-                                log_debug!("inbound upload rejected: {err}");
-                            } else {
-                                last_served_chunk = Some((index, begin, length));
-                                last_sent = Instant::now();
-                                check_seed_ratio(
-                                    &context.uploaded,
-                                    &context.downloaded,
-                                    &context.stop_requested,
-                                );
-                            }
-                        }
-                    }
-                    peer::Message::Cancel { .. } => {
-                        // BEP 3: Cancel acknowledged (we don't queue uploads,
-                        // so there's nothing to cancel, but we must not ignore it)
-                    }
-                    peer::Message::HaveAll => {
-                        // BEP 6: Peer has all pieces - treat as full bitfield
-                    }
-                    peer::Message::HaveNone => {
-                        // BEP 6: Peer has no pieces
-                    }
-                    peer::Message::HashRequest(request) => {
-                        let must_serve =
-                            immediately_after_served_chunk.is_some_and(|(index, begin, length)| {
-                                let pieces = lock_or_recover(&context.pieces);
-                                context
-                                    .v2_hashes
-                                    .request_covers_chunk(request, index, begin, length, &pieces)
-                            });
-                        if respond_v2_hash_request(
-                            &mut stream,
-                            V2HashResponseResources {
-                                store: &context.v2_hashes,
-                                pieces: &context.pieces,
-                                storage: &context.storage,
-                                limits: &context.limits,
-                                stop_flag: &context.stop_requested,
-                            },
-                            &mut hash_request_budget,
-                            must_serve,
-                            request,
-                        )
-                        .is_err()
-                        {
-                            break;
-                        }
-                        last_sent = Instant::now();
-                    }
-                    peer::Message::Hashes { .. } | peer::Message::HashReject(_) => {
-                        // We do not originate BEP 52 hash requests, so a
-                        // response cannot correlate with any pending request.
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(None) => {
-                idle += 1;
-            }
-            Err(_) => break,
-        }
-    }
-
-    set_peer_interest(&context.interested_peers, &mut peer_interested, false);
-    context.upload_manager.unregister(peer_tag);
-    PEER_DISCONNECTED.fetch_add(1, Ordering::SeqCst);
-    let _ = context
-        .active_peers
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-            Some(value.saturating_sub(1))
-        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12782,6 +12923,7 @@ fn handle_upload_request<W: Write>(
     upload_requests_served: &Arc<AtomicU64>,
     upload_manager: &Arc<UploadManager>,
     peer_tag: u64,
+    stop_flag: &AtomicBool,
 ) -> Result<(), String> {
     if length == 0 || length > MAX_UPLOAD_BLOCK_LEN {
         return Err("invalid request length".to_string());
@@ -12816,8 +12958,11 @@ fn handle_upload_request<W: Write>(
             .map_err(|err| format!("read failed: {err}"))?;
     }
 
-    limits.global_up.throttle(length as usize);
-    limits.torrent_up.throttle(length as usize);
+    if !limits.global_up.throttle_until(length as usize, stop_flag)
+        || !limits.torrent_up.throttle_until(length as usize, stop_flag)
+    {
+        return Err("torrent stopping".to_string());
+    }
     peer::write_message(
         stream,
         &peer::Message::Piece {
@@ -13185,6 +13330,7 @@ fn drain_rss_poll_results(
                     download_dir: args.download_dir.clone(),
                     preallocate: args.preallocate,
                     initial_label: String::new(),
+                    initial_options: ui::AddOptions::default(),
                 };
                 let queued = enqueue_request_if_new(
                     registry,
@@ -13263,6 +13409,7 @@ fn drain_rss_download_results(
                     download_dir: args.download_dir.clone(),
                     preallocate: args.preallocate,
                     initial_label: String::new(),
+                    initial_options: ui::AddOptions::default(),
                 };
                 let queued = enqueue_request_if_new(
                     registry,
@@ -13446,27 +13593,40 @@ fn run_port_mapping_with_retries<F>(
     retry_delays: &[Duration],
     mut map_port: F,
 ) where
-    F: FnMut() -> Result<(), String>,
+    F: FnMut() -> Result<Duration, String>,
 {
-    for attempt in 0..=retry_delays.len() {
+    let mut failures = 0usize;
+    while !shutdown_requested() {
         let result = map_port();
-        let error = result.as_ref().err().cloned();
-        record_port_mapping_result(ui_state, protocol, port, result);
-        let Some(error) = error else {
-            return;
-        };
-        let Some(delay) = retry_delays.get(attempt) else {
-            return;
-        };
-        let message = format!(
-            "retrying {protocol} on port {port} in {}s after: {error}",
-            delay.as_secs()
-        );
-        log_info!("{message}");
-        set_port_mapping_status(ui_state, protocol, message);
-        sleep_with_shutdown(*delay);
-        if shutdown_requested() {
-            return;
+        match result {
+            Ok(renew_after) => {
+                record_port_mapping_result(ui_state, protocol, port, Ok(()));
+                failures = 0;
+                sleep_with_shutdown(
+                    renew_after.clamp(Duration::from_millis(500), Duration::from_secs(1800)),
+                );
+            }
+            Err(error) => {
+                let disabled = error.ends_with(" disabled");
+                record_port_mapping_result(ui_state, protocol, port, Err(error.clone()));
+                if disabled {
+                    return;
+                }
+                let delay = retry_delays
+                    .get(failures)
+                    .copied()
+                    .unwrap_or(Duration::from_secs(300));
+                failures = failures.saturating_add(1);
+                set_port_mapping_status(
+                    ui_state,
+                    protocol,
+                    format!(
+                        "Unavailable: {error}. Retrying {protocol} in {}s.",
+                        delay.as_secs()
+                    ),
+                );
+                sleep_with_shutdown(delay);
+            }
         }
     }
 }
@@ -14510,6 +14670,18 @@ mod core_helpers_tests {
             info_hash: meta.info_hash,
             hybrid_v2_info_hash: None,
             peer_id: [9u8; 20],
+            metadata: Arc::new(torrent::info_bytes(&torrent_bytes).unwrap().to_vec()),
+            peer_queue: Arc::new(Mutex::new(PeerQueue::new(None))),
+            allow_pex: true,
+            piece_buffer_budgets: piece::PieceBufferBudgets::new(
+                Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES)),
+                Arc::new(piece::PieceBufferBudget::new(
+                    MAX_TORRENT_PIECE_BUFFER_BYTES,
+                )),
+            ),
+            ui_state: None,
+            global_peer_slots: Arc::new(PeerSlots::new(16)),
+            torrent_peer_slots: Arc::new(PeerSlots::new(8)),
             pieces: Arc::new(Mutex::new(piece::PieceManager::new(&meta).unwrap())),
             storage: Arc::new(Mutex::new(
                 storage::Storage::new(&meta, root, storage::StorageOptions::default()).unwrap(),
@@ -14566,6 +14738,7 @@ mod core_helpers_tests {
             download_dir: root.join("different-destination"),
             preallocate: false,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         };
 
         assert!(is_duplicate_torrent(
@@ -14614,6 +14787,7 @@ mod core_helpers_tests {
             download_dir: root.clone(),
             preallocate: false,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         };
         let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
         let session_store = SessionStore::load(&root).unwrap();
@@ -15031,6 +15205,7 @@ mod core_helpers_tests {
             download_dir: root.clone(),
             preallocate: false,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         };
         let (_, _, paths) =
             delete_info_from_request(&request, &[(0, "saved-name.bin".to_string())]).unwrap();
@@ -15072,6 +15247,7 @@ mod core_helpers_tests {
             download_dir: root.clone(),
             preallocate: false,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         }]);
         let ui_state = Some(Arc::new(Mutex::new(ui::UiState {
             torrents: vec![ui::UiTorrent {
@@ -15205,6 +15381,7 @@ mod core_helpers_tests {
             &context.upload_requests_served,
             &context.upload_manager,
             99,
+            &context.stop_requested,
         )
         .unwrap();
 
@@ -16066,6 +16243,7 @@ mod core_helpers_tests {
         entries.insert(
             info_hash,
             SessionEntry {
+                paused: false,
                 info_hash,
                 name: "demo".to_string(),
                 torrent_bytes,
@@ -16104,6 +16282,7 @@ mod core_helpers_tests {
         // 16 values. Each persisted rename uses five more values.
         let rename_count = (bencode::MAX_VALUES - 16) / 5;
         let entry = SessionEntry {
+            paused: false,
             info_hash,
             name: "demo".to_string(),
             torrent_bytes,
@@ -16182,6 +16361,7 @@ mod core_helpers_tests {
         entries.insert(
             info_hash,
             SessionEntry {
+                paused: false,
                 info_hash,
                 name: "demo".to_string(),
                 torrent_bytes,
@@ -16432,6 +16612,7 @@ mod core_helpers_tests {
         let torrent_bytes = test_torrent_bytes();
         let info_hash = torrent::parse_torrent(&torrent_bytes).unwrap().info_hash;
         let entry = SessionEntry {
+            paused: false,
             info_hash,
             name: "demo".to_string(),
             torrent_bytes,
@@ -17451,6 +17632,7 @@ mod core_helpers_tests {
             download_dir: root.clone(),
             preallocate: false,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         }]);
 
         stop_torrent(
@@ -17976,11 +18158,13 @@ fn apply_file_rename(
 fn set_torrent_paused(
     registry: &SessionRegistry,
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    session_store: &SessionStore,
     torrent_id: u64,
     paused: bool,
 ) -> Result<(), String> {
     let context =
         find_context_by_id(registry, torrent_id).ok_or_else(|| "unknown torrent".to_string())?;
+    session_store.set_paused(context.info_hash, paused)?;
     context.paused.store(paused, Ordering::SeqCst);
     update_ui(ui_state, |state| {
         update_torrent_entry(state, torrent_id, |torrent| {
@@ -18023,7 +18207,7 @@ fn resume_torrent(
         if context.stop_requested.load(Ordering::SeqCst) {
             return Err("torrent is still stopping; try again in a moment".to_string());
         }
-        return set_torrent_paused(registry, ui_state, torrent_id, false);
+        return set_torrent_paused(registry, ui_state, session_store, torrent_id, false);
     }
 
     let info_hash = info_hash_from_ui(ui_state, torrent_id)
@@ -18067,6 +18251,7 @@ fn resume_torrent(
     if entry.pending_delete {
         return Err("torrent deletion is pending; retry deletion instead".to_string());
     }
+    session_store.set_paused(info_hash, false)?;
     let label = session_entry_label(&entry);
     let request = TorrentRequest {
         id: torrent_id,
@@ -18074,6 +18259,7 @@ fn resume_torrent(
         download_dir: entry.download_dir.clone(),
         preallocate: entry.preallocate,
         initial_label: entry.label.clone(),
+        initial_options: ui::AddOptions::default(),
     };
     enqueue_request_with_label(queue, ui_state, request, label);
     update_ui(ui_state, |state| {
@@ -18102,10 +18288,13 @@ fn stop_torrent(
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
     queue: &mut VecDeque<TorrentRequest>,
     torrent_id: u64,
-    _session_store: &Arc<SessionStore>,
+    session_store: &Arc<SessionStore>,
     in_flight: &InFlightTorrents,
 ) -> Result<(), String> {
     if let Some(context) = find_context_by_id(registry, torrent_id) {
+        if session_store.contains(context.info_hash) {
+            session_store.set_paused(context.info_hash, true)?;
+        }
         if context.teardown_failed.load(Ordering::Acquire) {
             cancel_peer_connections(&context.peer_cancellations);
             return Err(
@@ -18485,6 +18674,7 @@ fn delete_info_from_session_entry(
         download_dir: entry.download_dir.clone(),
         preallocate: entry.preallocate,
         initial_label: entry.label.clone(),
+        initial_options: ui::AddOptions::default(),
     };
     let info = delete_info_from_request(&request, &entry.file_renames)?;
     if info.0 != entry.info_hash {
@@ -19409,13 +19599,14 @@ impl ProgressStats {
 fn start_console_progress(
     state: Arc<Mutex<ui::UiState>>,
     registry: SessionRegistry,
+    display: bool,
 ) -> Result<thread::JoinHandle<()>, String> {
     thread::Builder::new()
         .name("console-progress".to_string())
         .spawn(move || {
             let mut download_stats = ProgressStats::new();
             let mut upload_stats = ProgressStats::new();
-            PROGRESS_ACTIVE.store(true, Ordering::SeqCst);
+            PROGRESS_ACTIVE.store(display, Ordering::SeqCst);
             loop {
                 if shutdown_requested() {
                     break;
@@ -19453,9 +19644,11 @@ fn start_console_progress(
                 }
                 download_stats.last_line_len = line.len();
                 PROGRESS_LINE_LEN.store(download_stats.last_line_len, Ordering::SeqCst);
-                let _guard = LOG_LOCK.lock().ok();
-                eprint!("\r{line}");
-                let _ = io::stderr().flush();
+                if display {
+                    let _guard = LOG_LOCK.lock().ok();
+                    eprint!("\r{line}");
+                    let _ = io::stderr().flush();
+                }
 
                 let metrics = storage::metrics_snapshot();
                 let read_ms = if metrics.read_ops > 0 {
@@ -19491,7 +19684,9 @@ fn start_console_progress(
                 sleep_with_shutdown(Duration::from_secs(1));
             }
             PROGRESS_ACTIVE.store(false, Ordering::SeqCst);
-            eprintln!();
+            if display {
+                eprintln!();
+            }
         })
         .map_err(|err| format!("console progress worker could not start: {err}"))
 }
@@ -20401,6 +20596,7 @@ fn scan_watch_dir(
             download_dir: download_dir.to_path_buf(),
             preallocate,
             initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
         };
         let label = path
             .file_name()

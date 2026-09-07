@@ -12,14 +12,14 @@ const NATPMP_RETRY_TIMEOUTS: [Duration; 4] = [
 #[cfg(target_os = "linux")]
 const MAX_ROUTE_TABLE_BYTES: usize = 1024 * 1024;
 
-pub fn map_port(port: u16, lifetime: u32) -> Result<(), String> {
+pub fn map_port(port: u16, lifetime: u32) -> Result<Duration, String> {
     let gateway = default_gateway().ok_or_else(|| "no gateway found".to_string())?;
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|err| err.to_string())?;
     let addr = SocketAddrV4::new(gateway, NATPMP_PORT);
 
-    map_port_proto(&socket, addr, port, lifetime, 2)?;
-    map_port_proto(&socket, addr, port, lifetime, 1)?;
-    Ok(())
+    let tcp_lifetime = map_port_proto(&socket, addr, port, lifetime, 2)?;
+    let udp_lifetime = map_port_proto(&socket, addr, port, lifetime, 1)?;
+    Ok(Duration::from_secs(u64::from(tcp_lifetime.min(udp_lifetime))) / 2)
 }
 
 fn map_port_proto(
@@ -28,7 +28,7 @@ fn map_port_proto(
     port: u16,
     lifetime: u32,
     op: u8,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let mut req = [0u8; 12];
     req[0] = 0;
     req[1] = op;
@@ -64,7 +64,11 @@ fn map_port_proto(
                     if response_internal_port != port || response_external_port != port {
                         return Err("natpmp gateway assigned an unexpected port".to_string());
                     }
-                    return Ok(());
+                    let lease = u32::from_be_bytes(resp[12..16].try_into().unwrap());
+                    if lease == 0 {
+                        return Err("gateway returned an expired mapping".to_string());
+                    }
+                    return Ok(lease);
                 }
                 Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                     break;
@@ -143,6 +147,7 @@ mod tests {
             assert_eq!(u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]), 1800);
 
             let mut resp = [0u8; 16];
+            resp[12..16].copy_from_slice(&1800u32.to_be_bytes());
             resp[1] = 130; // op + 128 for TCP map
             resp[8..10].copy_from_slice(&51413u16.to_be_bytes());
             resp[10..12].copy_from_slice(&51413u16.to_be_bytes());
@@ -165,6 +170,7 @@ mod tests {
             let mut buf = [0u8; 64];
             let (_, peer) = server.recv_from(&mut buf).unwrap();
             let mut resp = [0u8; 16];
+            resp[12..16].copy_from_slice(&1800u32.to_be_bytes());
             resp[1] = 129; // wrong for op=2
             server.send_to(&resp, peer).unwrap();
         });
@@ -186,6 +192,7 @@ mod tests {
             let mut buf = [0u8; 64];
             let (_, peer) = server.recv_from(&mut buf).unwrap();
             let mut resp = [0u8; 16];
+            resp[12..16].copy_from_slice(&1800u32.to_be_bytes());
             resp[1] = 129; // op=1 (udp) + 128
             resp[2..4].copy_from_slice(&2u16.to_be_bytes());
             server.send_to(&resp, peer).unwrap();
@@ -231,6 +238,7 @@ mod tests {
             let _ = server.recv_from(&mut buf).unwrap();
             let (_, peer) = server.recv_from(&mut buf).unwrap();
             let mut resp = [0u8; 16];
+            resp[12..16].copy_from_slice(&1800u32.to_be_bytes());
             resp[1] = 130;
             resp[8..10].copy_from_slice(&51413u16.to_be_bytes());
             resp[10..12].copy_from_slice(&51413u16.to_be_bytes());
