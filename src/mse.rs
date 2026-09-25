@@ -1,9 +1,6 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
-use num_bigint::BigUint;
-use num_traits::Num;
-
-use crate::sha1;
+use crate::sha1::Sha1;
 
 pub enum CryptoMode {
     Plaintext,
@@ -12,6 +9,11 @@ pub enum CryptoMode {
 
 pub type AcceptOutcome = (CryptoMode, Option<CipherState>, [u8; 20], Vec<u8>, Vec<u8>);
 
+/// Largest PadA/PadB/PadC/PadD length allowed by the MSE specification.
+const MAX_PAD: usize = 512;
+const CRYPTO_PLAINTEXT: u32 = 0x01;
+const CRYPTO_RC4: u32 = 0x02;
+
 #[derive(Clone)]
 pub struct CipherState {
     enc: Rc4,
@@ -19,13 +21,12 @@ pub struct CipherState {
 }
 
 impl CipherState {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn new(enc_key: &[u8], dec_key: &[u8]) -> Self {
-        let mut enc = Rc4::new(enc_key);
-        let mut dec = Rc4::new(dec_key);
-        enc.discard(1024);
-        dec.discard(1024);
-        Self { enc, dec }
+        Self {
+            enc: Rc4::new(enc_key),
+            dec: Rc4::new(dec_key),
+        }
     }
 
     pub fn encrypt(&mut self, data: &mut [u8]) {
@@ -35,6 +36,10 @@ impl CipherState {
     pub fn decrypt(&mut self, data: &mut [u8]) {
         self.dec.apply(data);
     }
+}
+
+fn io_err(err: std::io::Error) -> String {
+    format!("mse: {err}")
 }
 
 /// MSE/PE initiator handshake (outbound connection).
@@ -53,151 +58,69 @@ pub fn initiate<RW: Read + Write>(
     allow_plain: bool,
     initial_payload: &[u8],
 ) -> Result<(CryptoMode, Option<CipherState>, Vec<u8>), String> {
-    let ia_len = u16::try_from(initial_payload.len())
-        .map_err(|_| "mse initial payload too large".to_string())?;
+    let ia_len =
+        u16::try_from(initial_payload.len()).map_err(|_| "mse payload too large".to_string())?;
     // Step 1: Send Ya (96 bytes, no padding)
-    let (priv_key, pub_key) = dh_generate()?;
-    let pub_bytes = to_fixed_bytes(&pub_key, 96);
-    stream
-        .write_all(&pub_bytes)
-        .map_err(|err| err.to_string())?;
+    let (private_key, public_key) = dh_generate()?;
+    stream.write_all(&public_key).map_err(io_err)?;
 
     // Step 2: Read Yb (96 bytes)
-    let mut peer_pub = [0u8; 96];
-    stream
-        .read_exact(&mut peer_pub)
-        .map_err(|err| err.to_string())?;
-    let peer_pub = BigUint::from_bytes_be(&peer_pub);
-    validate_peer_public(&peer_pub)?;
+    let mut peer_public = [0u8; 96];
+    stream.read_exact(&mut peer_public).map_err(io_err)?;
+    let shared = dh_shared(&peer_public, &private_key)?;
 
-    // Compute shared secret S, padded to 96 bytes
-    let shared = peer_pub.modpow(&priv_key, &prime()?);
-    let shared_bytes = to_fixed_bytes(&shared, 96);
+    // Initiator encrypts with keyA and decrypts with keyB.
+    let mut enc = Rc4::new(&derive_key(b"keyA", &shared, &info_hash));
+    let dec_key = derive_key(b"keyB", &shared, &info_hash);
 
-    // Compute identification hashes
-    let hash_req1 = sha1_bytes(b"req1", &shared_bytes);
-    let hash_req2 = sha1_bytes(b"req2", &info_hash);
-    let hash_req3 = sha1_bytes(b"req3", &shared_bytes);
-    let xor = xor_hash(&hash_req2, &hash_req3);
-
-    // Derive RC4 keys: initiator encrypts with keyA, decrypts with keyB
-    let (enc_key, dec_key) = derive_keys(&shared_bytes, &info_hash, true);
-
-    // Set up encryption stream (initiator outgoing)
-    let mut enc = Rc4::new(&enc_key);
-    enc.discard(1024);
-
-    // Build step 3 encrypted portion: VC + crypto_provide + len(PadC) + len(IA) + IA
-    let mut provide = 0x02u32; // RC4
-    if allow_plain {
-        provide |= 0x01; // also offer plaintext
-    }
-    let mut enc_data = Vec::with_capacity(8 + 4 + 2 + 2 + initial_payload.len());
-    enc_data.extend_from_slice(&[0u8; 8]); // VC (verification constant)
-    enc_data.extend_from_slice(&provide.to_be_bytes()); // crypto_provide
-    enc_data.extend_from_slice(&0u16.to_be_bytes()); // len(PadC) = 0
-    enc_data.extend_from_slice(&ia_len.to_be_bytes()); // len(IA)
-    enc_data.extend_from_slice(initial_payload); // IA
-    enc.apply(&mut enc_data);
-
-    // Send step 3: plaintext hashes + encrypted data
-    stream
-        .write_all(&hash_req1)
-        .and_then(|_| stream.write_all(&xor))
-        .and_then(|_| stream.write_all(&enc_data))
-        .map_err(|err| err.to_string())?;
-
-    // Step 4: Scan for peer's encrypted VC
-    // The peer may have sent PadB after Yb, so we scan up to 520 bytes.
-    // Compute what encrypted VC looks like: RC4 keystream XOR'd with 8 zeros
-    let mut vc_pattern = [0u8; 8];
-    {
-        let mut dec_preview = Rc4::new(&dec_key);
-        dec_preview.discard(1024);
-        dec_preview.apply(&mut vc_pattern);
-    }
-
-    // Read in chunks and search for the VC pattern
-    let mut scan_buf = Vec::with_capacity(528);
-    let max_scan = 520; // 512 max PadB + 8 VC
-    let vc_offset;
-    let mut chunk = [0u8; 512];
-    'vc_scan: loop {
-        let n = stream
-            .read(&mut chunk)
-            .map_err(|err| format!("mse vc scan: {err}"))?;
-        if n == 0 {
-            return Err("mse vc scan: unexpected eof".to_string());
-        }
-        scan_buf.extend_from_slice(&chunk[..n]);
-        // Check all new positions where the pattern could start
-        let search_start = if scan_buf.len() - n < 8 {
-            0
-        } else {
-            scan_buf.len() - n - 7 // pattern could straddle the boundary
-        };
-        if let Some(pos) = find_sync_pattern(&scan_buf, &vc_pattern, search_start, 512) {
-            vc_offset = pos;
-            break 'vc_scan;
-        }
-        if scan_buf.len() > max_scan {
-            return Err("mse vc sync failed".to_string());
-        }
-    }
-
-    // Set up decryption stream positioned after VC
-    let mut dec = Rc4::new(&dec_key);
-    dec.discard(1024 + 8); // skip past VC
-
-    // We may have over-read bytes after VC into scan_buf. Keep those bytes raw
-    // until crypto_select is known: only the response header and PadD are
-    // necessarily encrypted. Bytes following PadD use the selected mode.
-    let mut buffered = scan_buf[vc_offset + 8..].to_vec();
-    let mut read_exact_buffered = |out: &mut [u8], context: &str| -> Result<(), String> {
-        let take = out.len().min(buffered.len());
-        if take > 0 {
-            out[..take].copy_from_slice(&buffered[..take]);
-            buffered.drain(..take);
-        }
-        if take < out.len() {
-            stream
-                .read_exact(&mut out[take..])
-                .map_err(|err| format!("{context}: {err}"))?;
-        }
-        Ok(())
+    // Step 3: HASH('req1', S), HASH('req2', SKEY) xor HASH('req3', S), then
+    // ENCRYPT(VC, crypto_provide, len(PadC) = 0, len(IA), IA).
+    let provide = if allow_plain {
+        CRYPTO_RC4 | CRYPTO_PLAINTEXT
+    } else {
+        CRYPTO_RC4
     };
+    let mut message = Vec::with_capacity(40 + 16 + initial_payload.len());
+    message.extend_from_slice(&hash2(b"req1", &shared));
+    message.extend_from_slice(&xor20(
+        &hash2(b"req2", &info_hash),
+        &hash2(b"req3", &shared),
+    ));
+    message.extend_from_slice(&[0u8; 8]);
+    message.extend_from_slice(&provide.to_be_bytes());
+    message.extend_from_slice(&0u16.to_be_bytes());
+    message.extend_from_slice(&ia_len.to_be_bytes());
+    message.extend_from_slice(initial_payload);
+    enc.apply(&mut message[40..]);
+    stream.write_all(&message).map_err(io_err)?;
 
-    // Read crypto_select (4) + len(PadD) (2). This header is always RC4
-    // encrypted, even when the selected payload mode is plaintext.
-    let mut header_buf = [0u8; 6];
-    read_exact_buffered(&mut header_buf, "mse read header")?;
-    dec.apply(&mut header_buf);
+    // Step 4: the peer may have sent up to 512 bytes of PadB after Yb, so
+    // synchronise on the encrypted verification constant.
+    let mut dec = Rc4::new(&dec_key);
+    let mut vc_pattern = [0u8; 8];
+    dec.apply(&mut vc_pattern);
+    let mut buffered = sync_to(stream, &vc_pattern)?;
 
-    let crypto_select =
-        u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
-    let pad_d_len = u16::from_be_bytes([header_buf[4], header_buf[5]]) as usize;
-    if pad_d_len > 512 {
+    // crypto_select and len(PadD) are always RC4 encrypted, as is PadD.
+    let mut header = [0u8; 6];
+    read_buffered(stream, &mut buffered, &mut header)?;
+    dec.apply(&mut header);
+    let crypto_select = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let pad_d_len = usize::from(u16::from_be_bytes([header[4], header[5]]));
+    if pad_d_len > MAX_PAD {
         return Err("mse PadD too large".to_string());
     }
+    let mut pad = [0u8; MAX_PAD];
+    read_buffered(stream, &mut buffered, &mut pad[..pad_d_len])?;
+    dec.apply(&mut pad[..pad_d_len]);
 
-    // PadD is also always encrypted. Consume exactly PadD and leave any
-    // over-read payload bytes in their original representation for now.
-    if pad_d_len > 0 {
-        let mut pad = vec![0u8; pad_d_len];
-        read_exact_buffered(&mut pad, "mse read padD")?;
-        dec.apply(&mut pad);
-    }
-
-    if crypto_select == 0x02 {
-        // PeerStream buffers hold plaintext, so decrypt an over-read encrypted
-        // payload and advance the stream cipher by the same amount.
+    // Over-read bytes after PadD use the selected mode. PeerStream buffers
+    // hold plaintext, so decrypt them (advancing the cipher) only for RC4.
+    if crypto_select == CRYPTO_RC4 {
         dec.apply(&mut buffered);
-        let cipher = CipherState { enc, dec };
-        return Ok((CryptoMode::Rc4, Some(cipher), buffered));
+        return Ok((CryptoMode::Rc4, Some(CipherState { enc, dec }), buffered));
     }
-    if allow_plain && crypto_select == 0x01 {
-        // The selected plaintext stream starts immediately after PadD. Do not
-        // run over-read payload bytes through RC4.
+    if allow_plain && crypto_select == CRYPTO_PLAINTEXT {
         return Ok((CryptoMode::Plaintext, None, buffered));
     }
     Err("mse crypto selection failed".to_string())
@@ -216,159 +139,108 @@ pub fn accept<RW: Read + Write>(
     allow_plain: bool,
 ) -> Result<AcceptOutcome, String> {
     // Read Ya (first byte already consumed)
-    let mut peer_pub = [0u8; 96];
-    peer_pub[0] = first_byte;
-    stream
-        .read_exact(&mut peer_pub[1..])
-        .map_err(|err| err.to_string())?;
-    let peer_pub = BigUint::from_bytes_be(&peer_pub);
-
+    let mut peer_public = [0u8; 96];
+    peer_public[0] = first_byte;
+    stream.read_exact(&mut peer_public[1..]).map_err(io_err)?;
+    let (private_key, public_key) = dh_generate()?;
+    let shared = dh_shared(&peer_public, &private_key)?;
     // Send Yb (no padding)
-    validate_peer_public(&peer_pub)?;
+    stream.write_all(&public_key).map_err(io_err)?;
 
-    let (priv_key, pub_key) = dh_generate()?;
-    let pub_bytes = to_fixed_bytes(&pub_key, 96);
-    stream
-        .write_all(&pub_bytes)
-        .map_err(|err| err.to_string())?;
+    // Skip PadA by synchronising on HASH('req1', S).
+    let mut buffered = sync_to(stream, &hash2(b"req1", &shared))?;
 
-    // Compute shared secret S, padded to 96 bytes
-    let shared = peer_pub.modpow(&priv_key, &prime()?);
-    let shared_bytes = to_fixed_bytes(&shared, 96);
+    let mut obfuscated = [0u8; 20];
+    read_buffered(stream, &mut buffered, &mut obfuscated)?;
+    let req2 = xor20(&obfuscated, &hash2(b"req3", &shared));
+    let info_hash = *info_hashes
+        .iter()
+        .find(|hash| hash2(b"req2", hash.as_slice()) == req2)
+        .ok_or_else(|| "mse unknown info hash".to_string())?;
 
-    let hash_req1 = sha1_bytes(b"req1", &shared_bytes);
-    let hash_req3 = sha1_bytes(b"req3", &shared_bytes);
+    // The responder decrypts with keyA and encrypts with keyB.
+    let mut dec = Rc4::new(&derive_key(b"keyA", &shared, &info_hash));
+    let mut enc = Rc4::new(&derive_key(b"keyB", &shared, &info_hash));
 
-    // Scan for HASH('req1', S) in stream (skip PadA from peer)
-    let mut scan_buf = Vec::with_capacity(540);
-    let max_scan = 532; // 512 max PadA + 20 hash
-    let mut chunk = [0u8; 512];
-    let req1_offset;
-    'req1_scan: loop {
-        let n = stream
-            .read(&mut chunk)
-            .map_err(|err| format!("mse req1 scan: {err}"))?;
-        if n == 0 {
-            return Err("mse req1 scan: unexpected eof".to_string());
-        }
-        scan_buf.extend_from_slice(&chunk[..n]);
-        // Check all new positions where the pattern could start
-        let search_start = if scan_buf.len() - n < 20 {
-            0
-        } else {
-            scan_buf.len() - n - 19 // pattern could straddle the boundary
-        };
-        if let Some(pos) = find_sync_pattern(&scan_buf, &hash_req1, search_start, 512) {
-            req1_offset = pos;
-            break 'req1_scan;
-        }
-        if scan_buf.len() > max_scan {
-            return Err("mse req1 sync failed".to_string());
-        }
-    }
-
-    let mut buffered = scan_buf[req1_offset + 20..].to_vec();
-    let mut read_exact_buffered = |out: &mut [u8]| -> Result<(), String> {
-        let take = out.len().min(buffered.len());
-        if take > 0 {
-            out[..take].copy_from_slice(&buffered[..take]);
-            buffered.drain(..take);
-        }
-        if take < out.len() {
-            stream
-                .read_exact(&mut out[take..])
-                .map_err(|err| err.to_string())?;
-        }
-        Ok(())
-    };
-
-    // Read XOR'd hash (20 bytes)
-    let mut xor_buf = [0u8; 20];
-    read_exact_buffered(&mut xor_buf)?;
-    let hash_req2 = xor_hash(&xor_buf, &hash_req3);
-    let info_hash = match find_info_hash(info_hashes, &hash_req2) {
-        Some(hash) => hash,
-        None => return Err("mse unknown info hash".to_string()),
-    };
-
-    // Derive keys: responder decrypts with keyA (initiator's enc key)
-    let (dec_key, enc_key) = derive_keys(&shared_bytes, &info_hash, true);
-
-    // Set up decryption for initiator's encrypted data
-    let mut dec = Rc4::new(&dec_key);
-    dec.discard(1024);
-
-    // Read and decrypt: VC (8) + crypto_provide (4) + len(PadC) (2)
-    let mut enc_header = [0u8; 14];
-    read_exact_buffered(&mut enc_header)?;
-    dec.apply(&mut enc_header);
-
-    // Verify VC (first 8 bytes should be zeros)
-    if enc_header[..8] != [0u8; 8] {
+    // ENCRYPT(VC, crypto_provide, len(PadC), PadC, len(IA)), ENCRYPT(IA)
+    let mut header = [0u8; 14];
+    read_buffered(stream, &mut buffered, &mut header)?;
+    dec.apply(&mut header);
+    if header[..8] != [0u8; 8] {
         return Err("mse vc verification failed".to_string());
     }
-
-    let crypto_provide =
-        u32::from_be_bytes([enc_header[8], enc_header[9], enc_header[10], enc_header[11]]);
-    let pad_c_len = u16::from_be_bytes([enc_header[12], enc_header[13]]) as usize;
-
-    // Skip PadC
-    if pad_c_len > 0 {
-        if pad_c_len > 512 {
-            return Err("mse PadC too large".to_string());
-        }
-        let mut pad = vec![0u8; pad_c_len];
-        read_exact_buffered(&mut pad)?;
-        dec.apply(&mut pad);
+    let crypto_provide = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+    let pad_c_len = usize::from(u16::from_be_bytes([header[12], header[13]]));
+    if pad_c_len > MAX_PAD {
+        return Err("mse PadC too large".to_string());
     }
-
-    // Read len(IA) (2 bytes)
-    let mut ia_len_buf = [0u8; 2];
-    read_exact_buffered(&mut ia_len_buf)?;
-    dec.apply(&mut ia_len_buf);
-    let ia_len = u16::from_be_bytes(ia_len_buf) as usize;
-
-    // Read IA (initial payload = peer's BT handshake)
+    let mut pad = [0u8; MAX_PAD + 2];
+    read_buffered(stream, &mut buffered, &mut pad[..pad_c_len + 2])?;
+    dec.apply(&mut pad[..pad_c_len + 2]);
+    let ia_len = usize::from(u16::from_be_bytes([pad[pad_c_len], pad[pad_c_len + 1]]));
     let mut ia = vec![0u8; ia_len];
-    if ia_len > 0 {
-        read_exact_buffered(&mut ia)?;
-        dec.apply(&mut ia);
-    }
+    read_buffered(stream, &mut buffered, &mut ia)?;
+    dec.apply(&mut ia);
 
-    // Determine crypto_select
-    let crypto_select: u32 = if crypto_provide & 0x02 != 0 {
-        0x02
-    } else if allow_plain && crypto_provide & 0x01 != 0 {
-        0x01
+    let crypto_select = if crypto_provide & CRYPTO_RC4 != 0 {
+        CRYPTO_RC4
+    } else if allow_plain && crypto_provide & CRYPTO_PLAINTEXT != 0 {
+        CRYPTO_PLAINTEXT
     } else {
         return Err("mse no compatible crypto".to_string());
     };
 
-    // Set up encryption for our outgoing data and send step 4 response
-    let mut enc = Rc4::new(&enc_key);
-    enc.discard(1024);
+    // ENCRYPT(VC, crypto_select, len(PadD) = 0)
+    let mut response = [0u8; 14];
+    response[8..12].copy_from_slice(&crypto_select.to_be_bytes());
+    enc.apply(&mut response);
+    stream.write_all(&response).map_err(io_err)?;
 
-    let mut resp_data = Vec::with_capacity(14);
-    resp_data.extend_from_slice(&[0u8; 8]); // VC
-    resp_data.extend_from_slice(&crypto_select.to_be_bytes());
-    resp_data.extend_from_slice(&0u16.to_be_bytes()); // len(PadD) = 0
-    enc.apply(&mut resp_data);
-    stream
-        .write_all(&resp_data)
-        .map_err(|err| err.to_string())?;
-
-    if crypto_select & 0x02 != 0 {
+    if crypto_select == CRYPTO_RC4 {
         // PeerStream buffers hold plaintext. Only an RC4-selected stream has
         // encrypted bytes following IA; plaintext-selected bytes must remain
         // exactly as received.
         dec.apply(&mut buffered);
-        // Note: dec is for decrypting initiator's data (continuing from IA),
-        // enc is for encrypting our data (continuing from step 4 response)
         let cipher = CipherState { enc, dec };
         return Ok((CryptoMode::Rc4, Some(cipher), info_hash, ia, buffered));
     }
-
     Ok((CryptoMode::Plaintext, None, info_hash, ia, buffered))
+}
+
+/// Reads until `pattern` begins within the first `MAX_PAD` bytes and returns
+/// every byte received after it.
+fn sync_to<R: Read>(stream: &mut R, pattern: &[u8]) -> Result<Vec<u8>, String> {
+    let mut received = Vec::with_capacity(MAX_PAD + 64);
+    let mut chunk = [0u8; MAX_PAD];
+    loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => return Err("mse sync: unexpected eof".to_string()),
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(io_err(err)),
+        };
+        // A match may straddle the previous read boundary.
+        let search_start = received.len().saturating_sub(pattern.len() - 1);
+        received.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_sync_pattern(&received, pattern, search_start, MAX_PAD) {
+            return Ok(received.split_off(pos + pattern.len()));
+        }
+        if received.len() >= MAX_PAD + pattern.len() {
+            return Err("mse sync failed".to_string());
+        }
+    }
+}
+
+/// `read_exact` that first consumes bytes already over-read into `buffered`.
+fn read_buffered<R: Read>(
+    stream: &mut R,
+    buffered: &mut Vec<u8>,
+    out: &mut [u8],
+) -> Result<(), String> {
+    let take = out.len().min(buffered.len());
+    out[..take].copy_from_slice(&buffered[..take]);
+    buffered.drain(..take);
+    stream.read_exact(&mut out[take..]).map_err(io_err)
 }
 
 fn find_sync_pattern(
@@ -377,88 +249,224 @@ fn find_sync_pattern(
     search_start: usize,
     max_offset: usize,
 ) -> Option<usize> {
-    if pattern.is_empty() || data.len() < pattern.len() {
-        return None;
-    }
     let last = data.len().checked_sub(pattern.len())?.min(max_offset);
-    if search_start > last {
-        return None;
-    }
     (search_start..=last).find(|offset| data[*offset..*offset + pattern.len()] == *pattern)
 }
 
-fn find_info_hash(info_hashes: &[[u8; 20]], target: &[u8; 20]) -> Option<[u8; 20]> {
-    info_hashes
-        .iter()
-        .find(|hash| &sha1_bytes(b"req2", hash.as_slice()) == target)
-        .copied()
+fn hash2(prefix: &[u8], data: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(prefix);
+    hasher.update(data);
+    hasher.finalize()
 }
 
-fn sha1_bytes(prefix: &[u8], data: &[u8]) -> [u8; 20] {
-    let mut buf = Vec::with_capacity(prefix.len() + data.len());
-    buf.extend_from_slice(prefix);
-    buf.extend_from_slice(data);
-    sha1::sha1(&buf)
+fn derive_key(label: &[u8; 4], shared: &[u8; 96], info_hash: &[u8; 20]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(label);
+    hasher.update(shared);
+    hasher.update(info_hash);
+    hasher.finalize()
 }
 
-fn xor_hash(a: &[u8], b: &[u8]) -> [u8; 20] {
-    let mut out = [0u8; 20];
-    for i in 0..20 {
-        out[i] = a[i] ^ b[i];
+fn xor20(a: &[u8; 20], b: &[u8; 20]) -> [u8; 20] {
+    let mut out = *a;
+    for (byte, other) in out.iter_mut().zip(b) {
+        *byte ^= other;
     }
     out
 }
 
-fn derive_keys(shared: &[u8], info_hash: &[u8; 20], initiator: bool) -> ([u8; 20], [u8; 20]) {
-    let key_a = sha1_bytes(b"keyA", &[shared, info_hash.as_slice()].concat());
-    let key_b = sha1_bytes(b"keyB", &[shared, info_hash.as_slice()].concat());
-    if initiator {
-        (key_a, key_b)
-    } else {
-        (key_b, key_a)
-    }
+/// Generates a 160-bit Diffie-Hellman private exponent (the MSE
+/// specification considers anything beyond ~180 bits useless) and the
+/// matching public key `2^x mod P`.
+fn dh_generate() -> Result<([u8; 20], [u8; 96]), String> {
+    let mut private_key = [0u8; 20];
+    getrandom::fill(&mut private_key).map_err(|err| format!("mse random: {err}"))?;
+    // Keep the exponent full-size so it is never trivially small.
+    private_key[0] |= 0x80;
+    Ok((private_key, to_be_bytes(&mod_pow(&TWO, &private_key))))
 }
 
-fn validate_peer_public(peer_pub: &BigUint) -> Result<(), String> {
-    let modulus = prime()?;
-    let upper = &modulus - BigUint::from(2u8);
-    if peer_pub < &BigUint::from(2u8) || peer_pub > &upper {
+/// Validates the peer's public key and returns the 96-byte shared secret.
+fn dh_shared(peer_public: &[u8; 96], private_key: &[u8]) -> Result<[u8; 96], String> {
+    let peer = from_be_bytes(peer_public);
+    // Reject 0, 1, P - 1 and anything >= P: these confine the shared secret
+    // to a trivial subgroup or are not field elements at all.
+    if less_than(&peer, &TWO) || !less_than(&peer, &P_MINUS_ONE) {
         return Err("mse invalid DH public key".to_string());
     }
-    Ok(())
+    Ok(to_be_bytes(&mod_pow(&peer, private_key)))
 }
 
-fn dh_generate() -> Result<(BigUint, BigUint), String> {
-    let mut priv_bytes = [0u8; 96];
-    getrandom::fill(&mut priv_bytes)
-        .map_err(|err| format!("mse random generation failed: {err}"))?;
-    let modulus = prime()?;
-    let range = &modulus - BigUint::from(3u8);
-    let priv_key = (BigUint::from_bytes_be(&priv_bytes) % range) + BigUint::from(2u8);
-    let pub_key = BigUint::from(2u8).modpow(&priv_key, &modulus);
-    Ok((priv_key, pub_key))
-}
+// Fixed-size 768-bit arithmetic modulo the MSE prime, using Montgomery
+// multiplication over little-endian 64-bit limbs. Exponentiation always
+// performs both the square and the multiply and selects the result with a
+// mask, so its running time does not depend on the secret exponent bits.
+const LIMBS: usize = 12;
+type U768 = [u64; LIMBS];
 
-fn to_fixed_bytes(value: &BigUint, len: usize) -> Vec<u8> {
-    let mut bytes = value.to_bytes_be();
-    if bytes.len() > len {
-        bytes = bytes[bytes.len() - len..].to_vec();
+/// The 768-bit MSE prime P (little-endian limbs).
+const P: U768 = [
+    0x0000_0000_0009_0563,
+    0xF44C_42E9_A63A_3621,
+    0xE485_B576_625E_7EC6,
+    0x4FE1_356D_6D51_C245,
+    0x302B_0A6D_F25F_1437,
+    0xEF95_19B3_CD3A_431B,
+    0x514A_0879_8E34_04DD,
+    0x020B_BEA6_3B13_9B22,
+    0x2902_4E08_8A67_CC74,
+    0xC4C6_628B_80DC_1CD1,
+    0xC90F_DAA2_2168_C234,
+    0xFFFF_FFFF_FFFF_FFFF,
+];
+const P_MINUS_ONE: U768 = {
+    let mut value = P;
+    value[0] -= 1;
+    value
+};
+const ONE: U768 = {
+    let mut value = [0u64; LIMBS];
+    value[0] = 1;
+    value
+};
+const TWO: U768 = {
+    let mut value = [0u64; LIMBS];
+    value[0] = 2;
+    value
+};
+/// -P^-1 mod 2^64, by Newton iteration (each step doubles the correct bits).
+const N0_INV: u64 = {
+    let mut inverse = 1u64;
+    let mut step = 0;
+    while step < 6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(P[0].wrapping_mul(inverse)));
+        step += 1;
     }
-    if bytes.len() < len {
-        let mut out = vec![0u8; len - bytes.len()];
-        out.extend_from_slice(&bytes);
-        return out;
+    inverse.wrapping_neg()
+};
+/// R^2 mod P with R = 2^768, used to enter the Montgomery domain.
+const R2: U768 = {
+    // R mod P = 2^768 - P, the two's complement of P.
+    let mut value = [0u64; LIMBS];
+    let mut carry = 1u64;
+    let mut i = 0;
+    while i < LIMBS {
+        let (sum, overflow) = (!P[i]).overflowing_add(carry);
+        value[i] = sum;
+        carry = overflow as u64;
+        i += 1;
     }
-    bytes
+    // Doubling 768 times multiplies by another R.
+    let mut doubling = 0;
+    while doubling < 768 {
+        let mut top = 0u64;
+        let mut i = 0;
+        while i < LIMBS {
+            let next = value[i] >> 63;
+            value[i] = (value[i] << 1) | top;
+            top = next;
+            i += 1;
+        }
+        if top == 1 || !less_than(&value, &P) {
+            let mut borrow = 0u64;
+            let mut i = 0;
+            while i < LIMBS {
+                let (diff, under1) = value[i].overflowing_sub(P[i]);
+                let (diff, under2) = diff.overflowing_sub(borrow);
+                value[i] = diff;
+                borrow = (under1 | under2) as u64;
+                i += 1;
+            }
+        }
+        doubling += 1;
+    }
+    value
+};
+
+const fn less_than(a: &U768, b: &U768) -> bool {
+    let mut i = LIMBS;
+    while i > 0 {
+        i -= 1;
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+    }
+    false
 }
 
-fn prime() -> Result<BigUint, String> {
-    let hex = "\
-FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
-29024E088A67CC74020BBEA63B139B22514A08798E3404DD\
-EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245\
-E485B576625E7EC6F44C42E9A63A36210000000000090563";
-    BigUint::from_str_radix(hex, 16).map_err(|_| "invalid built-in MSE prime".to_string())
+fn from_be_bytes(bytes: &[u8; 96]) -> U768 {
+    let mut out = [0u64; LIMBS];
+    for (limb, chunk) in out.iter_mut().zip(bytes.as_chunks::<8>().0.iter().rev()) {
+        *limb = u64::from_be_bytes(*chunk);
+    }
+    out
+}
+
+fn to_be_bytes(value: &U768) -> [u8; 96] {
+    let mut out = [0u8; 96];
+    for (chunk, limb) in out.as_chunks_mut::<8>().0.iter_mut().rev().zip(value) {
+        *chunk = limb.to_be_bytes();
+    }
+    out
+}
+
+/// Montgomery product a * b * R^-1 mod P for a, b < P (CIOS method).
+fn mont_mul(a: &U768, b: &U768) -> U768 {
+    let mut t = [0u64; LIMBS + 2];
+    for &word in b {
+        let mut carry = 0u64;
+        for (slot, &limb) in t.iter_mut().zip(a) {
+            let sum = u128::from(*slot) + u128::from(limb) * u128::from(word) + u128::from(carry);
+            *slot = sum as u64;
+            carry = (sum >> 64) as u64;
+        }
+        let sum = u128::from(t[LIMBS]) + u128::from(carry);
+        t[LIMBS] = sum as u64;
+        t[LIMBS + 1] = (sum >> 64) as u64;
+
+        let m = t[0].wrapping_mul(N0_INV);
+        let mut carry = ((u128::from(t[0]) + u128::from(m) * u128::from(P[0])) >> 64) as u64;
+        for j in 1..LIMBS {
+            let sum = u128::from(t[j]) + u128::from(m) * u128::from(P[j]) + u128::from(carry);
+            t[j - 1] = sum as u64;
+            carry = (sum >> 64) as u64;
+        }
+        let sum = u128::from(t[LIMBS]) + u128::from(carry);
+        t[LIMBS - 1] = sum as u64;
+        t[LIMBS] = t[LIMBS + 1] + (sum >> 64) as u64;
+    }
+    // t < 2P: subtract P once when t >= P, selecting without branching.
+    let mut reduced = [0u64; LIMBS];
+    let mut borrow = 0u64;
+    for ((out, &limb), &modulus) in reduced.iter_mut().zip(&t[..LIMBS]).zip(&P) {
+        let (diff, under1) = limb.overflowing_sub(modulus);
+        let (diff, under2) = diff.overflowing_sub(borrow);
+        *out = diff;
+        borrow = u64::from(under1 | under2);
+    }
+    let keep_reduced = 0u64.wrapping_sub((t[LIMBS] | (borrow ^ 1)) & 1);
+    for (out, &limb) in reduced.iter_mut().zip(&t[..LIMBS]) {
+        *out = (*out & keep_reduced) | (limb & !keep_reduced);
+    }
+    reduced
+}
+
+/// base^exponent mod P for base < P; `exponent` is big-endian.
+fn mod_pow(base: &U768, exponent: &[u8]) -> U768 {
+    let base = mont_mul(base, &R2);
+    let mut acc = mont_mul(&ONE, &R2);
+    for byte in exponent {
+        for bit in (0..8).rev() {
+            acc = mont_mul(&acc, &acc);
+            let product = mont_mul(&acc, &base);
+            let mask = 0u64.wrapping_sub(u64::from((byte >> bit) & 1));
+            for (slot, value) in acc.iter_mut().zip(product) {
+                *slot = (value & mask) | (*slot & !mask);
+            }
+        }
+    }
+    mont_mul(&acc, &ONE)
 }
 
 #[derive(Clone)]
@@ -469,34 +477,38 @@ struct Rc4 {
 }
 
 impl Rc4 {
+    /// RC4 keyed for MSE, with the mandatory first 1024 bytes discarded.
     fn new(key: &[u8]) -> Self {
         let mut s = [0u8; 256];
         for (i, slot) in s.iter_mut().enumerate() {
             *slot = i as u8;
         }
         let mut j = 0u8;
-        for i in 0..256u16 {
-            let idx = i as usize;
-            j = j.wrapping_add(s[idx]).wrapping_add(key[idx % key.len()]);
-            s.swap(idx, j as usize);
+        for i in 0..256 {
+            j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
+            s.swap(i, usize::from(j));
         }
-        Self { s, i: 0, j: 0 }
+        let mut rc4 = Self { s, i: 0, j: 0 };
+        let mut discard = [0u8; 256];
+        for _ in 0..4 {
+            rc4.apply(&mut discard);
+        }
+        rc4
     }
 
     fn apply(&mut self, data: &mut [u8]) {
+        let (mut i, mut j) = (self.i, self.j);
         for byte in data {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.s[self.i as usize]);
-            self.s.swap(self.i as usize, self.j as usize);
-            let idx = self.s[self.i as usize].wrapping_add(self.s[self.j as usize]);
-            let k = self.s[idx as usize];
-            *byte ^= k;
+            i = i.wrapping_add(1);
+            let si = self.s[usize::from(i)];
+            j = j.wrapping_add(si);
+            let sj = self.s[usize::from(j)];
+            self.s[usize::from(i)] = sj;
+            self.s[usize::from(j)] = si;
+            *byte ^= self.s[usize::from(si.wrapping_add(sj))];
         }
-    }
-
-    fn discard(&mut self, count: usize) {
-        let mut buf = vec![0u8; count];
-        self.apply(&mut buf);
+        self.i = i;
+        self.j = j;
     }
 }
 
@@ -551,30 +563,128 @@ mod tests {
         }
     }
 
-    #[test]
-    fn xor_and_key_derivation_are_consistent() {
-        let a = [0xAAu8; 20];
-        let b = [0x0Fu8; 20];
-        let x = xor_hash(&a, &b);
-        assert_eq!(x, [0xA5u8; 20]);
+    fn hex96(hex: &str) -> [u8; 96] {
+        let mut out = [0u8; 96];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        out
+    }
 
-        let shared = [3u8; 96];
-        let info_hash = [9u8; 20];
-        let (i_enc, i_dec) = derive_keys(&shared, &info_hash, true);
-        let (r_enc, r_dec) = derive_keys(&shared, &info_hash, false);
-        assert_eq!(i_enc, r_dec);
-        assert_eq!(i_dec, r_enc);
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Reference results computed with Python's `pow(base, exponent, P)`.
+    #[test]
+    fn modular_exponentiation_matches_reference_values() {
+        assert_eq!(
+            to_be_bytes(&P),
+            hex96(
+                "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
+                 29024E088A67CC74020BBEA63B139B22514A08798E3404DD\
+                 EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245\
+                 E485B576625E7EC6F44C42E9A63A36210000000000090563"
+            )
+        );
+        assert_eq!(P[0].wrapping_mul(N0_INV), u64::MAX);
+
+        let x1 = hex_bytes("0102030405060708090a0b0c0d0e0f1011121314");
+        assert_eq!(
+            to_be_bytes(&mod_pow(&TWO, &x1)),
+            hex96(
+                "96e112dab29e8c5272accb9b17b26887ce54a144a4e3b697c7d159b7a817e556\
+                 b0918db2b4c658e02a87f7e5fb14b18a553e084cbf3dad2d30f16596ccb982d4\
+                 06258c61b30c5c1dae2ddc60bdbd48d79896312aad63238c39e1a633821eb693"
+            )
+        );
+
+        let y2 = hex96(
+            "0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186\
+             abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc0126\
+             4b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6",
+        );
+        let x2 = hex_bytes("c8237ed9348fea45a0fb56b10c67c21d78d32e89");
+        assert_eq!(
+            dh_shared(&y2, &x2).unwrap(),
+            hex96(
+                "0a9fd0881d48ee35ad96cca9b6fe73090dec4ebe4db2b2976c79843d923cdbaf\
+                 c4f56fd201aef742239723e779119bc2cc22b0a03681d0bb294c303af896edbd\
+                 a478437790c43ec8ff11e426ad5a9af0b824d138560ba53e6678d9fe58734888"
+            )
+        );
+
+        let mut p_minus_two = P;
+        p_minus_two[0] -= 2;
+        assert_eq!(
+            dh_shared(&to_be_bytes(&p_minus_two), &[0xff; 20]).unwrap(),
+            hex96(
+                "016553ebd09b52b26d455c7162c744d1fdbc83ed348587ee7683c199b242bbb8\
+                 aa768ed9578430d1cc909edacae9019f1df43ddeafca1bcf30ea5c24b3523169\
+                 92a4780d17885acb65cea84c6d8591cb31e9efd2fe8c1c13c299fa0fbf9d57ea"
+            )
+        );
+
+        let x4 = hex96(
+            "0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9a\
+             a7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a\
+             4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cdda",
+        );
+        assert_eq!(
+            dh_shared(&y2, &x4).unwrap(),
+            hex96(
+                "44c67145c1aa11ee5c0dd7a6546445f5c0dfc71a3b26b8ffa31a2dc94607ba40\
+                 f5fdac93170fb03dc647528d97944ebf917032a515f837a1a8210b633e00cfac\
+                 df2f5d7275e442074c6ed44bafceec0b2210e8f356a986daec540ffd1fd25b53"
+            )
+        );
     }
 
     #[test]
-    fn to_fixed_bytes_pads_and_truncates() {
-        let small = BigUint::from(0x1234u32);
-        let padded = to_fixed_bytes(&small, 4);
-        assert_eq!(padded, vec![0x00, 0x00, 0x12, 0x34]);
+    fn diffie_hellman_agrees_and_rejects_degenerate_public_keys() {
+        let (private_a, public_a) = dh_generate().unwrap();
+        let (private_b, public_b) = dh_generate().unwrap();
+        assert_ne!(public_a, public_b);
+        assert_eq!(
+            dh_shared(&public_b, &private_a).unwrap(),
+            dh_shared(&public_a, &private_b).unwrap()
+        );
 
-        let large = BigUint::from_str_radix("1122334455", 16).unwrap();
-        let truncated = to_fixed_bytes(&large, 3);
-        assert_eq!(truncated, vec![0x33, 0x44, 0x55]);
+        let mut value = [0u8; 96];
+        assert!(dh_shared(&value, &private_a).is_err());
+        value[95] = 1;
+        assert!(dh_shared(&value, &private_a).is_err());
+        value[95] = 2;
+        assert!(dh_shared(&value, &private_a).is_ok());
+        let p_minus_one = to_be_bytes(&P_MINUS_ONE);
+        assert!(dh_shared(&p_minus_one, &private_a).is_err());
+        assert!(dh_shared(&to_be_bytes(&P), &private_a).is_err());
+        assert!(dh_shared(&[0xff; 96], &private_a).is_err());
+        let mut p_minus_two = p_minus_one;
+        p_minus_two[95] -= 1;
+        assert!(dh_shared(&p_minus_two, &private_a).is_ok());
+    }
+
+    #[test]
+    fn xor_and_key_derivation_are_consistent() {
+        assert_eq!(xor20(&[0xAAu8; 20], &[0x0Fu8; 20]), [0xA5u8; 20]);
+
+        let shared = [3u8; 96];
+        let info_hash = [9u8; 20];
+        let mut expected = b"keyA".to_vec();
+        expected.extend_from_slice(&shared);
+        expected.extend_from_slice(&info_hash);
+        assert_eq!(
+            derive_key(b"keyA", &shared, &info_hash),
+            crate::sha1::sha1(&expected)
+        );
+        assert_ne!(
+            derive_key(b"keyA", &shared, &info_hash),
+            derive_key(b"keyB", &shared, &info_hash)
+        );
     }
 
     #[test]
@@ -590,6 +700,43 @@ mod tests {
     }
 
     #[test]
+    fn sync_finds_patterns_straddling_reads_and_bounds_padding() {
+        let mut data = vec![0x55u8; 300];
+        data.extend_from_slice(b"PATTERN!");
+        data.extend_from_slice(b"rest");
+        for chunk in [1, 5, 7, 64, 512] {
+            let mut reader = SlowReader {
+                data: data.clone(),
+                chunk,
+            };
+            // Over-read bytes are returned; the rest stays in the stream.
+            let mut after = sync_to(&mut reader, b"PATTERN!").unwrap();
+            after.extend_from_slice(&reader.data);
+            assert_eq!(after, b"rest", "chunk {chunk}");
+        }
+
+        let mut reader = SlowReader {
+            data: vec![0u8; 2000],
+            chunk: 97,
+        };
+        assert!(sync_to(&mut reader, b"PATTERN!").is_err());
+    }
+
+    struct SlowReader {
+        data: Vec<u8>,
+        chunk: usize,
+    }
+
+    impl Read for SlowReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.chunk.min(buf.len()).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[test]
     fn cipher_state_roundtrip() {
         let mut cipher = CipherState::new(b"key", b"key");
         let mut data = b"hello world".to_vec();
@@ -598,15 +745,6 @@ mod tests {
         assert_ne!(data, original);
         cipher.decrypt(&mut data);
         assert_eq!(data, original);
-    }
-
-    #[test]
-    fn find_info_hash_matches_req2_digest() {
-        let target = [7u8; 20];
-        let other = [8u8; 20];
-        let req2_target = sha1_bytes(b"req2", &target);
-        let found = find_info_hash(&[other, target], &req2_target);
-        assert_eq!(found, Some(target));
     }
 
     #[test]
@@ -672,30 +810,23 @@ mod tests {
 
             let mut ya = [0u8; 96];
             stream.read_exact(&mut ya).unwrap();
-            let ya = BigUint::from_bytes_be(&ya);
-            validate_peer_public(&ya).unwrap();
-
             let (private, public) = dh_generate().unwrap();
-            stream.write_all(&to_fixed_bytes(&public, 96)).unwrap();
-            let shared = ya.modpow(&private, &prime().unwrap());
-            let shared = to_fixed_bytes(&shared, 96);
+            stream.write_all(&public).unwrap();
+            let shared = dh_shared(&ya, &private).unwrap();
 
             let mut req1 = [0u8; 20];
             let mut obfuscated_req2 = [0u8; 20];
             stream.read_exact(&mut req1).unwrap();
             stream.read_exact(&mut obfuscated_req2).unwrap();
-            assert_eq!(req1, sha1_bytes(b"req1", &shared));
+            assert_eq!(req1, hash2(b"req1", &shared));
             assert_eq!(
                 obfuscated_req2,
-                xor_hash(
-                    &sha1_bytes(b"req2", &info_hash),
-                    &sha1_bytes(b"req3", &shared),
-                )
+                xor20(&hash2(b"req2", &info_hash), &hash2(b"req3", &shared),)
             );
 
-            let (initiator_key, responder_key) = derive_keys(&shared, &info_hash, true);
+            let initiator_key = derive_key(b"keyA", &shared, &info_hash);
+            let responder_key = derive_key(b"keyB", &shared, &info_hash);
             let mut dec = Rc4::new(&initiator_key);
-            dec.discard(1024);
 
             let mut header = [0u8; 14];
             stream.read_exact(&mut header).unwrap();
@@ -722,7 +853,6 @@ mod tests {
             response.extend_from_slice(&(pad_d.len() as u16).to_be_bytes());
             response.extend_from_slice(&pad_d);
             let mut enc = Rc4::new(&responder_key);
-            enc.discard(1024);
             enc.apply(&mut response);
             response.extend_from_slice(post_pad);
             stream.write_all(&response).unwrap();
@@ -766,15 +896,13 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).unwrap();
         let (private, public) = dh_generate().unwrap();
-        stream.write_all(&to_fixed_bytes(&public, 96)).unwrap();
+        stream.write_all(&public).unwrap();
 
         let mut yb = [0u8; 96];
         stream.read_exact(&mut yb).unwrap();
-        let yb = BigUint::from_bytes_be(&yb);
-        validate_peer_public(&yb).unwrap();
-        let shared = yb.modpow(&private, &prime().unwrap());
-        let shared = to_fixed_bytes(&shared, 96);
-        let (initiator_key, responder_key) = derive_keys(&shared, &info_hash, true);
+        let shared = dh_shared(&yb, &private).unwrap();
+        let initiator_key = derive_key(b"keyA", &shared, &info_hash);
+        let responder_key = derive_key(b"keyB", &shared, &info_hash);
 
         let mut encrypted = Vec::new();
         encrypted.extend_from_slice(&[0u8; 8]);
@@ -784,14 +912,13 @@ mod tests {
         encrypted.extend_from_slice(&(initial_payload.len() as u16).to_be_bytes());
         encrypted.extend_from_slice(initial_payload);
         let mut enc = Rc4::new(&initiator_key);
-        enc.discard(1024);
         enc.apply(&mut encrypted);
 
         let mut transcript = Vec::with_capacity(transcript_len);
-        transcript.extend_from_slice(&sha1_bytes(b"req1", &shared));
-        transcript.extend_from_slice(&xor_hash(
-            &sha1_bytes(b"req2", &info_hash),
-            &sha1_bytes(b"req3", &shared),
+        transcript.extend_from_slice(&hash2(b"req1", &shared));
+        transcript.extend_from_slice(&xor20(
+            &hash2(b"req2", &info_hash),
+            &hash2(b"req3", &shared),
         ));
         transcript.extend_from_slice(&encrypted);
         transcript.extend_from_slice(post_ia);
@@ -801,7 +928,6 @@ mod tests {
         let mut response = [0u8; 14];
         stream.read_exact(&mut response).unwrap();
         let mut dec = Rc4::new(&responder_key);
-        dec.discard(1024);
         dec.apply(&mut response);
         assert_eq!(&response[..8], &[0u8; 8]);
         assert_eq!(u32::from_be_bytes(response[8..12].try_into().unwrap()), 1);
