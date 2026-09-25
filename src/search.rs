@@ -225,10 +225,10 @@ struct ReaderTask {
 }
 
 impl ReaderTask {
-    fn spawn(reader: impl Read + Send + 'static, limit: usize) -> Self {
+    fn spawn(mut reader: Box<dyn Read + Send>, limit: usize) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
-            let _ = sender.send(read_limited(reader, limit));
+            let _ = sender.send(read_limited(&mut *reader, limit));
         });
         Self {
             receiver,
@@ -470,59 +470,49 @@ pub fn status_json() -> String {
         return "{\"busy\":false,\"python_available\":false,\"plugin_error\":\"search not initialized\",\"last_error\":\"\",\"query\":\"\",\"category\":\"all\",\"last_started_at\":0,\"last_finished_at\":0,\"plugins\":[],\"results\":[]}".to_string();
     };
     let state = lock_state(lock);
-    let mut out = format!(
-        "{{\"busy\":{},\"python_available\":{},\"plugin_error\":\"{}\",\"last_error\":\"{}\",\"query\":\"{}\",\"category\":\"{}\",\"last_started_at\":{},\"last_finished_at\":{},\"plugins\":[",
-        if state.busy { "true" } else { "false" },
-        if state.python_available { "true" } else { "false" },
-        escape_json(&state.plugin_error),
-        escape_json(&state.last_error),
-        escape_json(&state.last_query),
-        escape_json(&state.last_category),
-        state.last_started_at,
-        state.last_finished_at,
-    );
-    for (idx, plugin) in state.plugins.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
+    let mut out = Json(String::with_capacity(256 + state.results.len() * 256));
+    out.open("", '{');
+    out.raw("busy", &state.busy);
+    out.raw("python_available", &state.python_available);
+    out.str("plugin_error", &state.plugin_error);
+    out.str("last_error", &state.last_error);
+    out.str("query", &state.last_query);
+    out.str("category", &state.last_category);
+    out.raw("last_started_at", &state.last_started_at);
+    out.raw("last_finished_at", &state.last_finished_at);
+    out.open("plugins", '[');
+    for plugin in &state.plugins {
+        out.open("", '{');
+        out.str("module", &plugin.module);
+        out.str("display_name", &plugin.display_name);
+        out.str("site_url", &plugin.site_url);
+        out.str("version", &plugin.version);
+        out.raw("healthy", &plugin.healthy);
+        out.str("broken_reason", &plugin.broken_reason);
+        out.open("categories", '[');
+        for category in &plugin.categories {
+            out.str("", category);
         }
-        out.push_str(&format!(
-            "{{\"module\":\"{}\",\"display_name\":\"{}\",\"site_url\":\"{}\",\"version\":\"{}\",\"healthy\":{},\"broken_reason\":\"{}\",\"categories\":[",
-            escape_json(&plugin.module),
-            escape_json(&plugin.display_name),
-            escape_json(&plugin.site_url),
-            escape_json(&plugin.version),
-            if plugin.healthy { "true" } else { "false" },
-            escape_json(&plugin.broken_reason),
-        ));
-        for (cat_idx, category) in plugin.categories.iter().enumerate() {
-            if cat_idx > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!("\"{}\"", escape_json(category)));
-        }
-        out.push_str("]}");
+        out.0.push_str("]}");
     }
-    out.push_str("],\"results\":[");
-    for (idx, result) in state.results.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"index\":{},\"plugin\":\"{}\",\"site_url\":\"{}\",\"link\":\"{}\",\"name\":\"{}\",\"size\":{},\"seeds\":{},\"leech\":{},\"desc_link\":\"{}\",\"pub_date\":{}}}",
-            result.result_id,
-            escape_json(&result.plugin),
-            escape_json(&result.site_url),
-            escape_json(&result.link),
-            escape_json(&result.name),
-            result.size_bytes,
-            result.seeds,
-            result.leech,
-            escape_json(&result.desc_link),
-            result.pub_date,
-        ));
+    out.0.push(']');
+    out.open("results", '[');
+    for result in &state.results {
+        out.open("", '{');
+        out.raw("index", &result.result_id);
+        out.str("plugin", &result.plugin);
+        out.str("site_url", &result.site_url);
+        out.str("link", &result.link);
+        out.str("name", &result.name);
+        out.raw("size", &result.size_bytes);
+        out.raw("seeds", &result.seeds);
+        out.raw("leech", &result.leech);
+        out.str("desc_link", &result.desc_link);
+        out.raw("pub_date", &result.pub_date);
+        out.0.push('}');
     }
-    out.push_str("]}");
-    out
+    out.0.push_str("]}");
+    out.0
 }
 
 pub fn catalog_json(force_refresh: bool) -> String {
@@ -530,60 +520,86 @@ pub fn catalog_json(force_refresh: bool) -> String {
     let Some(lock) = SEARCH_STATE.get() else {
         return "{\"entries\":[],\"error\":\"search not initialized\"}".to_string();
     };
+    let mut state = lock_state(lock);
     if let Some(err) = fetch_error {
-        let mut state = lock_state(lock);
         state.catalog_error = err;
     }
-    let state = lock_state(lock);
-    let installed_plugins = state.plugins.clone();
-    let mut out = format!(
-        "{{\"error\":\"{}\",\"source_url\":\"{}\",\"fetched_at\":{},\"entries\":[",
-        escape_json(&state.catalog_error),
-        escape_json(CATALOG_URL),
-        state.catalog_fetched_at
-    );
-    append_catalog_entries_json(&mut out, &state.catalog, &installed_plugins);
-    out.push_str("]}");
-    out
+    let mut out = Json(String::with_capacity(256 + state.catalog.len() * 512));
+    out.open("", '{');
+    out.str("error", &state.catalog_error);
+    out.str("source_url", CATALOG_URL);
+    out.raw("fetched_at", &state.catalog_fetched_at);
+    out.open("entries", '[');
+    append_catalog_entries_json(&mut out, &state.catalog, &state.plugins);
+    out.0.push_str("]}");
+    out.0
 }
 
 fn append_catalog_entries_json(
-    out: &mut String,
+    out: &mut Json,
     entries: &[SearchCatalogEntry],
     installed_plugins: &[SearchPlugin],
 ) {
-    let mut first = true;
     for entry in entries.iter().filter(|entry| !entry.private_site) {
-        if !first {
-            out.push(',');
-        }
-        first = false;
         let installed = installed_plugins
             .iter()
             .find(|plugin| plugin.module == entry.module);
-        out.push_str(&format!(
-            "{{\"module\":\"{}\",\"name\":\"{}\",\"author\":\"{}\",\"version\":\"{}\",\"updated\":\"{}\",\"download_url\":\"{}\",\"comment\":\"{}\",\"private_site\":{},\"installed\":{},\"installed_version\":\"{}\",\"installed_name\":\"{}\",\"installed_healthy\":{}}}",
-            escape_json(&entry.module),
-            escape_json(&entry.name),
-            escape_json(&entry.author),
-            escape_json(&entry.version),
-            escape_json(&entry.updated),
-            escape_json(&entry.download_url),
-            escape_json(&entry.comment),
-            if entry.private_site { "true" } else { "false" },
-            if installed.is_some() { "true" } else { "false" },
-            escape_json(installed.map(|plugin| plugin.version.as_str()).unwrap_or("")),
-            escape_json(
-                installed
-                    .map(|plugin| plugin.display_name.as_str())
-                    .unwrap_or("")
-            ),
-            if installed.map(|plugin| plugin.healthy).unwrap_or(false) {
-                "true"
-            } else {
-                "false"
-            },
-        ));
+        out.open("", '{');
+        out.str("module", &entry.module);
+        out.str("name", &entry.name);
+        out.str("author", &entry.author);
+        out.str("version", &entry.version);
+        out.str("updated", &entry.updated);
+        out.str("download_url", &entry.download_url);
+        out.str("comment", &entry.comment);
+        out.raw("private_site", &entry.private_site);
+        out.raw("installed", &installed.is_some());
+        out.str(
+            "installed_version",
+            installed.map_or("", |plugin| plugin.version.as_str()),
+        );
+        out.str(
+            "installed_name",
+            installed.map_or("", |plugin| plugin.display_name.as_str()),
+        );
+        out.raw(
+            "installed_healthy",
+            &installed.is_some_and(|plugin| plugin.healthy),
+        );
+        out.0.push('}');
+    }
+}
+
+/// Minimal JSON writer. `key` inserts the separating comma unless the
+/// previous byte opened an object or array; an empty key writes an array
+/// element.
+struct Json(String);
+
+impl Json {
+    fn key(&mut self, key: &str) {
+        if !matches!(self.0.as_bytes().last(), None | Some(b'{' | b'[')) {
+            self.0.push(',');
+        }
+        if !key.is_empty() {
+            push_json_string(&mut self.0, key);
+            self.0.push(':');
+        }
+    }
+
+    fn str(&mut self, key: &str, value: &str) {
+        self.key(key);
+        push_json_string(&mut self.0, value);
+    }
+
+    fn raw(&mut self, key: &str, value: &dyn std::fmt::Display) {
+        use std::fmt::Write;
+        self.key(key);
+        let _ = write!(self.0, "{value}");
+    }
+
+    fn open(&mut self, key: &str, bracket: char) {
+        self.key(key);
+        self.0.push(bracket);
     }
 }
 
@@ -1449,19 +1465,17 @@ fn is_supported_result_link(value: &str) -> bool {
 }
 
 fn plugin_name_by_site_url(site_url: &str, plugins: &[SearchPlugin]) -> Option<String> {
-    let normalized = site_url.trim().trim_end_matches('/').to_ascii_lowercase();
-    plugins.iter().find_map(|plugin| {
-        let plugin_url = plugin
-            .site_url
-            .trim()
-            .trim_end_matches('/')
-            .to_ascii_lowercase();
-        if !plugin_url.is_empty() && plugin_url == normalized {
-            Some(plugin.module.clone())
-        } else {
-            None
-        }
-    })
+    fn normalize(url: &str) -> &str {
+        url.trim().trim_end_matches('/')
+    }
+    let wanted = normalize(site_url);
+    plugins
+        .iter()
+        .find(|plugin| {
+            let url = normalize(&plugin.site_url);
+            !url.is_empty() && url.eq_ignore_ascii_case(wanted)
+        })
+        .map(|plugin| plugin.module.clone())
 }
 
 fn parse_i64(value: &str) -> i64 {
@@ -1644,53 +1658,44 @@ fn run_command_with_timeout(
         .child
         .stdout
         .take()
-        .map(|handle| ReaderTask::spawn(handle, MAX_PROCESS_STDOUT_BYTES));
+        .map(|handle| ReaderTask::spawn(Box::new(handle), MAX_PROCESS_STDOUT_BYTES));
     let stderr_reader = process
         .child
         .stderr
         .take()
-        .map(|handle| ReaderTask::spawn(handle, MAX_PROCESS_STDERR_BYTES));
+        .map(|handle| ReaderTask::spawn(Box::new(handle), MAX_PROCESS_STDERR_BYTES));
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(1);
-    loop {
+    let outcome = loop {
         match process.try_wait() {
-            Ok(Some(status)) => {
-                let cleanup = process.terminate_and_reap();
-                let ((stdout, stdout_truncated), (stderr, stderr_truncated)) =
-                    collect_reader_tasks(stdout_reader, stderr_reader);
-                cleanup.map_err(|err| format!("cleanup {label}: {err}"))?;
-                return Ok(ProcessOutput {
-                    success: status.success(),
-                    stdout,
-                    stderr,
-                    stdout_truncated,
-                    stderr_truncated,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let cleanup = process.terminate_and_reap().err();
-                let _ = collect_reader_tasks(stdout_reader, stderr_reader);
-                let suffix = cleanup
-                    .map(|cleanup| format!("; cleanup failed: {cleanup}"))
-                    .unwrap_or_default();
-                return Err(format!("wait {label}: {err}{suffix}"));
-            }
-        }
-        if Instant::now() >= deadline {
-            let cleanup = process.terminate_and_reap().err();
-            let _ = collect_reader_tasks(stdout_reader, stderr_reader);
-            let suffix = cleanup
-                .map(|cleanup| format!("; cleanup failed: {cleanup}"))
-                .unwrap_or_default();
-            return Err(format!("{label} timed out{suffix}"));
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => {}
+            Ok(None) => break Err(format!("{label} timed out")),
+            Err(err) => break Err(format!("wait {label}: {err}")),
         }
         thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(50));
+    };
+    // Always kill the process group (descendants may hold the pipes) and
+    // collect the bounded readers, whatever the outcome.
+    let cleanup = process.terminate_and_reap();
+    let ((stdout, stdout_truncated), (stderr, stderr_truncated)) =
+        collect_reader_tasks(stdout_reader, stderr_reader);
+    match (outcome, cleanup) {
+        (Ok(status), Ok(())) => Ok(ProcessOutput {
+            success: status.success(),
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        }),
+        (Ok(_), Err(err)) => Err(format!("cleanup {label}: {err}")),
+        (Err(message), Ok(())) => Err(message),
+        (Err(message), Err(err)) => Err(format!("{message}; cleanup failed: {err}")),
     }
 }
 
-fn read_limited(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
+fn read_limited(reader: &mut dyn Read, limit: usize) -> (Vec<u8>, bool) {
     let mut output = Vec::with_capacity(limit.min(64 * 1024));
     let mut truncated = false;
     let mut chunk = [0u8; 8192];
@@ -1936,8 +1941,9 @@ fn lock_state(lock: &Mutex<SearchState>) -> std::sync::MutexGuard<'_, SearchStat
     }
 }
 
-fn escape_json(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Append `text` as a quoted JSON string.
+pub(crate) fn push_json_string(out: &mut String, text: &str) {
+    out.push('"');
     for ch in text.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
@@ -1945,11 +1951,14 @@ fn escape_json(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
-    out
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -2067,8 +2076,9 @@ mod tests {
                 private_site: true,
             },
         ];
-        let mut json = String::new();
+        let mut json = Json(String::from("["));
         append_catalog_entries_json(&mut json, &entries, &[]);
+        let json = json.0;
         assert!(json.contains("\"module\":\"publicmod\""));
         assert!(!json.contains("\"module\":\"privatemod\""));
     }
@@ -2207,7 +2217,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let (reader, writer) = UnixStream::pair().unwrap();
-        let task = ReaderTask::spawn(reader, 1024);
+        let task = ReaderTask::spawn(Box::new(reader), 1024);
         let started = Instant::now();
         let (bytes, truncated) = task.collect(Instant::now() + Duration::from_millis(50));
         assert!(bytes.is_empty());
@@ -2261,6 +2271,24 @@ mod tests {
         assert_eq!(bytes, b"replacement");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn json_writer_separates_members_and_escapes_strings() {
+        let mut out = Json(String::new());
+        out.open("", '{');
+        out.raw("busy", &true);
+        out.str("q", "a\"b\\c\n\u{1}é");
+        out.open("list", '[');
+        out.str("", "x");
+        out.open("", '{');
+        out.raw("n", &-1i64);
+        out.0.push('}');
+        out.0.push_str("],\"empty\":[]}");
+        assert_eq!(
+            out.0,
+            r#"{"busy":true,"q":"a\"b\\c\n\u0001é","list":["x",{"n":-1}],"empty":[]}"#
+        );
     }
 
     #[test]
