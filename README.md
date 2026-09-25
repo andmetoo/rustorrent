@@ -350,17 +350,58 @@ requires Python 3.9 or newer. Community plugins from the
 can be installed directly from the UI. Search plugins are executable third-party code: review and
 trust a plugin before installing it.
 
+### Terminal interface
+
+```sh
+rustorrent --tui --download-dir ~/Downloads
+```
+
+The terminal interface offers the same actions as the web UI. It has four views (`1` Transfers,
+`2` Search, `3` RSS, `4` Session). In Transfers, `a` adds a `.torrent` path or magnet link, `space`
+pauses or resumes, `s` stops, `v` verifies, `d` removes (you choose whether to keep the files), `b`
+sets a label, `Tab` cycles state filters and `/` finds by name. `Enter` opens details with Info,
+Files (`space` to skip or download a file, `+`/`-` for priority, `n` to rename) and Trackers (`a` to
+add, `d` to remove). `L` sets global rate limits, and `?` lists every key. The terminal interface
+uses the same local API as the browser. Without `--ui`, it serves that API on a private loopback
+port.
+
+### Remote control from the command line
+
+`rustorrent remote` controls an instance that is already running with `--ui`, `--tui` or
+`--daemon`:
+
+```sh
+rustorrent --daemon --download-dir ~/Downloads     # web UI on 127.0.0.1:8080
+rustorrent remote add ubuntu.torrent --paused --skip 2,3
+rustorrent remote add "magnet:?xt=urn:btih:..." --dir ~/Videos
+rustorrent remote list
+rustorrent remote info 1                 # details, files and trackers
+rustorrent remote resume all
+rustorrent remote priority 1 0 4 high    # files 0 and 4
+rustorrent remote remove 1 --delete-files
+rustorrent remote limit 5m 1m            # global down/up limits
+rustorrent remote search ubuntu desktop  # then: rustorrent remote get <result#>
+rustorrent remote rss add-feed https://example.org/feed.xml
+rustorrent remote tui                    # attach the terminal interface
+```
+
+Transfers can be named by id or by an info-hash prefix. `list`, `info`, `session` and `search`
+accept `--json` for scripting. Use `--ui-addr` or `RUSTORRENT_UI_ADDR` for a non-default address.
+Run `rustorrent remote help` to see every command.
+
 ## All options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `[file.torrent]` | | One torrent file to add at startup |
+| `[file.torrent \| magnet]` | | A torrent file or magnet link to add at startup |
 | `--magnet <link>` | | Add a magnet link |
 | `--download-dir <dir>` | `.` | Download directory |
 | `--port <port>` | `6881` | Listen port for incoming peers |
 | `--ui [port]` | off | Enable web UI (default port: 8080) |
 | `--ui-addr <addr>` | `127.0.0.1:8080` | Web UI bind address |
 | `--tui` | off | Use the interactive terminal interface |
+| `--no-port-mapping` | | Do not request NAT-PMP/UPnP router mappings |
+| `-h`, `--help` / `-V`, `--version` | | Show help or the version |
 | `--sequential` | off | Download pieces in order |
 | `--preallocate` | off | Preallocate disk space |
 | `--encryption <mode>` | `prefer` | `disable`, `prefer`, or `require` |
