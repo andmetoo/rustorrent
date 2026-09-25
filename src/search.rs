@@ -414,6 +414,9 @@ pub enum SearchDownload {
 static SEARCH_RUNTIME: OnceLock<SearchRuntime> = OnceLock::new();
 static SEARCH_STATE: OnceLock<Mutex<SearchState>> = OnceLock::new();
 
+const PYTHON_MISSING: &str =
+    "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins.";
+
 fn no_plugins_message() -> &'static str {
     "No search plugins are installed yet. Open Plugins or Community Catalog to add one."
 }
@@ -434,9 +437,7 @@ pub fn prepare(download_dir: &Path) -> Result<(), String> {
     let mut guard = lock_state(state);
     guard.python_available = runtime.python.is_some();
     if !guard.python_available {
-        guard.plugin_error =
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string();
+        guard.plugin_error = PYTHON_MISSING.to_string();
     } else if guard.plugins.is_empty() {
         guard.plugin_error = no_plugins_message().to_string();
     }
@@ -458,9 +459,7 @@ pub fn refresh_plugins() -> Result<(), String> {
     guard.python_available = runtime.python.is_some();
     guard.plugin_error = plugin_error;
     if !guard.python_available && guard.plugin_error.is_empty() {
-        guard.plugin_error =
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string();
+        guard.plugin_error = PYTHON_MISSING.to_string();
     } else if guard.python_available && guard.plugins.is_empty() && guard.plugin_error.is_empty() {
         guard.plugin_error = no_plugins_message().to_string();
     }
@@ -627,13 +626,8 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
     require_network()?;
     let runtime = runtime()?.clone();
     if runtime.python.is_none() {
-        set_last_error(
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins.",
-        );
-        return Err(
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string(),
-        );
+        set_last_error(PYTHON_MISSING);
+        return Err(PYTHON_MISSING.to_string());
     }
 
     let query = query.trim();
@@ -733,12 +727,7 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
                     guard.next_result_id = guard.next_result_id.saturating_add(1);
                 }
                 guard.results.extend(results);
-                guard.results.sort_by(|left, right| {
-                    right
-                        .seeds
-                        .cmp(&left.seeds)
-                        .then_with(|| left.name.cmp(&right.name))
-                });
+                sort_results(&mut guard.results);
             }
             // Always finalize the current generation, including when a worker could not be spawned.
             let state = SEARCH_STATE.get_or_init(|| Mutex::new(SearchState::default()));
@@ -1104,11 +1093,7 @@ fn runtime() -> Result<&'static SearchRuntime, String> {
 fn load_plugins(runtime: &SearchRuntime) -> Result<(Vec<SearchPlugin>, String), String> {
     let mut plugins = installed_plugins(&runtime.root)?;
     if runtime.python.is_none() {
-        return Ok((
-            plugins,
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string(),
-        ));
+        return Ok((plugins, PYTHON_MISSING.to_string()));
     }
 
     let output = run_python_script(
@@ -1116,6 +1101,7 @@ fn load_plugins(runtime: &SearchRuntime) -> Result<(Vec<SearchPlugin>, String), 
         "nova2.py",
         &["--capabilities".to_string()],
         CAPABILITIES_TIMEOUT,
+        None,
     )?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.stdout_truncated {
@@ -1206,7 +1192,7 @@ fn installed_plugins(root: &Path) -> Result<Vec<SearchPlugin>, String> {
             broken_reason: String::new(),
         });
     }
-    plugins.sort_by(|left, right| left.module.cmp(&right.module));
+    plugins.sort_unstable_by(|left, right| left.module.cmp(&right.module));
     Ok(plugins)
 }
 
@@ -1361,15 +1347,10 @@ fn run_search_process(
             .map(|token| token.to_string())
             .filter(|token| !token.is_empty()),
     );
-    let output = run_python_script(runtime, "nova2.py", &args, SEARCH_TIMEOUT)?;
+    let output = run_python_script(runtime, "nova2.py", &args, SEARCH_TIMEOUT, None)?;
     let plugins_by_url = current_plugins();
     let mut results = parse_search_results(&output.stdout, &plugins_by_url);
-    results.sort_by(|left, right| {
-        right
-            .seeds
-            .cmp(&left.seeds)
-            .then_with(|| left.name.cmp(&right.name))
-    });
+    sort_results(&mut results);
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stderr = if output.stderr_truncated {
@@ -1447,6 +1428,18 @@ fn parse_search_results(stdout: &[u8], plugins: &[SearchPlugin]) -> Vec<SearchRe
     results
 }
 
+/// Most seeds first, then by name. The result id makes the order total, so
+/// an unstable sort is deterministic across incremental merges.
+fn sort_results(results: &mut [SearchResult]) {
+    results.sort_unstable_by(|left, right| {
+        right
+            .seeds
+            .cmp(&left.seeds)
+            .then_with(|| left.name.cmp(&right.name))
+            .then(left.result_id.cmp(&right.result_id))
+    });
+}
+
 fn is_http_url(value: &str) -> bool {
     let value = value.trim();
     value.starts_with("http://") || value.starts_with("https://")
@@ -1482,10 +1475,18 @@ fn download_through_plugin(
     url: &str,
 ) -> Result<Vec<u8>, String> {
     let tmp_dir = create_plugin_temp_dir()?;
-    let args = vec![plugin.to_string(), url.to_string()];
-    let output =
-        run_python_script_in_dir(runtime, "nova2dl.py", &args, DOWNLOAD_TIMEOUT, &tmp_dir)?;
+    let args = [plugin.to_string(), url.to_string()];
     let result = (|| -> Result<Vec<u8>, String> {
+        // The private directory is both the working directory and the
+        // interpreter's temporary directory, so `helpers.download_file`
+        // (tempfile.mkstemp) writes where the containment check expects.
+        let output = run_python_script(
+            runtime,
+            "nova2dl.py",
+            &args,
+            DOWNLOAD_TIMEOUT,
+            Some(&tmp_dir),
+        )?;
         if output.stdout_truncated || output.stderr_truncated {
             return Err("search plugin download output was too large".to_string());
         }
@@ -1496,10 +1497,8 @@ fn download_through_plugin(
             }
             return Err(stderr);
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let path_str = stdout
-            .split_whitespace()
-            .next()
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let path_str = plugin_output_path(&stdout, url)
             .ok_or_else(|| "search plugin did not return a torrent file path".to_string())?;
         let path = Path::new(path_str);
         let path = if path.is_absolute() {
@@ -1531,6 +1530,18 @@ fn download_through_plugin(
     result
 }
 
+/// Plugins print `<path> <url>`. Strip the known URL so a temporary path
+/// containing spaces (for example a Windows profile directory) survives;
+/// otherwise fall back to the first whitespace-separated token.
+fn plugin_output_path<'a>(stdout: &'a str, url: &str) -> Option<&'a str> {
+    let stdout = stdout.trim();
+    stdout
+        .strip_suffix(url)
+        .map(str::trim_end)
+        .filter(|path| !path.is_empty() && !path.contains('\n'))
+        .or_else(|| stdout.split_whitespace().next())
+}
+
 fn create_plugin_temp_dir() -> Result<PathBuf, String> {
     for attempt in 0..32u64 {
         let random = crate::system_entropy_u64();
@@ -1560,21 +1571,15 @@ fn create_private_temp_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir(path)
 }
 
+/// Run a runtime script. With `temp_dir`, that private directory becomes the
+/// working directory and the interpreter's temporary directory; otherwise
+/// the script runs in the runtime root.
 fn run_python_script(
     runtime: &SearchRuntime,
     script_name: &str,
     args: &[String],
     timeout: Duration,
-) -> Result<ProcessOutput, String> {
-    run_python_script_in_dir(runtime, script_name, args, timeout, &runtime.root.clone())
-}
-
-fn run_python_script_in_dir(
-    runtime: &SearchRuntime,
-    script_name: &str,
-    args: &[String],
-    timeout: Duration,
-    working_dir: &Path,
+    temp_dir: Option<&Path>,
 ) -> Result<ProcessOutput, String> {
     let python = runtime
         .python
@@ -1588,7 +1593,7 @@ fn run_python_script_in_dir(
         .arg("utf8")
         .arg(script_path)
         .args(args)
-        .current_dir(working_dir)
+        .current_dir(temp_dir.unwrap_or(&runtime.root))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1608,9 +1613,20 @@ fn run_python_script_in_dir(
         "RUSTORRENT_SEARCH_INSECURE_SSL",
         "qbt_socks_proxy",
         "sock_proxy",
+        // Windows: Winsock and the CRT need these; without SYSTEMROOT the
+        // interpreter cannot open sockets.
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
     ] {
         if let Ok(value) = std::env::var(name) {
             command.env(name, value);
+        }
+    }
+    if let Some(temp_dir) = temp_dir {
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            command.env(name, temp_dir);
         }
     }
     command.env("PYTHONIOENCODING", "utf-8");
@@ -1837,53 +1853,42 @@ fn clean_wiki_text(text: &str) -> String {
         .replace("'''", "")
         .replace("''", "")
         .replace("&nbsp;", " ");
-    out = strip_double_brackets(&out);
-    out = strip_external_links_to_labels(&out);
+    out = strip_links(&out, true);
+    out = strip_links(&out, false);
     out = out.replace("&#124;", "|");
     collapse_whitespace(&out)
 }
 
-fn strip_double_brackets(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Replace wiki links by their labels: `[[target|label]]` when `double`,
+/// otherwise `[url label]`. Links without a label are dropped. Text is
+/// copied as string slices, so multi-byte characters stay intact.
+fn strip_links(text: &str, double: bool) -> String {
+    let close = if double { "]]" } else { "]" };
     let bytes = text.as_bytes();
-    let mut idx = 0usize;
+    let mut out = String::with_capacity(text.len());
+    let (mut idx, mut copied) = (0usize, 0usize);
     while idx < bytes.len() {
-        if bytes[idx] == b'[' && bytes.get(idx + 1) == Some(&b'[') {
-            let start = idx + 2;
-            if let Some(end_rel) = text[start..].find("]]") {
+        if bytes[idx] == b'[' && (bytes.get(idx + 1) == Some(&b'[')) == double {
+            let start = idx + 1 + usize::from(double);
+            if let Some(end_rel) = text[start..].find(close) {
+                out.push_str(&text[copied..idx]);
                 let inner = &text[start..start + end_rel];
-                if let Some((_, label)) = inner.rsplit_once('|') {
+                let label = if double {
+                    inner.rsplit_once('|')
+                } else {
+                    inner.trim().split_once(' ')
+                };
+                if let Some((_, label)) = label {
                     out.push_str(label.trim());
                 }
-                idx = start + end_rel + 2;
+                idx = start + end_rel + close.len();
+                copied = idx;
                 continue;
             }
         }
-        out.push(bytes[idx] as char);
         idx += 1;
     }
-    out
-}
-
-fn strip_external_links_to_labels(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut idx = 0usize;
-    while idx < bytes.len() {
-        if bytes[idx] == b'[' && bytes.get(idx + 1) != Some(&b'[') {
-            let start = idx + 1;
-            if let Some(end_rel) = text[start..].find(']') {
-                let inner = text[start..start + end_rel].trim();
-                if let Some((_, label)) = inner.split_once(' ') {
-                    out.push_str(label.trim());
-                }
-                idx = start + end_rel + 1;
-                continue;
-            }
-        }
-        out.push(bytes[idx] as char);
-        idx += 1;
-    }
+    out.push_str(&text[copied..]);
     out
 }
 
@@ -2256,6 +2261,81 @@ mod tests {
                 .unwrap();
         assert_eq!(bytes, b"replacement");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wiki_cleanup_keeps_multibyte_text_intact() {
+        assert_eq!(
+            clean_wiki_text("✔ qbt [[File:x.png|Ünïcode]] café [https://x.example/ label ü] ok"),
+            "✔ qbt Ünïcode café label ü ok"
+        );
+        assert_eq!(strip_links("a [[b]] c", true), "a  c");
+        assert_eq!(
+            strip_links("日本 [unterminated", false),
+            "日本 [unterminated"
+        );
+    }
+
+    #[test]
+    fn plugin_output_path_accepts_paths_with_spaces() {
+        let url = "https://example.com/a.torrent";
+        assert_eq!(
+            plugin_output_path(
+                "C:\\Users\\Jo Smith\\tmp\\x.torrent https://example.com/a.torrent\n",
+                url
+            ),
+            Some("C:\\Users\\Jo Smith\\tmp\\x.torrent")
+        );
+        assert_eq!(
+            plugin_output_path("/tmp/x.torrent https://other.example/b\n", url),
+            Some("/tmp/x.torrent")
+        );
+        assert_eq!(plugin_output_path("  \n", url), None);
+    }
+
+    #[test]
+    fn results_sort_is_total_and_deterministic() {
+        let result = |id, seeds, name: &str| SearchResult {
+            result_id: id,
+            seeds,
+            name: name.to_string(),
+            ..SearchResult::default()
+        };
+        let mut results = vec![
+            result(3, 5, "b"),
+            result(2, 5, "a"),
+            result(1, 5, "a"),
+            result(0, 9, "z"),
+        ];
+        sort_results(&mut results);
+        let ids = results.iter().map(|r| r.result_id).collect::<Vec<_>>();
+        assert_eq!(ids, [0, 1, 2, 3]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_downloads_use_the_private_directory_for_temporary_files() {
+        let Some(python) = detect_python() else {
+            return;
+        };
+        let root = create_plugin_temp_dir().unwrap();
+        fs::write(
+            root.join("nova2dl.py"),
+            "import os, sys, tempfile\n\
+             fd, path = tempfile.mkstemp()\n\
+             os.write(fd, b'd4:infoe')\n\
+             os.close(fd)\n\
+             print(path, sys.argv[2])\n",
+        )
+        .unwrap();
+        let runtime = SearchRuntime {
+            root: root.clone(),
+            python: Some(python),
+        };
+        let bytes =
+            download_through_plugin(&runtime, "engine", "https://example.com/x.torrent").unwrap();
+        assert_eq!(bytes, b"d4:infoe");
         fs::remove_dir_all(root).unwrap();
     }
 }

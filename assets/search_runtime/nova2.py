@@ -1,4 +1,4 @@
-# VERSION: 1.51
+# VERSION: 1.52
 
 # Author:
 #  Fabien Devaux <fab AT gnux DOT info>
@@ -208,8 +208,10 @@ if __name__ == "__main__":
                       f"To list available engines: {prog_name} --capabilities [--names]\n"
                       f"Found engines: {','.join(found_engines)}")
 
-        if "--capabilities" in sys.argv:
-            if "--names" in sys.argv:
+        # Only the first argument selects capabilities mode; search keywords
+        # (sys.argv[3:]) are user input and must never switch modes.
+        if len(sys.argv) > 1 and sys.argv[1] == "--capabilities":
+            if "--names" in sys.argv[2:]:
                 print(",".join((e for e in found_engines if import_engine(e) is not None)))
                 return ExitCode.OK.value
 
