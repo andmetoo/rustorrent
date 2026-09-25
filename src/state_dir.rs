@@ -347,8 +347,8 @@ mod unix {
                 io::Error::new(io::ErrorKind::InvalidInput, "path is not a state file")
             })?;
             component_name(name)?;
+            // `binding` has just verified the path binding.
             let directory = binding(&root, create)?;
-            directory.verify_binding()?;
             Ok((directory, name.to_os_string()))
         }
 
@@ -567,21 +567,23 @@ mod unix {
             .lock()
             .map_err(|_| io::Error::other("state-directory binding registry is poisoned"))?;
         let tick = registry.next_tick();
-        let directory = if let Some(record) = registry.entries.get(&key) {
+        let directory = if let Some(record) = registry.entries.get_mut(&key) {
             if let Some(directory) = record.directory.as_ref() {
+                // The pinned descriptors are unchanged, so their identity is
+                // the recorded one; only the path binding needs re-checking.
                 directory.verify_binding()?;
-                Arc::clone(directory)
-            } else {
-                let expected_identity = record.identity;
-                let directory = Arc::new(OpenStateDirectory::open(&key, false)?);
-                if directory.identity()? != expected_identity {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "state directory identity changed after descriptor eviction",
-                    ));
-                }
-                directory
+                record.last_used = tick;
+                return Ok(Arc::clone(directory));
             }
+            let expected_identity = record.identity;
+            let directory = Arc::new(OpenStateDirectory::open(&key, false)?);
+            if directory.identity()? != expected_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "state directory identity changed after descriptor eviction",
+                ));
+            }
+            directory
         } else {
             if registry.entries.len() >= MAX_KNOWN_BINDINGS {
                 return Err(io::Error::other(
@@ -590,6 +592,7 @@ mod unix {
             }
             Arc::new(OpenStateDirectory::open(&key, create)?)
         };
+        // `identity` verifies the binding as part of reading it.
         let identity = directory.identity()?;
         registry.entries.insert(
             key.clone(),
@@ -1411,7 +1414,7 @@ mod windows {
             let mut data = Vec::with_capacity((opened.info.length as usize).min(limit));
             opened
                 .file
-                .take((limit + 1) as u64)
+                .take(limit.saturating_add(1) as u64)
                 .read_to_end(&mut data)?;
             if data.len() > limit {
                 return Err(io::Error::new(

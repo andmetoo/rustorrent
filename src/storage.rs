@@ -430,7 +430,9 @@ impl Storage {
             if cursor < entry.offset {
                 return Err(Error::OutOfBounds);
             }
-            let available = entry.offset + entry.length - cursor;
+            let available = (entry.offset + entry.length)
+                .checked_sub(cursor)
+                .ok_or(Error::OutOfBounds)?;
             let take = available.min((len - done) as u64) as usize;
             if take == 0 {
                 continue;
