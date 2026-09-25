@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
+#[cfg(not(any(unix, windows)))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +21,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::torrent::TorrentMeta;
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct Storage {
     entries: Vec<FileEntry>,
     root: PathBuf,
@@ -34,7 +35,7 @@ pub struct Storage {
     write_cache_limit: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct StorageMetrics {
     pub read_ops: u64,
     pub read_ns: u64,
@@ -47,6 +48,70 @@ static READ_NS: AtomicU64 = AtomicU64::new(0);
 static WRITE_OPS: AtomicU64 = AtomicU64::new(0);
 static WRITE_NS: AtomicU64 = AtomicU64::new(0);
 
+fn record(ops: &AtomicU64, total_ns: &AtomicU64, start: Instant) {
+    ops.fetch_add(1, Ordering::Relaxed);
+    total_ns.fetch_add(
+        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(mut file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_all_at(mut file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(buf)
+}
+
 pub fn metrics_snapshot() -> StorageMetrics {
     StorageMetrics {
         read_ops: READ_OPS.load(Ordering::Relaxed),
@@ -56,18 +121,20 @@ pub fn metrics_snapshot() -> StorageMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct StorageOptions {
     pub preallocate: bool,
     pub write_cache_bytes: usize,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 struct FileEntry {
     path: PathBuf,
     offset: u64,
     length: u64,
     file: File,
+    /// Written since the last successful `flush` sync.
+    dirty: bool,
     #[cfg(windows)]
     parent_identity: crate::windows_fs::FileIdentity,
 }
@@ -78,13 +145,18 @@ struct OpenedPayload {
     parent_identity: crate::windows_fs::FileIdentity,
 }
 
-#[derive(Debug)]
+enum Transfer<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+
+#[cfg_attr(test, derive(Debug))]
 struct WriteEntry {
     offset: u64,
     data: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Debug))]
 struct FileLayout {
     path: PathBuf,
     offset: u64,
@@ -189,18 +261,20 @@ impl Storage {
                 #[cfg(windows)]
                 parent_identity: opened.parent_identity,
                 file: opened.file,
+                dirty: false,
             });
         }
         validate_distinct_files(&entries)?;
         // Validate every path and file identity before changing any file size.
         if options.preallocate {
             for entry in &entries {
-                if let Err(err) = entry.file.set_len(entry.length) {
-                    if err.raw_os_error() == Some(28) {
-                        return Err(Error::InsufficientDiskSpace);
+                entry.file.set_len(entry.length).map_err(|err| {
+                    if is_disk_full(&err) {
+                        Error::InsufficientDiskSpace
+                    } else {
+                        Error::Io(err)
                     }
-                    return Err(Error::Io(err));
-                }
+                })?;
             }
         }
 
@@ -257,6 +331,7 @@ impl Storage {
                 #[cfg(windows)]
                 parent_identity: opened.parent_identity,
                 file: opened.file,
+                dirty: false,
             });
         }
         validate_distinct_files(&entries)?;
@@ -286,165 +361,107 @@ impl Storage {
 
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
         let start = Instant::now();
-        let result = (|| {
-            let end = offset
-                .checked_add(data.len() as u64)
-                .ok_or(Error::OutOfBounds)?;
-            if end > self.total_length {
-                return Err(Error::OutOfBounds);
-            }
-            if data.is_empty() {
-                return Ok(());
-            }
-            if self.write_cache_limit == 0 {
-                return self.write_direct(offset, data);
-            }
-            if data.len() >= self.write_cache_limit {
-                self.flush_cache()?;
-                return self.write_direct(offset, data);
-            }
-            self.write_cache.push(WriteEntry {
-                offset,
-                data: data.to_vec(),
-            });
-            self.write_cache_bytes = self.write_cache_bytes.saturating_add(data.len());
-            if self.write_cache_bytes >= self.write_cache_limit {
-                self.flush_cache()?;
-            }
-            Ok(())
-        })();
-        let elapsed = start.elapsed().as_nanos() as u64;
-        WRITE_OPS.fetch_add(1, Ordering::Relaxed);
-        WRITE_NS.fetch_add(elapsed, Ordering::Relaxed);
+        let result = self.write_at_inner(offset, data);
+        record(&WRITE_OPS, &WRITE_NS, start);
         result
+    }
+
+    fn write_at_inner(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
+        self.check_bounds(offset, data.len())?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() >= self.write_cache_limit {
+            // Also covers a disabled cache (limit 0). Earlier cached writes are
+            // flushed first so overlapping ranges keep their write order.
+            self.flush_cache()?;
+            return self.transfer(offset, Transfer::Write(data));
+        }
+        self.write_cache.push(WriteEntry {
+            offset,
+            data: data.to_vec(),
+        });
+        self.write_cache_bytes = self.write_cache_bytes.saturating_add(data.len());
+        if self.write_cache_bytes >= self.write_cache_limit {
+            self.flush_cache()?;
+        }
+        Ok(())
     }
 
     pub fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
         let start = Instant::now();
-        if self.write_cache_limit > 0 {
-            let read_end = offset.saturating_add(out.len() as u64);
-            let overlaps = self.write_cache.iter().any(|entry| {
-                let entry_end = entry.offset.saturating_add(entry.data.len() as u64);
-                entry.offset < read_end && entry_end > offset
-            });
-            if overlaps {
-                self.flush_cache()?;
-            }
-        }
-        let result = self.read_direct(offset, out);
-        let elapsed = start.elapsed().as_nanos() as u64;
-        READ_OPS.fetch_add(1, Ordering::Relaxed);
-        READ_NS.fetch_add(elapsed, Ordering::Relaxed);
+        let read_end = offset.saturating_add(out.len() as u64);
+        let overlaps = self.write_cache.iter().any(|entry| {
+            let entry_end = entry.offset.saturating_add(entry.data.len() as u64);
+            entry.offset < read_end && entry_end > offset
+        });
+        let result = if overlaps { self.flush_cache() } else { Ok(()) }
+            .and_then(|()| self.transfer(offset, Transfer::Read(out)));
+        record(&READ_OPS, &READ_NS, start);
         result
     }
 
-    fn write_direct(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or(Error::OutOfBounds)?;
-        if end > self.total_length {
-            return Err(Error::OutOfBounds);
+    fn check_bounds(&self, offset: u64, len: usize) -> Result<(), Error> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.total_length => Ok(()),
+            _ => Err(Error::OutOfBounds),
         }
+    }
 
+    /// Positioned I/O across file boundaries. Entries are sorted by offset,
+    /// so the first touched file is found by binary search instead of a scan
+    /// over every file, and positioned reads/writes avoid a seek per block.
+    fn transfer(&mut self, offset: u64, mut io: Transfer<'_>) -> Result<(), Error> {
+        let len = match &io {
+            Transfer::Read(buf) => buf.len(),
+            Transfer::Write(buf) => buf.len(),
+        };
+        self.check_bounds(offset, len)?;
+        let mut index = self
+            .entries
+            .partition_point(|entry| entry.offset + entry.length <= offset);
         let mut cursor = offset;
-        let mut remaining = data;
-
-        for entry in &mut self.entries {
-            if remaining.is_empty() {
-                break;
-            }
-            let entry_end = entry.offset + entry.length;
+        let mut done = 0usize;
+        while done < len {
+            let entry = self.entries.get_mut(index).ok_or(Error::OutOfBounds)?;
+            index += 1;
+            // v2 layouts pad files to piece boundaries; the gap is not backed
+            // by any file and must never be read or written.
             if cursor < entry.offset {
                 return Err(Error::OutOfBounds);
             }
-            if cursor >= entry_end {
+            let available = entry.offset + entry.length - cursor;
+            let take = available.min((len - done) as u64) as usize;
+            if take == 0 {
                 continue;
             }
-
-            let file_offset = cursor - entry.offset;
-            let max_len = (entry_end - cursor) as usize;
-            let chunk_len = remaining.len().min(max_len);
-
-            entry.file.seek(SeekFrom::Start(file_offset))?;
-            entry.file.write_all(&remaining[..chunk_len])?;
-
-            cursor += chunk_len as u64;
-            remaining = &remaining[chunk_len..];
-        }
-
-        if !remaining.is_empty() {
-            return Err(Error::OutOfBounds);
-        }
-        Ok(())
-    }
-
-    fn read_direct(&mut self, offset: u64, out: &mut [u8]) -> Result<(), Error> {
-        let end = offset
-            .checked_add(out.len() as u64)
-            .ok_or(Error::OutOfBounds)?;
-        if end > self.total_length {
-            return Err(Error::OutOfBounds);
-        }
-
-        let mut cursor = offset;
-        let mut remaining = out;
-
-        for entry in &mut self.entries {
-            if remaining.is_empty() {
-                break;
-            }
-            let entry_end = entry.offset + entry.length;
-            if cursor < entry.offset {
-                return Err(Error::OutOfBounds);
-            }
-            if cursor >= entry_end {
-                continue;
-            }
-
-            let file_offset = cursor - entry.offset;
-            let max_len = (entry_end - cursor) as usize;
-            let chunk_len = remaining.len().min(max_len);
-
-            entry.file.seek(SeekFrom::Start(file_offset))?;
-            entry.file.read_exact(&mut remaining[..chunk_len])?;
-
-            cursor += chunk_len as u64;
-            remaining = &mut remaining[chunk_len..];
-        }
-
-        if !remaining.is_empty() {
-            return Err(Error::OutOfBounds);
-        }
-        Ok(())
-    }
-
-    fn flush_cache(&mut self) -> Result<(), Error> {
-        if self.write_cache.is_empty() {
-            return Ok(());
-        }
-        let mut pending = Vec::new();
-        std::mem::swap(&mut pending, &mut self.write_cache);
-        self.write_cache_bytes = 0;
-        let mut synced_files: HashSet<usize> = HashSet::new();
-        for (idx, entry) in pending.iter().enumerate() {
-            if let Err(err) = self.write_direct(entry.offset, &entry.data) {
-                let remaining = pending.split_off(idx);
-                let remaining_bytes: usize = remaining.iter().map(|e| e.data.len()).sum();
-                self.write_cache = remaining;
-                self.write_cache_bytes = remaining_bytes;
-                return Err(err);
-            }
-            for (fi, fe) in self.entries.iter().enumerate() {
-                let entry_end = entry.offset.saturating_add(entry.data.len() as u64);
-                let fe_end = fe.offset + fe.length;
-                if entry.offset < fe_end && entry_end > fe.offset {
-                    synced_files.insert(fi);
+            let at = cursor - entry.offset;
+            let range = done..done + take;
+            match &mut io {
+                Transfer::Read(buf) => read_exact_at(&entry.file, &mut buf[range], at)?,
+                Transfer::Write(buf) => {
+                    entry.dirty = true;
+                    write_all_at(&entry.file, &buf[range], at)?;
                 }
             }
+            done += take;
+            cursor += take as u64;
         }
-        for fi in synced_files {
-            if let Some(fe) = self.entries.get(fi) {
-                fe.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Write queued blocks to the files. Durability is established by
+    /// `flush`, which syncs every file written since the previous flush; an
+    /// fsync here would run once per cache fill or overlapping read.
+    fn flush_cache(&mut self) -> Result<(), Error> {
+        let pending = std::mem::take(&mut self.write_cache);
+        self.write_cache_bytes = 0;
+        for (idx, entry) in pending.iter().enumerate() {
+            if let Err(err) = self.transfer(entry.offset, Transfer::Write(&entry.data)) {
+                let remaining = pending.into_iter().skip(idx).collect::<Vec<_>>();
+                self.write_cache_bytes = remaining.iter().map(|e| e.data.len()).sum();
+                self.write_cache = remaining;
+                return Err(err);
             }
         }
         Ok(())
@@ -453,8 +470,11 @@ impl Storage {
     /// Persist all queued writes and report any write or sync failure.
     pub fn flush(&mut self) -> Result<(), Error> {
         self.flush_cache()?;
-        for entry in &self.entries {
-            entry.file.sync_data()?;
+        for entry in &mut self.entries {
+            if entry.dirty {
+                entry.file.sync_data()?;
+                entry.dirty = false;
+            }
         }
         Ok(())
     }
@@ -548,6 +568,15 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+fn is_disk_full(err: &std::io::Error) -> bool {
+    // ENOSPC on Unix; ERROR_HANDLE_DISK_FULL / ERROR_DISK_FULL on Windows.
+    #[cfg(windows)]
+    let full = matches!(err.raw_os_error(), Some(39 | 112));
+    #[cfg(not(windows))]
+    let full = err.raw_os_error() == Some(28);
+    full
 }
 
 fn apply_saved_file_renames(
@@ -1242,6 +1271,7 @@ fn bytes_to_os_string(bytes: &[u8]) -> Result<OsString, Error> {
 mod tests {
     use super::*;
     use crate::torrent::{FileInfo, FileTreeEntry, InfoDict};
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn dummy_meta() -> TorrentMeta {
@@ -1744,6 +1774,166 @@ mod tests {
         storage.rename_file(0, &old_path, &new_path).unwrap();
         assert_eq!(storage.file_path(0), Some(new_path.as_path()));
         assert!(new_path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn many_file_meta(files: usize, file_len: u64, zero_every: usize) -> TorrentMeta {
+        let mut meta = dummy_meta();
+        meta.info.files = (0..files)
+            .map(|index| FileInfo {
+                length: if zero_every > 0 && index % zero_every == 0 {
+                    0
+                } else {
+                    file_len
+                },
+                path: vec![format!("f{index:05}").into_bytes()],
+                attr: Vec::new(),
+            })
+            .collect();
+        let total: u64 = meta.info.files.iter().map(|file| file.length).sum();
+        meta.info.piece_length = 16_384;
+        meta.info.pieces = vec![[0u8; 20]; total.div_ceil(16_384) as usize];
+        meta
+    }
+
+    #[test]
+    fn positioned_io_spans_many_files_including_empty_ones() {
+        let dir = temp_dir("many-files");
+        fs::create_dir_all(&dir).unwrap();
+        // Every third file is empty; blocks straddle several file boundaries.
+        let meta = many_file_meta(60, 7, 3);
+        let total: u64 = meta.info.files.iter().map(|file| file.length).sum();
+        let payload = (0..total).map(|i| (i * 31 % 251) as u8).collect::<Vec<_>>();
+        let mut storage = Storage::new(
+            &meta,
+            &dir,
+            StorageOptions {
+                preallocate: false,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+        for chunk_start in (0..payload.len()).step_by(11) {
+            let end = (chunk_start + 11).min(payload.len());
+            storage
+                .write_at(chunk_start as u64, &payload[chunk_start..end])
+                .unwrap();
+        }
+        let mut out = vec![0u8; payload.len()];
+        storage.read_at(0, &mut out).unwrap();
+        assert_eq!(out, payload);
+        let mut middle = [0u8; 20];
+        storage.read_at(100, &mut middle).unwrap();
+        assert_eq!(&middle[..], &payload[100..120]);
+        storage.flush().unwrap();
+        assert!(storage.entries.iter().all(|entry| !entry.dirty));
+        assert_eq!(fs::read(dir.join("root/f00001")).unwrap(), &payload[..7]);
+        assert_eq!(fs::read(dir.join("root/f00000")).unwrap(), b"");
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_marks_only_written_files_dirty() {
+        let dir = temp_dir("dirty-files");
+        fs::create_dir_all(&dir).unwrap();
+        let mut storage = Storage::new(
+            &dummy_meta(),
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 0,
+            },
+        )
+        .unwrap();
+        storage.write_at(4, &[1]).unwrap();
+        assert!(!storage.entries[0].dirty);
+        assert!(storage.entries[1].dirty);
+        storage.flush().unwrap();
+        assert!(!storage.entries[1].dirty);
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_overlapping_writes_keep_their_order() {
+        let dir = temp_dir("cache-order");
+        fs::create_dir_all(&dir).unwrap();
+        let mut storage = Storage::new(
+            &dummy_meta(),
+            &dir,
+            StorageOptions {
+                preallocate: true,
+                write_cache_bytes: 1024,
+            },
+        )
+        .unwrap();
+        storage.write_at(2, &[1, 1, 1, 1]).unwrap();
+        storage.write_at(0, &[2, 2, 2]).unwrap();
+        // A write at least as large as the cache bypasses it only after the
+        // queued writes are applied.
+        storage.flush().unwrap();
+        let mut out = [0u8; 8];
+        storage.read_at(0, &mut out).unwrap();
+        assert_eq!(out, [2, 2, 2, 1, 1, 1, 0, 0]);
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_full_errors_are_recognized() {
+        #[cfg(not(windows))]
+        assert!(is_disk_full(&std::io::Error::from_raw_os_error(28)));
+        #[cfg(windows)]
+        assert!(is_disk_full(&std::io::Error::from_raw_os_error(112)));
+        assert!(!is_disk_full(&std::io::Error::other("x")));
+    }
+
+    /// `cargo test --release storage_io_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn storage_io_benchmark() {
+        let dir = temp_dir("bench");
+        fs::create_dir_all(&dir).unwrap();
+        let files = 4_000;
+        let meta = many_file_meta(files, 16_384, 0);
+        let block = vec![7u8; 16_384];
+        let total = files as u64 * 16_384;
+        for cache in [0usize, 1 << 20] {
+            let mut storage = Storage::new(
+                &meta,
+                &dir,
+                StorageOptions {
+                    preallocate: false,
+                    write_cache_bytes: cache,
+                },
+            )
+            .unwrap();
+            let started = Instant::now();
+            for round in 0..2u64 {
+                let mut offset = round * 8_192;
+                while offset + 16_384 <= total {
+                    storage.write_at(offset, &block).unwrap();
+                    offset += 16_384;
+                }
+            }
+            storage.flush().unwrap();
+            let write_elapsed = started.elapsed();
+            let started = Instant::now();
+            let mut out = vec![0u8; 16_384];
+            for _ in 0..4 {
+                let mut offset = 0;
+                while offset + 16_384 <= total {
+                    storage.read_at(offset, &mut out).unwrap();
+                    offset += 16_384;
+                }
+            }
+            println!(
+                "cache={cache}: write+flush {:?}, read {:?}",
+                write_elapsed,
+                started.elapsed()
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
