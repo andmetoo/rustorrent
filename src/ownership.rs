@@ -6,13 +6,15 @@ use std::path::{Component, Path, PathBuf};
 use crate::storage;
 use crate::torrent::TorrentMeta;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub enum ClaimKind {
     File,
     Tree,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub struct StorageClaim {
     path: PathBuf,
     comparison_path: PathBuf,

@@ -1,14 +1,11 @@
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bencode::{self, Value};
 use crate::xml;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FeedItem {
     pub title: String,
     pub link: String,
@@ -16,7 +13,7 @@ pub struct FeedItem {
     pub guid: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RssFeed {
     pub url: String,
     pub title: String,
@@ -25,7 +22,7 @@ pub struct RssFeed {
     pub poll_interval_secs: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RssRule {
     pub name: String,
     pub feed_url: String,
@@ -45,7 +42,6 @@ pub(crate) const MAX_RSS_RULES: usize = 1_024;
 pub(crate) const MAX_RSS_TEXT_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RSS_PATTERN_BYTES: usize = 512;
 const MAX_FEED_ITEMS: usize = 2_000;
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 impl RssState {
     pub fn new() -> Self {
@@ -226,11 +222,11 @@ pub fn seen_key(feed_url: &str, guid: &str) -> String {
     digest.update(&(feed_url.len() as u64).to_be_bytes());
     digest.update(feed_url.as_bytes());
     digest.update(guid.as_bytes());
-    let digest = digest.finalize();
-    let mut key = String::with_capacity(3 + digest.len() * 2);
-    key.push_str("v3:");
-    for byte in digest {
-        key.push_str(&format!("{byte:02x}"));
+    let mut key = String::from("v3:");
+    for byte in digest.finalize() {
+        for nibble in [byte >> 4, byte & 15] {
+            key.push(char::from(b"0123456789abcdef"[usize::from(nibble)]));
+        }
     }
     key
 }
@@ -404,7 +400,7 @@ pub fn save_rss_state(path: &Path, state: &RssState) -> Result<(), String> {
     bencode::validate_structure(&dict)
         .map_err(|err| format!("rss save: state structure exceeds parser limits: {err}"))?;
     let data = bencode::encode(&dict);
-    write_atomic(path, &data)
+    write_atomic(path, &data, true)
 }
 
 pub fn load_rss_state(path: &Path) -> Result<RssState, String> {
@@ -429,7 +425,7 @@ pub fn load_rss_state(path: &Path) -> Result<RssState, String> {
     };
     let state = parse_rss_state(&backup_data)
         .map_err(|backup_error| format!("rss parse: {primary_error}; backup: {backup_error}"))?;
-    if let Err(err) = write_atomic_inner(path, &backup_data, false) {
+    if let Err(err) = write_atomic(path, &backup_data, false) {
         eprintln!("warning: RSS backup loaded but primary restore failed: {err}");
     }
     Ok(state)
@@ -529,159 +525,14 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
-    write_atomic_inner(path, data, true)
-}
-
-fn write_atomic_inner(path: &Path, data: &[u8], rotate_backup: bool) -> Result<(), String> {
+/// Atomically replace the state file, optionally keeping the previous
+/// version as `.bak`. Uses the crate-wide writer: descriptor-pinned state
+/// directory writes on Unix/Windows, and a no-follow temp+rename elsewhere.
+fn write_atomic(path: &Path, data: &[u8], rotate_backup: bool) -> Result<(), String> {
     if data.len() > MAX_RSS_STATE_BYTES {
         return Err("rss save: state file is too large".to_string());
     }
-    #[cfg(any(unix, windows))]
-    if crate::state_dir::is_state_file_path(path) {
-        return crate::state_dir::write_atomic(
-            path,
-            data,
-            rotate_backup,
-            0o600,
-            MAX_RSS_STATE_BYTES,
-        )
-        .map_err(|err| format!("rss save state: {err}"));
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if parent != Path::new(".") {
-        if crate::state_dir::is_state_file_path(path) {
-            let download_dir = parent
-                .parent()
-                .ok_or_else(|| "rss state directory has no parent".to_string())?;
-            crate::ensure_private_state_directory(download_dir)?;
-        } else {
-            fs::create_dir_all(parent).map_err(|err| format!("rss save dir: {err}"))?;
-        }
-    }
-    let suffix = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temp = sidecar_path(path, &format!(".tmp-{}-{suffix}", std::process::id()));
-    let result = (|| -> Result<(), String> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp)
-            .map_err(|err| format!("rss save temp: {err}"))?;
-        file.write_all(data)
-            .map_err(|err| format!("rss save: {err}"))?;
-        file.sync_all()
-            .map_err(|err| format!("rss save sync: {err}"))?;
-        drop(file);
-        if rotate_backup {
-            match fs::symlink_metadata(path) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink() || !metadata.is_file() {
-                        return Err("rss save target is not a regular file".to_string());
-                    }
-                    rotate_backup_file(path, parent)?;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(format!("rss save target: {err}")),
-            }
-        }
-        fs::rename(&temp, path).map_err(|err| format!("rss save rename: {err}"))?;
-        sync_rss_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-fn rotate_backup_file(path: &Path, parent: &Path) -> Result<(), String> {
-    let backup = sidecar_path(path, ".bak");
-    match fs::symlink_metadata(&backup) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err("rss save backup is not a regular file".to_string());
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("rss save backup target: {err}")),
-    }
-
-    let mut source_options = OpenOptions::new();
-    source_options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        source_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        source_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut source = source_options
-        .open(path)
-        .map_err(|err| format!("rss save backup source: {err}"))?;
-    let metadata = source
-        .metadata()
-        .map_err(|err| format!("rss save backup source metadata: {err}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("rss save backup source is not a regular file".to_string());
-    }
-
-    let suffix = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temp = sidecar_path(&backup, &format!(".tmp-{}-{suffix}", std::process::id()));
-    let result = (|| -> Result<(), String> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut output = options
-            .open(&temp)
-            .map_err(|err| format!("rss save backup temp: {err}"))?;
-        let copied = std::io::copy(
-            &mut Read::by_ref(&mut source).take((MAX_RSS_STATE_BYTES + 1) as u64),
-            &mut output,
-        )
-        .map_err(|err| format!("rss save backup copy: {err}"))?;
-        if copied > MAX_RSS_STATE_BYTES as u64 {
-            return Err("rss save backup source is too large".to_string());
-        }
-        output
-            .sync_all()
-            .map_err(|err| format!("rss save backup sync: {err}"))?;
-        drop(output);
-
-        // Renaming a sibling temporary file replaces the directory entry
-        // itself; unlike `fs::copy`, it never follows an existing link.
-        fs::rename(&temp, &backup).map_err(|err| format!("rss save backup rename: {err}"))?;
-        sync_rss_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-#[cfg(unix)]
-fn sync_rss_directory(parent: &Path) -> Result<(), String> {
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|err| format!("rss save directory sync: {err}"))
-}
-
-#[cfg(not(unix))]
-fn sync_rss_directory(_parent: &Path) -> Result<(), String> {
-    Ok(())
+    crate::write_atomic_file(path, data, "rss", rotate_backup, true)
 }
 
 fn dict_get<'a>(dict: &'a [(Vec<u8>, Value)], key: &[u8]) -> Option<&'a Value> {
@@ -880,6 +731,15 @@ mod tests {
     }
 
     #[test]
+    fn seen_key_format_is_stable() {
+        // Persisted in rss state; the encoding must never change.
+        assert_eq!(
+            seen_key("a", "b"),
+            "v3:bfd8d48c5ab028a9c554ccc9d65ed6fc15a987f4f98cdd8bbfd5f17860493bac"
+        );
+    }
+
+    #[test]
     fn failed_downloads_remain_eligible_until_success_is_recorded() {
         let item = FeedItem {
             title: "Release".to_string(),
@@ -1031,7 +891,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rss_state_backup_rotation_rejects_symlinks_without_following_them() {
+    fn rss_state_backup_rotation_replaces_symlinks_without_following_them() {
         use std::os::unix::fs::symlink;
 
         let path = temp_file("backup-symlink");
@@ -1046,10 +906,15 @@ mod tests {
         symlink(&outside, &backup).unwrap();
         state.seen_guids.push("second".to_string());
 
-        let error = save_rss_state(&path, &state).unwrap_err();
-        assert!(error.contains("backup is not a regular file"));
+        // The backup is published by rename, which replaces the link itself
+        // rather than writing through it.
+        save_rss_state(&path, &state).unwrap();
         assert_eq!(fs::read(&outside).unwrap(), b"must not be overwritten");
-        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!fs::symlink_metadata(&backup)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&backup).unwrap(), original);
 
         let _ = fs::remove_file(&backup);
         let _ = fs::remove_file(&outside);

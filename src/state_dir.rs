@@ -67,7 +67,7 @@ mod unix {
         directory: fs::File,
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Copy, Eq, PartialEq)]
     struct BindingIdentity {
         root_device: u64,
         root_inode: u64,
@@ -933,7 +933,7 @@ mod windows {
         directory: PinnedDir,
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Copy, Eq, PartialEq)]
     struct BindingIdentity {
         root: FileIdentity,
         state: FileIdentity,

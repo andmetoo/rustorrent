@@ -39,7 +39,7 @@ fn require_network() -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SearchPlugin {
     pub module: String,
     pub display_name: String,
@@ -50,7 +50,7 @@ pub struct SearchPlugin {
     pub broken_reason: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SearchResult {
     pub result_id: u64,
     pub plugin: String,
@@ -64,7 +64,7 @@ pub struct SearchResult {
     pub pub_date: i64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SearchCatalogEntry {
     pub module: String,
     pub name: String,
@@ -76,7 +76,7 @@ pub struct SearchCatalogEntry {
     pub private_site: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct SearchState {
     plugins: Vec<SearchPlugin>,
     results: Vec<SearchResult>,
@@ -95,13 +95,12 @@ struct SearchState {
     catalog_fetched_at: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SearchRuntime {
     root: PathBuf,
     python: Option<String>,
 }
-
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 struct ProcessOutput {
     success: bool,
     stdout: Vec<u8>,

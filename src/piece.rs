@@ -13,7 +13,7 @@ pub const PRIORITY_LOW: u8 = 1;
 pub const PRIORITY_NORMAL: u8 = 2;
 pub const PRIORITY_HIGH: u8 = 3;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PieceHash {
     Sha1([u8; 20]),
     Sha256 {
@@ -56,7 +56,7 @@ impl PieceHash {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlockState {
     Missing,
     Requested,
@@ -100,14 +100,14 @@ pub struct PieceManager {
     totals: Totals,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct BlockRequest {
     pub index: u32,
     pub begin: u32,
     pub length: u32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct PieceBuffer {
     index: u32,
     length: u32,
@@ -117,25 +117,25 @@ pub struct PieceBuffer {
     _budget_reservation: Option<PieceBufferReservation>,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct PieceBufferBudget {
     limit: usize,
     used: AtomicUsize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PieceBufferBudgets {
     global: Arc<PieceBufferBudget>,
     torrent: Arc<PieceBufferBudget>,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 struct BudgetCounterPermit {
     budget: Arc<PieceBufferBudget>,
     bytes: usize,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct PieceBufferReservation {
     _torrent: BudgetCounterPermit,
     _global: BudgetCounterPermit,
