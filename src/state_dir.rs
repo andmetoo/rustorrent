@@ -392,7 +392,8 @@ mod unix {
                 ));
             }
             let mut data = Vec::with_capacity((stat.st_size as usize).min(limit));
-            file.take((limit + 1) as u64).read_to_end(&mut data)?;
+            file.take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut data)?;
             if data.len() > limit {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -446,7 +447,16 @@ mod unix {
             }
         }
 
-        fn write_entry_atomic(&self, name: &OsStr, data: &[u8], mode: u32) -> io::Result<()> {
+        /// Publish `data` under `name` via an fsynced temporary file and a
+        /// rename. `sync_directory` makes the rename itself durable; it may be
+        /// skipped when a later rename in the same directory is synced.
+        fn write_entry_atomic(
+            &self,
+            name: &OsStr,
+            data: &[u8],
+            mode: u32,
+            sync_directory: bool,
+        ) -> io::Result<()> {
             self.existing_entry_is_safe(name)?;
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let mut temporary = name.to_os_string();
@@ -476,7 +486,10 @@ mod unix {
                 file.sync_all()?;
                 drop(file);
                 self.rename(&temporary, name)?;
-                self.directory.sync_all()
+                if sync_directory {
+                    self.directory.sync_all()?;
+                }
+                Ok(())
             })();
             if result.is_err() {
                 let _ = self.unlink(&temporary);
@@ -649,13 +662,18 @@ mod unix {
                 Ok(existing) => {
                     let mut backup = name.clone();
                     backup.push(".bak");
-                    directory.write_entry_atomic(&backup, &existing, mode)?;
+                    // Both files are complete and fsynced before their
+                    // renames, and the primary's rename below syncs the
+                    // shared directory. Any subset of the two renames
+                    // surviving a crash leaves a valid primary, so the
+                    // backup's own directory sync is redundant.
+                    directory.write_entry_atomic(&backup, &existing, mode, false)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
-        directory.write_entry_atomic(&name, data, mode)
+        directory.write_entry_atomic(&name, data, mode, true)
     }
 
     pub(super) fn exists(path: &Path) -> io::Result<bool> {
@@ -1972,6 +1990,27 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"forged");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o666);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backup_rotation_keeps_the_previous_version_and_unbounded_reads_work() {
+        let root = temp_path("backup-rotation");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(".rustorrent/state.benc");
+        write_atomic(&path, b"one", true, 0o600, 1024).unwrap();
+        write_atomic(&path, b"two", true, 0o600, 1024).unwrap();
+        assert_eq!(super::read_limited(&path, usize::MAX).unwrap(), b"two");
+        let backup = root.join(".rustorrent/state.benc.bak");
+        assert_eq!(super::read_limited(&backup, 1024).unwrap(), b"one");
+        assert_eq!(fs::metadata(&backup).unwrap().mode() & 0o777, 0o600);
+        assert!(fs::read_dir(root.join(".rustorrent"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")));
         let _ = fs::remove_dir_all(&root);
     }
 
