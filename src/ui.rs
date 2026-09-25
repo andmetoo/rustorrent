@@ -260,7 +260,7 @@ const API_TOKEN_RATE_MAX: u32 = 180;
 const API_TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 const SSE_MAX_ACTIVE_CONNECTIONS: usize = 24;
 
-fn api_token() -> &'static str {
+pub(crate) fn api_token() -> &'static str {
     UI_API_TOKEN.get_or_init(generate_api_token).as_str()
 }
 
@@ -431,9 +431,10 @@ pub fn start(
     addr: String,
     state: Arc<Mutex<UiState>>,
     cmd_tx: Option<mpsc::Sender<UiCommand>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::net::SocketAddr> {
     configure_ui_owner_secret()?;
     let listener = TcpListener::bind(&addr)?;
+    let local_addr = listener.local_addr()?;
     let active_connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -450,7 +451,7 @@ pub fn start(
             });
         }
     });
-    Ok(())
+    Ok(local_addr)
 }
 
 fn handle_connection(

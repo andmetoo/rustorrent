@@ -48,5 +48,8 @@ verbose = []
 opt-level = "z"
 lto = true
 codegen-units = 1
+# Aborting on panic removes the unwinding machinery (~290 KB). Untrusted input
+# must therefore never reach a panic; parsers are fuzzed and bounds-checked.
+panic = "abort"
 overflow-checks = true
 strip = "symbols"

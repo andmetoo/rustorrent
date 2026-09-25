@@ -15,6 +15,7 @@ mod peer;
 mod peer_stream;
 mod piece;
 mod proxy;
+mod remote;
 mod rss;
 mod search;
 mod sha1;
@@ -23,6 +24,7 @@ mod state_dir;
 mod storage;
 mod torrent;
 mod tracker;
+mod tui;
 #[cfg(feature = "udp_tracker")]
 mod udp_tracker;
 mod ui;
@@ -379,6 +381,8 @@ const SIGPIPE: i32 = 13;
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Set while the terminal UI owns the screen; console logging is suppressed.
+pub(crate) static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PROGRESS_LINE_LEN: AtomicUsize = AtomicUsize::new(0);
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
@@ -919,15 +923,19 @@ fn write_to_log_file(args: std::fmt::Arguments) {
 
 pub(crate) fn log_stdout(args: std::fmt::Arguments) {
     let _guard = LOG_LOCK.lock().ok();
-    clear_progress_line();
-    println!("{args}");
+    if !TUI_ACTIVE.load(Ordering::Relaxed) {
+        clear_progress_line();
+        println!("{args}");
+    }
     write_to_log_file(args);
 }
 
 pub(crate) fn log_stderr(args: std::fmt::Arguments) {
     let _guard = LOG_LOCK.lock().ok();
-    clear_progress_line();
-    eprintln!("{args}");
+    if !TUI_ACTIVE.load(Ordering::Relaxed) {
+        clear_progress_line();
+        eprintln!("{args}");
+    }
     write_to_log_file(args);
 }
 
@@ -992,7 +1000,91 @@ fn install_panic_logger() {
     }));
 }
 
+const HELP: &str = concat!(
+    "rustorrent ",
+    env!("CARGO_PKG_VERSION"),
+    " - a compact BitTorrent client
+
+usage:
+  rustorrent [options] [file.torrent | magnet-link]
+  rustorrent remote <command>      control a running instance (rustorrent remote help)
+  rustorrent --create <path> --tracker <url> [--output <file>] [--piece-length <n>]
+
+interface:
+  --ui [port]                 web interface on 127.0.0.1 (default port 8080)
+  --ui-addr <addr>            web interface address (loopback only)
+  --tui                       interactive terminal interface
+  --daemon                    run in the background with the web interface
+  --pid-file <path>           write the process id
+  --log <path>                append logs to a file
+
+transfers:
+  --magnet <link>             add a magnet link
+  --download-dir <dir>        where downloads go (default: current directory)
+  --move-completed <dir>      move finished downloads here
+  --watch <dir>               add .torrent files dropped into a folder
+  --sequential                download pieces in order
+  --preallocate               reserve disk space up front
+  --write-cache <size>        buffer writes (k/m/g suffixes)
+  --max-active <n>            concurrently active transfers (default 4)
+  --on-complete <script>      run a program when a transfer finishes
+
+seeding:
+  --seed-ratio <ratio>        stop seeding at this ratio (0 = never)
+  --max-seed-time <minutes>   stop seeding after this long (0 = never)
+  --super-seed                super-seed completed transfers
+  --ratio-group <name:ratio:stop|pause|none>
+
+bandwidth (bytes/s, k/m/g suffixes, 0 = unlimited):
+  --download-rate <rate>  --upload-rate <rate>
+  --torrent-download-rate <rate>  --torrent-upload-rate <rate>
+  --throttle <name:down_kbps:up_kbps>
+  --schedule <secs:command>   run a scheduler command periodically
+
+network:
+  --port <port>               incoming peer port (default 6881)
+  --no-port-mapping           leave router port mapping alone
+  --encryption <disable|prefer|require>, --no-encryption
+  --utp | --no-utp            micro transport protocol (default on)
+  --peer-profile <conservative|balanced|aggressive>
+  --max-peers <n>  --max-peers-torrent <n>  --numwant <n>
+  --retry-interval <secs>     tracker retry interval (default 60)
+  --proxy <socks5://host:port | http://host:port>
+  --blocklist <path>          IP ranges to refuse
+  --geoip-db <path>           CSV country database for peer locations
+
+feeds:
+  --rss <url>                 poll an RSS/Atom feed (repeatable)
+  --rss-rule <feed:pattern>   add matching items (repeatable)
+  --rss-interval <secs>       polling interval (default 900)
+
+other:
+  --config <path>             key = value settings file (also RUSTORRENT_CONFIG)
+  -h, --help                  show this help
+  -V, --version               show the version
+"
+);
+
 fn main() {
+    let mut cli = env::args().skip(1);
+    match cli.next().as_deref() {
+        Some("remote") => {
+            if let Err(err) = remote::main(cli.collect()) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("-h" | "--help" | "help") => {
+            print!("{HELP}");
+            return;
+        }
+        Some("-V" | "--version") => {
+            println!("rustorrent {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        _ => {}
+    }
     if let Err(err) = run() {
         log_warn!("error: {err}");
         std::process::exit(1);
@@ -2770,18 +2862,26 @@ fn run() -> Result<(), String> {
         };
     });
     let (cmd_tx, cmd_rx) = mpsc::channel::<ui::UiCommand>();
-    if args.ui {
+    // The terminal UI drives the same local API as the browser, so --tui
+    // starts the API on an ephemeral loopback port when --ui is off.
+    let mut api_addr = None;
+    if args.ui || args.tui {
         search::set_network_enabled(args.proxy.is_none());
-        ui::start(args.ui_addr.clone(), state.clone(), Some(cmd_tx.clone()))
-            .map_err(|err| format!("UI bind {} failed: {err}", args.ui_addr))?;
-        log_info!("ui: http://{}", args.ui_addr);
-    }
-    if args.ui {
+        let addr = if args.ui {
+            args.ui_addr.as_str()
+        } else {
+            "127.0.0.1:0"
+        };
+        let bound = ui::start(addr.to_string(), state.clone(), Some(cmd_tx.clone()))
+            .map_err(|err| format!("UI bind {addr} failed: {err}"))?;
+        if args.ui {
+            log_info!("ui: http://{bound}");
+        }
+        api_addr = Some(bound);
         if let Err(err) = search::prepare(&args.download_dir) {
             log_warn!("search prepare error: {err}");
         }
-    }
-    if args.ui {
+
         let search_root = args.download_dir.clone();
         spawn_detached("search-refresh", move || {
             if let Err(err) = search::refresh_plugins() {
@@ -2802,17 +2902,7 @@ fn run() -> Result<(), String> {
             }
         }
     };
-    let tui_handle = if args.tui {
-        match start_tui(state.clone(), cmd_tx.clone()) {
-            Ok(handle) => Some(handle),
-            Err(err) => {
-                log_warn!("{err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let tui_handle = api_addr.filter(|_| args.tui).and_then(spawn_tui);
     let ip_filter = if let Some(path) = args.blocklist_path.as_ref() {
         match IpFilter::from_file(path) {
             Ok(filter) => Some(Arc::new(filter)),
@@ -10004,12 +10094,17 @@ fn parse_args() -> Result<Args, String> {
             idx += 2;
             continue;
         }
+        if arg.starts_with("magnet:") && magnet.is_none() {
+            magnet = Some(arg.clone());
+            idx += 1;
+            continue;
+        }
         if !arg.starts_with("--") && torrent_path.is_none() {
             torrent_path = Some(arg.clone());
             idx += 1;
             continue;
         }
-        return Err(format!("unknown argument: {arg}"));
+        return Err(format!("unknown argument: {arg} (see --help)"));
     }
     if !cfg!(feature = "mse") {
         encryption = EncryptionMode::Disable;
@@ -10046,7 +10141,7 @@ fn parse_args() -> Result<Args, String> {
         && rss_feeds.is_empty()
     {
         return Err(
-            "usage: rustorrent [path.torrent] [--magnet <link>] [--config <path>] [--download-dir <dir>] [--preallocate] [--sequential] [--move-completed <dir>] [--watch <dir>] [--ui] [--ui-addr <addr>] [--tui] [--peer-profile <conservative|balanced|aggressive>] [--retry-interval <secs>] [--numwant <n>] [--port <port>] [--encryption <disable|prefer|require>] [--no-encryption] [--utp|--no-utp] [--blocklist <path>] [--max-active <n>] [--max-peers <n>] [--max-peers-torrent <n>] [--download-rate <bps>] [--upload-rate <bps>] [--torrent-download-rate <bps>] [--torrent-upload-rate <bps>] [--write-cache <bytes>] [--log <path>] [--daemon] [--pid-file <path>] [--seed-ratio <ratio>] [--max-seed-time <minutes>] [--on-complete <script>] [--super-seed] [--throttle <name:down_kbps:up_kbps>] [--ratio-group <name:ratio:action>] [--schedule <interval_secs:command>] [--rss <url>] [--rss-rule <feed_url:pattern>] [--rss-interval <secs>] [--create <path> --tracker <url> --output <file>]".to_string(),
+            "nothing to do: pass a .torrent file or magnet link, or use --ui, --tui, --watch or --rss (see --help)".to_string(),
         );
     }
     if max_peers_torrent == 0 {
@@ -20621,599 +20716,18 @@ fn scan_watch_dir(
     }
 }
 
-// ---- TUI (--tui) ----
-
-struct TuiState {
-    selected: usize,
-    scroll_offset: usize,
-    show_detail: bool,
-    confirm_delete: Option<u64>,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn tui_terminal_size() -> (u16, u16) {
-    #[repr(C)]
-    struct Winsize {
-        ws_row: u16,
-        ws_col: u16,
-        ws_xpixel: u16,
-        ws_ypixel: u16,
-    }
-    extern "C" {
-        fn ioctl(fd: i32, request: u64, ...) -> i32;
-    }
-    #[cfg(target_os = "macos")]
-    const TIOCGWINSZ: u64 = 0x40087468;
-    #[cfg(target_os = "linux")]
-    const TIOCGWINSZ: u64 = 0x5413;
-    let mut ws = Winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe {
-        ioctl(1, TIOCGWINSZ, &mut ws as *mut Winsize);
-    }
-    (ws.ws_row, ws.ws_col)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn tui_terminal_size() -> (u16, u16) {
-    (24, 80)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn tui_set_raw_mode() -> Option<[u8; 128]> {
-    #[cfg(target_os = "macos")]
-    const TERMIOS_SIZE: usize = 72;
-    #[cfg(target_os = "linux")]
-    const TERMIOS_SIZE: usize = 60;
-    extern "C" {
-        fn tcgetattr(fd: i32, termios: *mut u8) -> i32;
-        fn tcsetattr(fd: i32, action: i32, termios: *const u8) -> i32;
-    }
-    let mut original = [0u8; 128];
-    let mut raw = [0u8; 128];
-    if unsafe { tcgetattr(0, original.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    raw[..TERMIOS_SIZE].copy_from_slice(&original[..TERMIOS_SIZE]);
-    // Clear ICANON and ECHO (both in c_lflag)
-    // c_lflag offset: macOS=16, Linux=12
-    #[cfg(target_os = "macos")]
-    const LFLAG_OFFSET: usize = 16;
-    #[cfg(target_os = "linux")]
-    const LFLAG_OFFSET: usize = 12;
-    let lflag = u64::from_ne_bytes([
-        raw[LFLAG_OFFSET],
-        raw[LFLAG_OFFSET + 1],
-        raw.get(LFLAG_OFFSET + 2).copied().unwrap_or(0),
-        raw.get(LFLAG_OFFSET + 3).copied().unwrap_or(0),
-        0,
-        0,
-        0,
-        0,
-    ]) as u32;
-    // ICANON=0x100, ECHO=0x8 on macOS; ICANON=2, ECHO=8 on Linux
-    #[cfg(target_os = "macos")]
-    let new_lflag = lflag & !(0x100 | 0x8);
-    #[cfg(target_os = "linux")]
-    let new_lflag = lflag & !(0x2 | 0x8);
-    let bytes = new_lflag.to_ne_bytes();
-    raw[LFLAG_OFFSET..LFLAG_OFFSET + 4].copy_from_slice(&bytes);
-    // Set VMIN=1, VTIME=0 for non-blocking-ish reads
-    // c_cc offset: macOS=20, Linux=17
-    #[cfg(target_os = "macos")]
-    {
-        raw[20 + 16] = 0; // VMIN index=16 on macOS -> set to 0 for non-blocking
-        raw[20 + 17] = 1; // VTIME index=17 -> 0.1s timeout
-    }
-    #[cfg(target_os = "linux")]
-    {
-        raw[17 + 6] = 0; // VMIN
-        raw[17 + 5] = 1; // VTIME
-    }
-
-    if unsafe { tcsetattr(0, 0, raw.as_ptr()) } != 0 {
-        return None;
-    }
-    Some(original)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn tui_set_raw_mode() -> Option<[u8; 128]> {
-    None
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn tui_restore_mode(original: &[u8; 128]) {
-    extern "C" {
-        fn tcsetattr(fd: i32, action: i32, termios: *const u8) -> i32;
-    }
-    unsafe {
-        tcsetattr(0, 0, original.as_ptr());
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn tui_restore_mode(_original: &[u8; 128]) {}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn tui_read_key() -> Option<u8> {
-    extern "C" {
-        fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    }
-    let mut buf = [0u8; 1];
-    let n = unsafe { read(0, buf.as_mut_ptr(), 1) };
-    if n == 1 {
-        Some(buf[0])
-    } else {
-        None
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn tui_read_key() -> Option<u8> {
-    None
-}
-
-fn tui_read_escape_seq() -> Vec<u8> {
-    let mut seq = Vec::new();
-    for _ in 0..4 {
-        if let Some(b) = tui_read_key() {
-            seq.push(b);
-            if b.is_ascii_alphabetic() || b == b'~' {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    seq
-}
-
-fn tui_format_bytes(value: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = value as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit + 1 < UNITS.len() {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{value}{}", UNITS[unit])
-    } else {
-        format!("{:.1}{}", size, UNITS[unit])
-    }
-}
-
-fn tui_format_rate(bps: f64) -> String {
-    if bps <= 0.0 || !bps.is_finite() {
-        return "0B/s".to_string();
-    }
-    let formatted = tui_format_bytes(bps as u64);
-    format!("{formatted}/s")
-}
-
-fn tui_progress_bar(percent: f64, width: usize) -> String {
-    let filled = ((percent / 100.0) * width as f64).round() as usize;
-    let empty = width.saturating_sub(filled);
-    let mut bar = String::with_capacity(width * 3);
-    for _ in 0..filled {
-        bar.push('\u{2588}');
-    }
-    for _ in 0..empty {
-        bar.push('\u{2591}');
-    }
-    bar
-}
-
-fn tui_status_color(status: &str) -> &'static str {
-    match status {
-        "seeding" | "complete" => "\x1b[32m", // green
-        "downloading" => "\x1b[33m",          // yellow
-        "error" => "\x1b[31m",                // red
-        "paused" => "\x1b[90m",               // gray
-        "announcing" | "loading" | "fetching metadata" => "\x1b[36m", // cyan
-        _ => "\x1b[0m",
-    }
-}
-
-fn tui_status_icon(status: &str, paused: bool) -> &'static str {
-    if paused {
-        "\u{23f8}"
-    } else {
-        match status {
-            "seeding" | "complete" => "\u{25b2}",
-            "downloading" | "announcing" => "\u{25b6}",
-            "error" => "\u{2717}",
-            _ => " ",
-        }
-    }
-}
-
-fn start_tui(
-    state: Arc<Mutex<ui::UiState>>,
-    cmd_tx: mpsc::Sender<ui::UiCommand>,
-) -> Result<thread::JoinHandle<()>, String> {
+fn spawn_tui(addr: SocketAddr) -> Option<thread::JoinHandle<()>> {
+    let client = remote::Client::new(&addr.to_string(), Some(ui::api_token().to_string())).ok()?;
     thread::Builder::new()
         .name("terminal-ui".to_string())
         .spawn(move || {
-        let original = match tui_set_raw_mode() {
-            Some(orig) => orig,
-            None => {
-                log_warn!("tui: failed to set raw mode");
-                return;
+            if let Err(err) = tui::run(client) {
+                log_warn!("terminal UI: {err}");
             }
-        };
-        // Enter alternate screen, hide cursor
-        let stdout = io::stdout();
-        {
-            let mut out = stdout.lock();
-            let _ = out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J");
-            let _ = out.flush();
-        }
-
-        let mut tui = TuiState {
-            selected: 0,
-            scroll_offset: 0,
-            show_detail: false,
-            confirm_delete: None,
-        };
-
-        loop {
-            if shutdown_requested() {
-                break;
-            }
-
-            // Read keyboard input
-            if let Some(key) = tui_read_key() {
-                match key {
-                    b'q' | 3 => {
-                        // q or Ctrl-C
-                        SHUTDOWN.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    b'j' | b'B' => {
-                        // down (j or arrow down sequence starts with ESC)
-                        tui.selected = tui.selected.saturating_add(1);
-                        tui.confirm_delete = None;
-                    }
-                    b'k' | b'A' => {
-                        // up
-                        tui.selected = tui.selected.saturating_sub(1);
-                        tui.confirm_delete = None;
-                    }
-                    0x1b => {
-                        // ESC - start of escape sequence
-                        let seq = tui_read_escape_seq();
-                        if seq == *b"[A" {
-                            tui.selected = tui.selected.saturating_sub(1);
-                        } else if seq == *b"[B" {
-                            tui.selected = tui.selected.saturating_add(1);
-                        }
-                        tui.confirm_delete = None;
-                    }
-                    b'\r' | b'\n' => {
-                        tui.show_detail = !tui.show_detail;
-                    }
-                    b'p' => {
-                        // Pause/resume selected torrent
-                        let guard = lock_or_recover(&state);
-                        if let Some(torrent) = guard.torrents.get(tui.selected) {
-                            let id = torrent.id;
-                            let paused = torrent.paused;
-                            drop(guard);
-                            let (reply_tx, _) = mpsc::channel();
-                            if paused {
-                                let _ = cmd_tx.send(ui::UiCommand::ResumeTorrent {
-                                    torrent_id: id,
-                                    reply: reply_tx,
-                                });
-                            } else {
-                                let _ = cmd_tx.send(ui::UiCommand::PauseTorrent {
-                                    torrent_id: id,
-                                    reply: reply_tx,
-                                });
-                            }
-                        }
-                    }
-                    b's' => {
-                        // Stop selected torrent
-                        let guard = lock_or_recover(&state);
-                        if let Some(torrent) = guard.torrents.get(tui.selected) {
-                            let id = torrent.id;
-                            drop(guard);
-                            let (reply_tx, _) = mpsc::channel();
-                            let _ = cmd_tx.send(ui::UiCommand::StopTorrent {
-                                torrent_id: id,
-                                reply: reply_tx,
-                            });
-                        }
-                    }
-                    b'd' => {
-                        // Delete selected torrent (requires confirmation)
-                        let guard = lock_or_recover(&state);
-                        if let Some(torrent) = guard.torrents.get(tui.selected) {
-                            if tui.confirm_delete == Some(torrent.id) {
-                                // Already confirming - ignore, wait for y/n
-                            } else {
-                                tui.confirm_delete = Some(torrent.id);
-                            }
-                        }
-                    }
-                    b'y' => {
-                        if let Some(id) = tui.confirm_delete.take() {
-                            let (reply_tx, _) = mpsc::channel();
-                            let _ = cmd_tx.send(ui::UiCommand::DeleteTorrent {
-                                torrent_id: id,
-                                remove_data: false,
-                                reply: reply_tx,
-                            });
-                        }
-                    }
-                    b'n' => {
-                        tui.confirm_delete = None;
-                    }
-                    b'r' => {
-                        // Recheck selected torrent
-                        let guard = lock_or_recover(&state);
-                        if let Some(torrent) = guard.torrents.get(tui.selected) {
-                            let id = torrent.id;
-                            drop(guard);
-                            let (reply_tx, _) = mpsc::channel();
-                            let _ = cmd_tx.send(ui::UiCommand::RecheckTorrent {
-                                torrent_id: id,
-                                reply: reply_tx,
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Render frame
-            let (rows, cols) = tui_terminal_size();
-            let cols = cols as usize;
-            let rows = rows as usize;
-            if rows < 5 || cols < 30 {
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-
-            let guard = lock_or_recover(&state);
-            let torrent_count = guard.torrents.len();
-            if torrent_count > 0 && tui.selected >= torrent_count {
-                tui.selected = torrent_count - 1;
-            }
-
-            // Calculate layout
-            let header_rows = 1;
-            let footer_rows = 1;
-            let detail_rows = if tui.show_detail { 6.min(rows / 3) } else { 0 };
-            let list_rows = rows.saturating_sub(header_rows + footer_rows + detail_rows);
-
-            // Adjust scroll
-            if tui.selected < tui.scroll_offset {
-                tui.scroll_offset = tui.selected;
-            }
-            if tui.selected >= tui.scroll_offset + list_rows {
-                tui.scroll_offset = tui.selected.saturating_sub(list_rows - 1);
-            }
-
-            let mut frame = String::with_capacity(cols * rows * 3);
-
-            // Header: status bar
-            frame.push_str("\x1b[H");
-            let total_down_rate: f64 = guard.torrents.iter().map(|t| t.download_rate_bps).sum();
-            let total_up_rate: f64 = guard.torrents.iter().map(|t| t.upload_rate_bps).sum();
-            let active = guard
-                .torrents
-                .iter()
-                .filter(|t| t.status == "downloading" || t.status == "seeding")
-                .count();
-            let header = format!(
-                " \x1b[1mRustorrent 0.1.0\x1b[0m  \x1b[32m\u{2193}\x1b[0m {} \x1b[36m\u{2191}\x1b[0m {}  [{}/{}]",
-                tui_format_rate(total_down_rate),
-                tui_format_rate(total_up_rate),
-                active,
-                torrent_count,
-            );
-            frame.push_str(&header);
-            let header_visible = strip_ansi_len(&header);
-            if header_visible < cols {
-                for _ in 0..(cols - header_visible) {
-                    frame.push(' ');
-                }
-            }
-
-            // Torrent list
-            for row in 0..list_rows {
-                let idx = tui.scroll_offset + row;
-                frame.push_str(&format!("\x1b[{};1H", header_rows + row + 1));
-                if idx < torrent_count {
-                    let t = &guard.torrents[idx];
-                    let selected = idx == tui.selected;
-                    let pct = if t.total_bytes > 0 {
-                        (t.completed_bytes as f64 / t.total_bytes as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    let bar_width = 10.min(cols / 5);
-                    let bar = tui_progress_bar(pct, bar_width);
-                    let icon = tui_status_icon(&t.status, t.paused);
-                    let color = tui_status_color(&t.status);
-                    let reset = "\x1b[0m";
-
-                    let right = if t.status == "seeding" || t.status == "complete" {
-                        format!("seeding \u{2191}{}", tui_format_rate(t.upload_rate_bps))
-                    } else if t.status == "downloading" {
-                        format!(
-                            "{:.0}% \u{2193}{}",
-                            pct,
-                            tui_format_rate(t.download_rate_bps)
-                        )
-                    } else {
-                        t.status.clone()
-                    };
-
-                    let name_max = cols.saturating_sub(bar_width + right.len() + 8);
-                    let name: String = if t.name.len() > name_max {
-                        t.name
-                            .chars()
-                            .take(name_max.saturating_sub(1))
-                            .collect::<String>()
-                            + "\u{2026}"
-                    } else {
-                        t.name.clone()
-                    };
-                    let name_pad = name_max.saturating_sub(name.len());
-
-                    let sel_start = if selected { "\x1b[7m" } else { "" };
-                    let sel_end = if selected { "\x1b[0m" } else { "" };
-
-                    let line = format!(
-                        "{sel_start} {icon} {color}{name}{reset}{sel_start}{:name_pad$} [{bar}] {right} {sel_end}",
-                        "",
-                        name_pad = name_pad,
-                    );
-                    frame.push_str(&line);
-                    let visible_len = strip_ansi_len(&line);
-                    if visible_len < cols {
-                        for _ in 0..(cols - visible_len) {
-                            frame.push(' ');
-                        }
-                    }
-                    if selected {
-                        frame.push_str("\x1b[0m");
-                    }
-                } else {
-                    // Empty row
-                    for _ in 0..cols {
-                        frame.push(' ');
-                    }
-                }
-            }
-
-            // Detail panel
-            if tui.show_detail && tui.selected < torrent_count {
-                let t = &guard.torrents[tui.selected];
-                let detail_start = header_rows + list_rows + 1;
-                let ratio_val = if t.downloaded_bytes > 0 {
-                    t.uploaded_bytes as f64 / t.downloaded_bytes as f64
-                } else {
-                    0.0
-                };
-                let eta = if t.eta_secs > 0 {
-                    let h = t.eta_secs / 3600;
-                    let m = (t.eta_secs % 3600) / 60;
-                    let s = t.eta_secs % 60;
-                    if h > 0 {
-                        format!("{h}h{m:02}m{s:02}s")
-                    } else {
-                        format!("{m}m{s:02}s")
-                    }
-                } else {
-                    "--:--".to_string()
-                };
-
-                let details = [
-                    format!(" Name: {}", t.name),
-                    format!(
-                        " Size: {}  Down: {}  Up: {}",
-                        tui_format_bytes(t.total_bytes),
-                        tui_format_bytes(t.downloaded_bytes),
-                        tui_format_bytes(t.uploaded_bytes)
-                    ),
-                    format!(
-                        " Ratio: {:.2}  ETA: {}  Peers: {}/{}",
-                        ratio_val, eta, t.active_peers, t.tracker_peers
-                    ),
-                    format!(" Hash: {}", t.info_hash),
-                    format!(" Dir: {}", t.download_dir),
-                    format!(" Files: {}", t.files.len()),
-                ];
-
-                for (i, detail) in details.iter().enumerate() {
-                    if i >= detail_rows {
-                        break;
-                    }
-                    frame.push_str(&format!("\x1b[{};1H\x1b[90m", detail_start + i));
-                    let truncated: String = detail.chars().take(cols).collect();
-                    frame.push_str(&truncated);
-                    let pad = cols.saturating_sub(truncated.len());
-                    for _ in 0..pad {
-                        frame.push(' ');
-                    }
-                    frame.push_str("\x1b[0m");
-                }
-            }
-
-            // Footer: keybinds
-            frame.push_str(&format!("\x1b[{};1H", rows));
-            let confirm_msg = if let Some(id) = tui.confirm_delete {
-                format!(" Delete torrent {id}? [y/n] ")
-            } else {
-                String::new()
-            };
-            if !confirm_msg.is_empty() {
-                frame.push_str("\x1b[33;1m");
-                frame.push_str(&confirm_msg);
-                let pad = cols.saturating_sub(confirm_msg.len());
-                for _ in 0..pad {
-                    frame.push(' ');
-                }
-                frame.push_str("\x1b[0m");
-            } else {
-                let footer =
-                    " [q]uit [p]ause [r]echeck [s]top [d]elete [Enter]detail [\u{2191}\u{2193}]nav";
-                frame.push_str("\x1b[7m");
-                let truncated: String = footer.chars().take(cols).collect();
-                frame.push_str(&truncated);
-                let flen = strip_ansi_len(&truncated);
-                for _ in 0..cols.saturating_sub(flen) {
-                    frame.push(' ');
-                }
-                frame.push_str("\x1b[0m");
-            }
-
-            drop(guard);
-
-            // Write frame
-            {
-                let mut out = stdout.lock();
-                let _ = out.write_all(frame.as_bytes());
-                let _ = out.flush();
-            }
-
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        // Restore terminal
-        {
-            let mut out = stdout.lock();
-            let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
-            let _ = out.flush();
-        }
-        tui_restore_mode(&original);
-    })
-        .map_err(|err| format!("terminal UI worker could not start: {err}"))
-}
-
-fn strip_ansi_len(s: &str) -> usize {
-    let mut len = 0usize;
-    let mut in_escape = false;
-    for ch in s.chars() {
-        if in_escape {
-            if ch.is_ascii_alphabetic() || ch == 'm' {
-                in_escape = false;
-            }
-        } else if ch == '\x1b' {
-            in_escape = true;
-        } else {
-            len += 1;
-        }
-    }
-    len
+            request_shutdown();
+        })
+        .map_err(|err| {
+            log_warn!("terminal UI worker could not start: {err}");
+        })
+        .ok()
 }
