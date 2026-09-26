@@ -1260,6 +1260,7 @@ fn bytes_to_os_string(bytes: &[u8]) -> Result<OsString, Error> {
 mod tests {
     use super::*;
     use crate::torrent::{FileInfo, FileTreeEntry, InfoDict};
+    #[cfg(unix)]
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 

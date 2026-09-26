@@ -138,7 +138,7 @@ impl<'a> Request<'a> {
 
 enum HttpStream {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 trait DeadlineStream: Read + Write {
@@ -606,7 +606,7 @@ fn connect_stream(parsed: &ParsedUrl, request: &Request<'_>) -> Result<HttpStrea
         Scheme::Https => {
             let connector = TlsConnector::new().map_err(|err| err.to_string())?;
             let stream = connect_tls(&connector, &parsed.host, stream, budget)?;
-            Ok(HttpStream::Tls(stream))
+            Ok(HttpStream::Tls(Box::new(stream)))
         }
     }
 }
