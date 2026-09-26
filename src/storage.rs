@@ -178,17 +178,17 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(err) => write!(f, "io error: {err}"),
-            Error::InvalidName => write!(f, "invalid torrent name"),
-            Error::InvalidPathSegment => write!(f, "invalid path segment"),
-            Error::InvalidFiles => write!(f, "invalid file list"),
-            Error::InvalidLength => write!(f, "invalid length"),
-            Error::OutOfBounds => write!(f, "read/write out of bounds"),
-            Error::SymlinkNotAllowed => write!(f, "symlinks are not allowed in torrent paths"),
-            Error::InsufficientDiskSpace => write!(f, "insufficient disk space"),
-            Error::PayloadInUse => write!(f, "torrent payload is already in use"),
-        }
+        f.write_str(match self {
+            Error::Io(err) => return write!(f, "io error: {err}"),
+            Error::InvalidName => "invalid torrent name",
+            Error::InvalidPathSegment => "invalid path segment",
+            Error::InvalidFiles => "invalid file list",
+            Error::InvalidLength => "invalid length",
+            Error::OutOfBounds => "read/write out of bounds",
+            Error::SymlinkNotAllowed => "symlinks are not allowed in torrent paths",
+            Error::InsufficientDiskSpace => "insufficient disk space",
+            Error::PayloadInUse => "torrent payload is already in use",
+        })
     }
 }
 
@@ -215,42 +215,70 @@ impl Storage {
         options: StorageOptions,
         file_renames: &[(usize, String)],
     ) -> Result<Self, Error> {
+        Self::open(meta, download_dir, options, file_renames, true)
+    }
+
+    /// Open an existing payload without creating directories or files. This is
+    /// used to verify a crash-recovery destination before adopting it.
+    pub fn open_existing_with_file_renames(
+        meta: &TorrentMeta,
+        download_dir: &Path,
+        file_renames: &[(usize, String)],
+    ) -> Result<Self, Error> {
+        Self::open(
+            meta,
+            download_dir,
+            StorageOptions::default(),
+            file_renames,
+            false,
+        )
+    }
+
+    fn open(
+        meta: &TorrentMeta,
+        download_dir: &Path,
+        options: StorageOptions,
+        file_renames: &[(usize, String)],
+        create: bool,
+    ) -> Result<Self, Error> {
         let mut layouts = build_layout(meta, download_dir)?;
-        #[cfg(unix)]
-        raise_open_file_limit();
         apply_saved_file_renames(&mut layouts, file_renames)?;
         validate_no_reserved_state_paths(download_dir, &layouts)?;
-        fs::create_dir_all(download_dir)?;
+        let total_length = layouts
+            .iter()
+            .try_fold(0u64, |end, layout| {
+                Some(end.max(layout.offset.checked_add(layout.length)?))
+            })
+            .ok_or(Error::InvalidLength)?;
+        #[cfg(unix)]
+        raise_open_file_limit();
+        if create {
+            fs::create_dir_all(download_dir)?;
+        }
         #[cfg(unix)]
         let root_directory = open_directory_no_follow(download_dir)?;
         #[cfg(windows)]
         let root_directory =
             crate::windows_fs::PinnedDir::open(download_dir).map_err(windows_path_error)?;
-        let total_length = layouts.iter().try_fold(0u64, |end, layout| {
-            layout
-                .offset
-                .checked_add(layout.length)
-                .map(|layout_end| end.max(layout_end))
-        });
-        let total_length = total_length.ok_or(Error::InvalidLength)?;
         let mut entries = Vec::with_capacity(layouts.len());
         for layout in layouts {
             #[cfg(unix)]
-            let opened = open_payload_file_unix(&root_directory, download_dir, &layout.path, true)?;
+            let opened =
+                open_payload_file_unix(&root_directory, download_dir, &layout.path, create)?;
             #[cfg(windows)]
             let opened =
-                open_payload_file_windows(&root_directory, download_dir, &layout.path, true)?;
+                open_payload_file_windows(&root_directory, download_dir, &layout.path, create)?;
             #[cfg(not(any(unix, windows)))]
             let opened = {
-                if let Some(parent) = layout.path.parent() {
+                if let Some(parent) = layout.path.parent().filter(|_| create) {
                     if !parent.as_os_str().is_empty() {
                         create_dir_secure(download_dir, parent)?;
                     }
                 }
-                open_payload_file(&layout.path, true)?
+                open_payload_file(&layout.path, create)?
             };
             opened.file.try_lock().map_err(|_| Error::PayloadInUse)?;
-            if opened.file.metadata()?.len() > layout.length {
+            if create && opened.file.metadata()?.len() > layout.length {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "existing file is larger than the torrent file; choose another download folder",
@@ -268,7 +296,7 @@ impl Storage {
         }
         validate_distinct_files(&entries)?;
         // Validate every path and file identity before changing any file size.
-        if options.preallocate {
+        if create && options.preallocate {
             for entry in &entries {
                 entry.file.set_len(entry.length).map_err(|err| {
                     if is_disk_full(&err) {
@@ -283,73 +311,12 @@ impl Storage {
         Ok(Self {
             entries,
             root: download_dir.to_path_buf(),
-            #[cfg(unix)]
-            root_directory,
-            #[cfg(windows)]
+            #[cfg(any(unix, windows))]
             root_directory,
             total_length,
             write_cache: Vec::new(),
             write_cache_bytes: 0,
             write_cache_limit: options.write_cache_bytes,
-        })
-    }
-
-    /// Open an existing payload without creating directories or files. This is
-    /// used to verify a crash-recovery destination before adopting it.
-    pub fn open_existing_with_file_renames(
-        meta: &TorrentMeta,
-        download_dir: &Path,
-        file_renames: &[(usize, String)],
-    ) -> Result<Self, Error> {
-        let mut layouts = build_layout(meta, download_dir)?;
-        #[cfg(unix)]
-        raise_open_file_limit();
-        apply_saved_file_renames(&mut layouts, file_renames)?;
-        let total_length = layouts.iter().try_fold(0u64, |end, layout| {
-            layout
-                .offset
-                .checked_add(layout.length)
-                .map(|layout_end| end.max(layout_end))
-        });
-        let total_length = total_length.ok_or(Error::InvalidLength)?;
-        #[cfg(unix)]
-        let root_directory = open_directory_no_follow(download_dir)?;
-        #[cfg(windows)]
-        let root_directory =
-            crate::windows_fs::PinnedDir::open(download_dir).map_err(windows_path_error)?;
-        let mut entries = Vec::with_capacity(layouts.len());
-        for layout in layouts {
-            #[cfg(unix)]
-            let opened =
-                open_payload_file_unix(&root_directory, download_dir, &layout.path, false)?;
-            #[cfg(windows)]
-            let opened =
-                open_payload_file_windows(&root_directory, download_dir, &layout.path, false)?;
-            #[cfg(not(any(unix, windows)))]
-            let opened = open_payload_file(&layout.path, false)?;
-            opened.file.try_lock().map_err(|_| Error::PayloadInUse)?;
-            entries.push(FileEntry {
-                path: layout.path,
-                offset: layout.offset,
-                length: layout.length,
-                #[cfg(windows)]
-                parent_identity: opened.parent_identity,
-                file: opened.file,
-                dirty: false,
-            });
-        }
-        validate_distinct_files(&entries)?;
-        Ok(Self {
-            entries,
-            root: download_dir.to_path_buf(),
-            #[cfg(unix)]
-            root_directory,
-            #[cfg(windows)]
-            root_directory,
-            total_length,
-            write_cache: Vec::new(),
-            write_cache_bytes: 0,
-            write_cache_limit: 0,
         })
     }
 
@@ -1131,50 +1098,34 @@ fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayou
         }]);
     }
 
-    if meta.info.files.is_empty() && meta.info.file_tree.is_empty() {
+    // v1/hybrid metadata lists `files`; v2-only metadata has a file tree.
+    let files: Vec<(&[Vec<u8>], u64)> = if meta.info.files.is_empty() {
+        let tree = meta.info.file_tree.iter();
+        tree.map(|file| (file.path.as_slice(), file.length))
+            .collect()
+    } else {
+        let list = meta.info.files.iter();
+        list.map(|file| (file.path.as_slice(), file.length))
+            .collect()
+    };
+    if files.is_empty() {
         return Err(Error::InvalidFiles);
     }
-
-    let base = root;
-    let mut layouts = if !meta.info.files.is_empty() {
-        Vec::with_capacity(meta.info.files.len())
-    } else {
-        Vec::with_capacity(meta.info.file_tree.len())
-    };
-    if !meta.info.files.is_empty() {
-        let file_offsets = meta.file_offsets().ok_or(Error::InvalidLength)?;
-        for (file, file_offset) in meta.info.files.iter().zip(file_offsets) {
-            if file.path.is_empty() {
-                return Err(Error::InvalidPathSegment);
-            }
-            let mut path = base.clone();
-            for segment in &file.path {
-                let segment = clean_segment(segment)?;
-                path.push(segment);
-            }
-            layouts.push(FileLayout {
-                path,
-                offset: file_offset,
-                length: file.length,
-            });
+    let file_offsets = meta.file_offsets().ok_or(Error::InvalidLength)?;
+    let mut layouts = Vec::with_capacity(files.len());
+    for ((segments, length), offset) in files.into_iter().zip(file_offsets) {
+        if segments.is_empty() {
+            return Err(Error::InvalidPathSegment);
         }
-    } else {
-        let file_offsets = meta.file_offsets().ok_or(Error::InvalidLength)?;
-        for (file, file_offset) in meta.info.file_tree.iter().zip(file_offsets) {
-            if file.path.is_empty() {
-                return Err(Error::InvalidPathSegment);
-            }
-            let mut path = base.clone();
-            for segment in &file.path {
-                let segment = clean_segment(segment)?;
-                path.push(segment);
-            }
-            layouts.push(FileLayout {
-                path,
-                offset: file_offset,
-                length: file.length,
-            });
+        let mut path = root.clone();
+        for segment in segments {
+            path.push(clean_segment(segment)?);
         }
+        layouts.push(FileLayout {
+            path,
+            offset,
+            length,
+        });
     }
 
     let laid_out_content = layouts

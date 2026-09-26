@@ -154,14 +154,14 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::InvalidPieceLength => write!(f, "invalid piece length"),
-            Error::InvalidPieces => write!(f, "invalid pieces"),
-            Error::InvalidBitfield => write!(f, "invalid bitfield"),
-            Error::InvalidPiece => write!(f, "invalid piece index"),
-            Error::InvalidBlock => write!(f, "invalid block"),
-            Error::InvalidPriority => write!(f, "invalid priority"),
-        }
+        f.write_str(match self {
+            Error::InvalidPieceLength => "invalid piece length",
+            Error::InvalidPieces => "invalid pieces",
+            Error::InvalidBitfield => "invalid bitfield",
+            Error::InvalidPiece => "invalid piece index",
+            Error::InvalidBlock => "invalid block",
+            Error::InvalidPriority => "invalid priority",
+        })
     }
 }
 
