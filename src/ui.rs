@@ -513,181 +513,55 @@ fn handle_connection(
     }
 
     if request.method == "POST" {
-        if path == "/torrent/open-folder" {
-            if let Err(err) = handle_open_folder(&query, &state) {
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/torrent/pause"
-            || path == "/torrent/resume"
-            || path == "/torrent/stop"
-            || path == "/torrent/archive"
-            || path == "/torrent/delete"
-        {
-            if let Err(err) = handle_torrent_action(&path, &query, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/add-torrent" {
-            let torrent_id = match handle_add_torrent(&request, &query, &state, &cmd_tx) {
-                Ok(torrent_id) => torrent_id,
-                Err(err) => {
-                    update_error(&state, &err);
-                    return send_api_error(stream, &err);
+        // Ok(Some(id)) reports a new transfer id; errors other than from the
+        // folder helpers are also surfaced in the UI state.
+        let result: Result<Option<u64>, String> = match path.as_str() {
+            "/torrent/open-folder" => {
+                return match handle_open_folder(&query, &state) {
+                    Ok(()) => send_api_ok(stream),
+                    Err(err) => send_api_error(stream, &err),
                 }
-            };
-            return send_api_ok_with_torrent_id(stream, torrent_id);
-        }
-        if path == "/add-magnet" {
-            let torrent_id = match handle_add_magnet(&request, &state, &cmd_tx) {
-                Ok(torrent_id) => torrent_id,
-                Err(err) => {
-                    update_error(&state, &err);
-                    return send_api_error(stream, &err);
+            }
+            "/select-download-dir" => {
+                return match handle_select_download_dir() {
+                    Ok(path) => send_api_ok_with_path(stream, path.as_deref().unwrap_or("")),
+                    Err(err) => send_api_error(stream, &err),
                 }
-            };
-            return send_api_ok_with_torrent_id(stream, torrent_id);
-        }
-        if path == "/select-download-dir" {
-            match handle_select_download_dir() {
-                Ok(Some(path)) => return send_api_ok_with_path(stream, &path),
-                Ok(None) => return send_api_ok_with_path(stream, ""),
-                Err(err) => return send_api_error(stream, &err),
             }
-        }
-        if path == "/file-priority" {
-            if let Err(err) = handle_file_priority(&request, &state, &cmd_tx) {
+            "/torrent/pause" | "/torrent/resume" | "/torrent/stop" | "/torrent/archive"
+            | "/torrent/delete" => handle_torrent_action(&path, &query, &cmd_tx).map(|_| None),
+            "/add-torrent" => handle_add_torrent(&request, &query, &state, &cmd_tx).map(Some),
+            "/add-magnet" => handle_add_magnet(&request, &state, &cmd_tx).map(Some),
+            "/file-priority" => handle_file_priority(&request, &state, &cmd_tx).map(|_| None),
+            "/rename-file" => handle_rename_file(&request, &state, &cmd_tx).map(|_| None),
+            "/rate-limits" => handle_rate_limits(&request, &state, &cmd_tx).map(|_| None),
+            "/torrent/recheck" => handle_torrent_recheck(&query, &cmd_tx).map(|_| None),
+            "/settings/seed-ratio" => handle_set_seed_ratio(&request, &cmd_tx).map(|_| None),
+            "/settings/peer-profile" => handle_set_peer_profile(&request, &cmd_tx).map(|_| None),
+            "/torrent/set-label" => handle_set_label(&request, &state, &cmd_tx).map(|_| None),
+            "/torrent/add-tracker" => handle_add_tracker(&request, &cmd_tx).map(|_| None),
+            "/torrent/remove-tracker" => handle_remove_tracker(&request, &cmd_tx).map(|_| None),
+            "/rss/add-feed" => handle_rss_add_feed(&request, &cmd_tx).map(|_| None),
+            "/rss/remove-feed" => handle_rss_remove_feed(&request, &cmd_tx).map(|_| None),
+            "/rss/add-rule" => handle_rss_add_rule(&request, &cmd_tx).map(|_| None),
+            "/rss/remove-rule" => handle_rss_remove_rule(&request, &cmd_tx).map(|_| None),
+            "/search/install-url" => handle_search_install_url(&request).map(|_| None),
+            "/search/install-plugin" => {
+                handle_search_install_plugin(&request, &query).map(|_| None)
+            }
+            "/search/remove-plugin" => handle_search_remove_plugin(&request).map(|_| None),
+            "/search/run" => handle_search_run(&request).map(|_| None),
+            "/search/add-result" => handle_search_add_result(&request, &state, &cmd_tx).map(Some),
+            _ => return send_api_error_with_status(stream, 404, "unknown endpoint"),
+        };
+        return match result {
+            Ok(Some(torrent_id)) => send_api_ok_with_torrent_id(stream, torrent_id),
+            Ok(None) => send_api_ok(stream),
+            Err(err) => {
                 update_error(&state, &err);
-                return send_api_error(stream, &err);
+                send_api_error(stream, &err)
             }
-            return send_api_ok(stream);
-        }
-        if path == "/rename-file" {
-            if let Err(err) = handle_rename_file(&request, &state, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/rate-limits" {
-            if let Err(err) = handle_rate_limits(&request, &state, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/torrent/recheck" {
-            if let Err(err) = handle_torrent_recheck(&query, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/settings/seed-ratio" {
-            if let Err(err) = handle_set_seed_ratio(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/settings/peer-profile" {
-            if let Err(err) = handle_set_peer_profile(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/torrent/set-label" {
-            if let Err(err) = handle_set_label(&request, &state, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/torrent/add-tracker" {
-            if let Err(err) = handle_add_tracker(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/torrent/remove-tracker" {
-            if let Err(err) = handle_remove_tracker(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/rss/add-feed" {
-            if let Err(err) = handle_rss_add_feed(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/rss/remove-feed" {
-            if let Err(err) = handle_rss_remove_feed(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/rss/add-rule" {
-            if let Err(err) = handle_rss_add_rule(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/rss/remove-rule" {
-            if let Err(err) = handle_rss_remove_rule(&request, &cmd_tx) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/search/install-url" {
-            if let Err(err) = handle_search_install_url(&request) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/search/install-plugin" {
-            if let Err(err) = handle_search_install_plugin(&request, &query) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/search/remove-plugin" {
-            if let Err(err) = handle_search_remove_plugin(&request) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/search/run" {
-            if let Err(err) = handle_search_run(&request) {
-                update_error(&state, &err);
-                return send_api_error(stream, &err);
-            }
-            return send_api_ok(stream);
-        }
-        if path == "/search/add-result" {
-            let torrent_id = match handle_search_add_result(&request, &state, &cmd_tx) {
-                Ok(torrent_id) => torrent_id,
-                Err(err) => {
-                    update_error(&state, &err);
-                    return send_api_error(stream, &err);
-                }
-            };
-            return send_api_ok_with_torrent_id(stream, torrent_id);
-        }
-        return send_api_error_with_status(stream, 404, "unknown endpoint");
+        };
     }
 
     if let Some(index) = UI_ASSETS.iter().position(|(asset, _, _)| *asset == path) {
@@ -1349,8 +1223,7 @@ fn handle_add_magnet(
     state: &Arc<Mutex<UiState>>,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<u64, String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
+    let form = form_pairs(request);
     let magnet = query_value(&form, "magnet").unwrap_or("").to_string();
     if magnet.trim().is_empty() {
         return Err("magnet link is empty".to_string());
@@ -1387,22 +1260,17 @@ fn handle_file_priority(
     state: &Arc<Mutex<UiState>>,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let index = query_value(&form, "index")
-        .ok_or_else(|| "missing index".to_string())?
+    let form = form_pairs(request);
+    let index = required(&form, "index")?
         .parse::<usize>()
         .map_err(|_| "invalid index".to_string())?;
-    let priority = query_value(&form, "priority")
-        .ok_or_else(|| "missing priority".to_string())?
+    let priority = required(&form, "priority")?
         .parse::<u8>()
         .map_err(|_| "invalid priority".to_string())?;
     if priority > 3 {
         return Err("invalid priority (expected 0 through 3)".to_string());
     }
-    let torrent_id = query_value(&form, "id")
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
+    let torrent_id = torrent_id(&form)?;
 
     dispatch_command_ok(cmd_tx, |reply| UiCommand::SetFilePriority {
         torrent_id,
@@ -1434,15 +1302,11 @@ fn handle_rename_file(
     state: &Arc<Mutex<UiState>>,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let index = query_value(&form, "index")
-        .ok_or_else(|| "missing index".to_string())?
+    let form = form_pairs(request);
+    let index = required(&form, "index")?
         .parse::<usize>()
         .map_err(|_| "invalid index".to_string())?;
-    let new_name = query_value(&form, "name")
-        .ok_or_else(|| "missing name".to_string())?
-        .to_string();
+    let new_name = required(&form, "name")?.to_string();
     if new_name.is_empty()
         || new_name.len() > 255
         || new_name.contains('/')
@@ -1454,9 +1318,7 @@ fn handle_rename_file(
     {
         return Err("invalid file name".to_string());
     }
-    let torrent_id = query_value(&form, "id")
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
+    let torrent_id = torrent_id(&form)?;
 
     dispatch_command_ok(cmd_tx, |reply| UiCommand::RenameFile {
         torrent_id,
@@ -1495,11 +1357,8 @@ fn handle_rss_add_feed(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let url = query_value(&form, "url")
-        .ok_or_else(|| "missing url".to_string())?
-        .to_string();
+    let form = form_pairs(request);
+    let url = required(&form, "url")?.to_string();
     if url.is_empty() {
         return Err("empty url".to_string());
     }
@@ -1525,11 +1384,8 @@ fn handle_rss_remove_feed(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let url = query_value(&form, "url")
-        .ok_or_else(|| "missing url".to_string())?
-        .to_string();
+    let form = form_pairs(request);
+    let url = required(&form, "url")?.to_string();
     dispatch_command_ok(cmd_tx, |reply| UiCommand::RemoveRssFeed {
         url: url.clone(),
         reply,
@@ -1540,15 +1396,10 @@ fn handle_rss_add_rule(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let name = query_value(&form, "name")
-        .ok_or_else(|| "missing name".to_string())?
-        .to_string();
+    let form = form_pairs(request);
+    let name = required(&form, "name")?.to_string();
     let feed_url = query_value(&form, "feed_url").unwrap_or("").to_string();
-    let pattern = query_value(&form, "pattern")
-        .ok_or_else(|| "missing pattern".to_string())?
-        .to_string();
+    let pattern = required(&form, "pattern")?.to_string();
     if name.trim().is_empty() || name.len() > 128 {
         return Err("invalid rule name".to_string());
     }
@@ -1570,11 +1421,8 @@ fn handle_rss_remove_rule(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let name = query_value(&form, "name")
-        .ok_or_else(|| "missing name".to_string())?
-        .to_string();
+    let form = form_pairs(request);
+    let name = required(&form, "name")?.to_string();
     dispatch_command_ok(cmd_tx, |reply| UiCommand::RemoveRssRule {
         name: name.clone(),
         reply,
@@ -1623,12 +1471,8 @@ fn rss_status_json() -> String {
 }
 
 fn handle_search_install_url(request: &HttpRequest) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let url = query_value(&form, "url")
-        .ok_or_else(|| "missing url".to_string())?
-        .trim()
-        .to_string();
+    let form = form_pairs(request);
+    let url = required(&form, "url")?.trim().to_string();
     if url.is_empty() {
         return Err("empty url".to_string());
     }
@@ -1643,20 +1487,14 @@ fn handle_search_install_plugin(
     if request.body.is_empty() {
         return Err("empty plugin upload".to_string());
     }
-    let filename = query_value(query, "filename")
-        .ok_or_else(|| "missing filename".to_string())?
-        .to_string();
+    let filename = required(query, "filename")?.to_string();
     let _ = crate::search::install_plugin_from_bytes(&filename, &request.body)?;
     Ok(())
 }
 
 fn handle_search_remove_plugin(request: &HttpRequest) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let module = query_value(&form, "module")
-        .ok_or_else(|| "missing module".to_string())?
-        .trim()
-        .to_string();
+    let form = form_pairs(request);
+    let module = required(&form, "module")?.trim().to_string();
     if module.is_empty() {
         return Err("empty module".to_string());
     }
@@ -1664,12 +1502,8 @@ fn handle_search_remove_plugin(request: &HttpRequest) -> Result<(), String> {
 }
 
 fn handle_search_run(request: &HttpRequest) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let query = query_value(&form, "query")
-        .ok_or_else(|| "missing query".to_string())?
-        .trim()
-        .to_string();
+    let form = form_pairs(request);
+    let query = required(&form, "query")?.trim().to_string();
     let category = query_value(&form, "category").unwrap_or("all").to_string();
     let engines = query_value(&form, "engines")
         .unwrap_or("")
@@ -1685,10 +1519,8 @@ fn handle_search_add_result(
     state: &Arc<Mutex<UiState>>,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<u64, String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let index = query_value(&form, "index")
-        .ok_or_else(|| "missing index".to_string())?
+    let form = form_pairs(request);
+    let index = required(&form, "index")?
         .parse::<u64>()
         .map_err(|_| "invalid index".to_string())?;
     let download_dir = query_value(&form, "dir").unwrap_or("").to_string();
@@ -1736,14 +1568,11 @@ fn handle_rate_limits(
     state: &Arc<Mutex<UiState>>,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let download_kbps = query_value(&form, "download_kbps")
-        .ok_or_else(|| "missing download_kbps".to_string())?
+    let form = form_pairs(request);
+    let download_kbps = required(&form, "download_kbps")?
         .parse::<u64>()
         .map_err(|_| "invalid download_kbps".to_string())?;
-    let upload_kbps = query_value(&form, "upload_kbps")
-        .ok_or_else(|| "missing upload_kbps".to_string())?
+    let upload_kbps = required(&form, "upload_kbps")?
         .parse::<u64>()
         .map_err(|_| "invalid upload_kbps".to_string())?;
     if download_kbps > MAX_RATE_LIMIT_KBPS || upload_kbps > MAX_RATE_LIMIT_KBPS {
@@ -1770,9 +1599,7 @@ fn handle_torrent_recheck(
     query: &[(String, String)],
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let torrent_id = query_value(query, "id")
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
+    let torrent_id = torrent_id(query)?;
     dispatch_command_ok(cmd_tx, |reply| UiCommand::RecheckTorrent {
         torrent_id,
         reply,
@@ -1783,10 +1610,8 @@ fn handle_set_seed_ratio(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let ratio = query_value(&form, "ratio")
-        .ok_or_else(|| "missing ratio".to_string())?
+    let form = form_pairs(request);
+    let ratio = required(&form, "ratio")?
         .parse::<f64>()
         .map_err(|_| "invalid ratio".to_string())?;
     if !ratio.is_finite() || !(0.0..=10.0).contains(&ratio) {
@@ -1799,8 +1624,7 @@ fn handle_set_peer_profile(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
+    let form = form_pairs(request);
     let profile = query_value(&form, "profile")
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1817,11 +1641,8 @@ fn handle_set_label(
     state: &Arc<Mutex<UiState>>,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let torrent_id = query_value(&form, "id")
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
+    let form = form_pairs(request);
+    let torrent_id = torrent_id(&form)?;
     let label = query_value(&form, "label").unwrap_or("").to_string();
     if label.len() > MAX_LABEL_BYTES || label.chars().any(char::is_control) {
         return Err("invalid label".to_string());
@@ -1844,14 +1665,9 @@ fn handle_add_tracker(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let torrent_id = query_value(&form, "id")
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
-    let url = query_value(&form, "url")
-        .ok_or_else(|| "missing tracker url".to_string())?
-        .to_string();
+    let form = form_pairs(request);
+    let torrent_id = torrent_id(&form)?;
+    let url = required(&form, "url")?.to_string();
     if url.trim().is_empty() {
         return Err("tracker url is empty".to_string());
     }
@@ -1866,14 +1682,9 @@ fn handle_remove_tracker(
     request: &HttpRequest,
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let body_str = String::from_utf8_lossy(&request.body);
-    let form = parse_query_pairs(&body_str);
-    let torrent_id = query_value(&form, "id")
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
-    let url = query_value(&form, "url")
-        .ok_or_else(|| "missing tracker url".to_string())?
-        .to_string();
+    let form = form_pairs(request);
+    let torrent_id = torrent_id(&form)?;
+    let url = required(&form, "url")?.to_string();
     dispatch_command_ok(cmd_tx, |reply| UiCommand::RemoveTracker {
         torrent_id,
         url,
@@ -1928,9 +1739,7 @@ fn handle_torrent_action(
     query: &[(String, String)],
     cmd_tx: &Option<mpsc::Sender<UiCommand>>,
 ) -> Result<(), String> {
-    let torrent_id = query_value(query, "id")
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
+    let torrent_id = torrent_id(query)?;
     enum TorrentActionKind {
         Pause,
         Resume,
@@ -1965,9 +1774,7 @@ fn handle_open_folder(
     query: &[(String, String)],
     state: &Arc<Mutex<UiState>>,
 ) -> Result<(), String> {
-    let torrent_id = query_value(query, "id")
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "missing torrent id".to_string())?;
+    let torrent_id = torrent_id(query)?;
     let guard = lock_state(state);
     let torrent = guard
         .torrents
@@ -2004,6 +1811,20 @@ fn handle_open_folder(
             .map_err(|err| format!("open failed: {err}"))?;
     }
     Ok(())
+}
+
+fn form_pairs(request: &HttpRequest) -> Vec<(String, String)> {
+    parse_query_pairs(&String::from_utf8_lossy(&request.body))
+}
+
+fn required<'a>(pairs: &'a [(String, String)], key: &str) -> Result<&'a str, String> {
+    query_value(pairs, key).ok_or_else(|| format!("missing {key}"))
+}
+
+fn torrent_id(pairs: &[(String, String)]) -> Result<u64, String> {
+    query_value(pairs, "id")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "missing torrent id".to_string())
 }
 
 fn query_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
