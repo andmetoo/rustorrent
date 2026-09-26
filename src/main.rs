@@ -315,6 +315,8 @@ const OPTIMISTIC_UNCHOKE_INTERVAL: Duration = Duration::from_secs(30);
 const METADATA_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TRANSFER_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PEER_RETRIES: u32 = 8;
+const MAX_KNOWN_PEERS: usize = 4096;
+const MAX_PEX_PEERS_PER_MESSAGE: usize = 100;
 const PEER_RETRY_BASE_SECS: u64 = 2;
 const NO_PEER_REANNOUNCE_SECS: u64 = 30;
 const PEER_BAN_SECS: u64 = 60;
@@ -6594,6 +6596,10 @@ impl PeerQueue {
             if self.is_banned(addr) {
                 continue;
             }
+            // Bound memory: DHT and PEX can supply unbounded address lists.
+            if !self.known.contains(&addr) && self.known.len() >= MAX_KNOWN_PEERS {
+                continue;
+            }
             self.known.insert(addr);
             if self.queued.contains(&addr) || self.inflight.contains(&addr) {
                 continue;
@@ -6704,8 +6710,13 @@ impl PeerQueue {
         self.inflight.remove(&addr);
         self.deferred.retain(|entry| entry.addr != addr);
         self.failures.remove(&addr);
-        let until = Instant::now() + duration;
-        self.banned.insert(addr, until);
+        let now = Instant::now();
+        if self.banned.len() >= MAX_KNOWN_PEERS {
+            self.banned.retain(|_, until| *until > now);
+        }
+        if self.banned.len() < MAX_KNOWN_PEERS {
+            self.banned.insert(addr, now + duration);
+        }
     }
 
     fn len(&self) -> usize {
@@ -10497,23 +10508,15 @@ fn spawn_tracker_announces(
 }
 
 fn generate_peer_id() -> [u8; 20] {
+    // Random suffix from the OS source: a time/pid seed gave torrents
+    // started in the same instant identical peer ids.
     let mut out = [0u8; 20];
     out[..8].copy_from_slice(b"-RT0001-");
-    let mut seed = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos() as u64,
-        Err(_) => 0,
-    };
-    seed ^= std::process::id() as u64;
-    for slot in &mut out[8..] {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        *slot = (seed & 0xff) as u8;
-    }
+    out[8..16].copy_from_slice(&system_entropy_u64().to_le_bytes());
+    out[16..].copy_from_slice(&system_entropy_u64().to_le_bytes()[..4]);
     out
 }
 
-/// Concurrent version of download_from_peer that works with Arc<Mutex<>> shared state
 /// How often per-connection housekeeping (choke decisions, timeouts, HAVE
 /// broadcasts, piece-state refresh) runs. Message handling itself is not
 /// throttled by this interval.
@@ -12588,6 +12591,8 @@ fn parse_ut_pex(payload: &[u8]) -> Result<Vec<SocketAddr>, String> {
     if let Some(Value::Bytes(bytes)) = dict_get(&dict, b"added6") {
         peers.extend(decode_compact_peers6(bytes));
     }
+    // BEP 11 messages carry at most 50 added peers; ignore any excess.
+    peers.truncate(MAX_PEX_PEERS_PER_MESSAGE);
     Ok(peers)
 }
 
@@ -15586,6 +15591,33 @@ mod core_helpers_tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn peer_discovery_input_is_bounded() {
+        let mut queue = PeerQueue::new(None);
+        let peers = (0..(MAX_KNOWN_PEERS as u32 + 500)).map(|n| {
+            let [_, a, b, c] = n.to_be_bytes();
+            SocketAddr::from(([8, a, b, c], 6881))
+        });
+        queue.enqueue_with_source(peers, PeerSource::Dht);
+        assert_eq!(queue.known_len(), MAX_KNOWN_PEERS);
+        assert_eq!(queue.len(), MAX_KNOWN_PEERS);
+
+        let compact: Vec<u8> = (0..300u16)
+            .flat_map(|n| {
+                let [hi, lo] = n.to_be_bytes();
+                [8, 8, hi, lo, 0x1a, 0xe1]
+            })
+            .collect();
+        let payload = bencode::encode(&Value::Dict(vec![(
+            b"added".to_vec(),
+            Value::Bytes(compact),
+        )]));
+        assert_eq!(
+            parse_ut_pex(&payload).unwrap().len(),
+            MAX_PEX_PEERS_PER_MESSAGE
+        );
     }
 
     #[test]
