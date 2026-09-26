@@ -369,6 +369,7 @@ const SHUTDOWN_SLEEP_SLICE_MS: u64 = 50;
 const TORRENT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const TORRENT_RESOURCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const WATCH_FILE_SETTLE_TIME: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 const SIGINT: i32 = 2;
@@ -12836,28 +12837,27 @@ fn handle_upload_request<W: Write>(
         return Err("request out of bounds".to_string());
     }
 
+    // Read the block straight into the wire frame: one allocation and no
+    // extra copy per uploaded block.
     let offset = piece_start.saturating_add(begin as u64);
-    let mut buf = vec![0u8; length as usize];
-    {
-        let mut s = lock_or_recover(storage);
-        s.read_at(offset, &mut buf)
-            .map_err(|err| format!("read failed: {err}"))?;
-    }
+    let mut frame = Vec::with_capacity(13 + length as usize);
+    frame.extend_from_slice(&(9 + length).to_be_bytes());
+    frame.push(7);
+    frame.extend_from_slice(&index.to_be_bytes());
+    frame.extend_from_slice(&begin.to_be_bytes());
+    frame.resize(13 + length as usize, 0);
+    lock_or_recover(storage)
+        .read_at(offset, &mut frame[13..])
+        .map_err(|err| format!("read failed: {err}"))?;
 
     if !limits.global_up.throttle_until(length as usize, stop_flag)
         || !limits.torrent_up.throttle_until(length as usize, stop_flag)
     {
         return Err("torrent stopping".to_string());
     }
-    peer::write_message(
-        stream,
-        &peer::Message::Piece {
-            index,
-            begin,
-            block: buf,
-        },
-    )
-    .map_err(|err| format!("piece write failed: {err}"))?;
+    stream
+        .write_all(&frame)
+        .map_err(|err| format!("piece write failed: {err}"))?;
     uploaded.fetch_add(length as u64, Ordering::SeqCst);
     SESSION_UPLOADED_BYTES.fetch_add(length as u64, Ordering::SeqCst);
     upload_requests_served.fetch_add(1, Ordering::SeqCst);
@@ -15564,6 +15564,48 @@ mod core_helpers_tests {
             assert_eq!(pieces.reserve_piece_for_peer(2, &[0x80], false), Some(0));
         }
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watch_folder_waits_for_files_that_are_still_being_written() {
+        let root = temp_path("watch-settle");
+        let watch = root.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        let session_store = SessionStore::load(&root).unwrap();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let in_flight = empty_in_flight();
+        let path = watch.join("new.torrent");
+        fs::write(&path, test_torrent_bytes()).unwrap();
+        let mut queue = VecDeque::new();
+        let mut next_id = 1;
+        let scan = |queue: &mut VecDeque<TorrentRequest>, next_id: &mut u64| {
+            scan_watch_dir(
+                &watch,
+                queue,
+                &None,
+                next_id,
+                &root,
+                false,
+                &registry,
+                &session_store,
+                &in_flight,
+            )
+        };
+        scan(&mut queue, &mut next_id);
+        assert!(queue.is_empty());
+        assert!(path.exists());
+
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
+        scan(&mut queue, &mut next_id);
+        assert_eq!(queue.len(), 1);
+        assert!(!path.exists());
+        assert!(watch.join("processed").join("new.torrent").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -20954,6 +20996,17 @@ fn scan_watch_dir(
         }
         let ext = path.extension().and_then(|e| e.to_str());
         if ext != Some("torrent") {
+            continue;
+        }
+        // A file that is still being copied in would be read truncated,
+        // rejected and then moved away; wait until it has settled.
+        let settled = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_none_or(|age| age >= WATCH_FILE_SETTLE_TIME);
+        if !settled {
             continue;
         }
         let data = match read_file_limited(&path, MAX_TORRENT_BYTES, true) {
