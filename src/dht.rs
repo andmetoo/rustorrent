@@ -19,7 +19,7 @@ use crate::sha1;
 
 const DHT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often each torrent runs an iterative get_peers lookup (and announce).
-const QUERY_INTERVAL: Duration = Duration::from_secs(60);
+const QUERY_INTERVAL: Duration = Duration::from_secs(120);
 /// Concurrent get_peers lookups across all torrents.
 const MAX_PEER_LOOKUPS: usize = 8;
 const BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(60);
