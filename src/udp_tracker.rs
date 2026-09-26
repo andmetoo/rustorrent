@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
-use std::thread;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::tracker::{sanitize_failure_reason, TrackerResponse};
@@ -15,18 +13,8 @@ const RESPONSE_CONNECT_LEN: usize = 16;
 const RESPONSE_HEADER_LEN: usize = 20;
 const ACTION_ERROR: u32 = 3;
 const MAX_CONNECTION_CACHE_ENTRIES: usize = 1024;
-const MAX_UDP_RESOLVER_WORKERS: usize = 16;
-const MAX_UDP_RESOLVED_ADDRESSES: usize = 16;
+#[cfg(test)]
 const UDP_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-static ACTIVE_UDP_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
-
-struct UdpResolverGuard;
-
-impl Drop for UdpResolverGuard {
-    fn drop(&mut self) {
-        ACTIVE_UDP_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 /// BEP 15 specifies 15 * 2^n seconds. We use up to 3 retries (15s, 30s, 60s).
 const BEP15_BASE_TIMEOUT_SECS: u64 = 15;
@@ -370,11 +358,10 @@ fn parse_announce_response(
                 u16::from_be_bytes([response[pos + 4], response[pos + 5]]),
             )
         };
-        if port == 0 {
-            return Err(Error::InvalidPeers);
-        }
-        peers.push(SocketAddr::new(ip, port));
         pos += stride;
+        if port != 0 {
+            peers.push(SocketAddr::new(ip, port));
+        }
     }
 
     Ok(TrackerResponse {
@@ -393,8 +380,8 @@ fn is_timeout(err: &Error) -> bool {
         )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn announce(
     url: &str,
     info_hash: [u8; 20],
@@ -595,160 +582,6 @@ fn announce_to_addr(
     Err(last_err.unwrap_or(Error::InvalidResponse))
 }
 
-#[allow(dead_code)]
-const ACTION_SCRAPE: u32 = 2;
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct ScrapeResult {
-    pub seeders: u32,
-    pub leechers: u32,
-    #[allow(dead_code)]
-    pub completed: u32,
-}
-
-/// Send a scrape request and parse the response.
-#[allow(dead_code)]
-fn send_scrape(
-    socket: &UdpSocket,
-    connection_id: u64,
-    info_hash: [u8; 20],
-    budget: RequestBudget,
-    attempt_timeout: Duration,
-    scrape_tx: u32,
-) -> Result<ScrapeResult, Error> {
-    let attempt = budget.for_attempt(attempt_timeout)?;
-    let mut scrape_req = Vec::with_capacity(36);
-    scrape_req.extend_from_slice(&connection_id.to_be_bytes());
-    scrape_req.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
-    scrape_req.extend_from_slice(&scrape_tx.to_be_bytes());
-    scrape_req.extend_from_slice(&info_hash);
-    attempt.configure_socket(socket, attempt_timeout)?;
-    socket.send(&scrape_req)?;
-
-    let mut response = [0u8; 128];
-    loop {
-        attempt.configure_socket(socket, attempt_timeout)?;
-        let n = socket.recv(&mut response)?;
-        if n < 8 {
-            continue;
-        }
-        let resp_tx = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
-        if resp_tx != scrape_tx {
-            continue;
-        }
-        let action = u32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-        if action == ACTION_ERROR {
-            return Err(parse_error_response(&response[..n], scrape_tx));
-        }
-        if n < 20 {
-            return Err(Error::InvalidResponse);
-        }
-        if action != ACTION_SCRAPE {
-            return Err(Error::InvalidAction);
-        }
-        let seeders = u32::from_be_bytes([response[8], response[9], response[10], response[11]]);
-        let completed =
-            u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
-        let leechers = u32::from_be_bytes([response[16], response[17], response[18], response[19]]);
-
-        return Ok(ScrapeResult {
-            seeders,
-            leechers,
-            completed,
-        });
-    }
-}
-
-#[allow(dead_code)]
-pub fn scrape(url: &str, info_hash: [u8; 20]) -> Result<ScrapeResult, Error> {
-    scrape_until(url, info_hash, Instant::now() + UDP_TRACKER_REQUEST_TIMEOUT)
-}
-
-#[allow(dead_code)]
-fn scrape_until(url: &str, info_hash: [u8; 20], deadline: Instant) -> Result<ScrapeResult, Error> {
-    let global_budget = RequestBudget::new(deadline);
-    let addrs = parse_udp_urls_with_budget(url, global_budget)?;
-    let mut last_err = None;
-    for (index, addr) in addrs.iter().copied().enumerate() {
-        let candidate_budget = split_candidate_budget(global_budget, addrs.len() - index)?;
-        match scrape_addr(addr, info_hash, candidate_budget) {
-            Ok(response) => return Ok(response),
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(last_err.unwrap_or(Error::InvalidUrl))
-}
-
-#[allow(dead_code)]
-fn scrape_addr(
-    addr: SocketAddr,
-    info_hash: [u8; 20],
-    budget: RequestBudget,
-) -> Result<ScrapeResult, Error> {
-    budget.remaining()?;
-    let bind_addr: &str = if addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = UdpSocket::bind(bind_addr)?;
-    socket.connect(addr)?;
-
-    let mut last_err: Option<Error> = None;
-    let connect_transaction_id = next_transaction_id();
-    let scrape_transaction_id = next_transaction_id();
-
-    for attempt in 0..BEP15_MAX_RETRIES {
-        budget.remaining()?;
-        let attempt_timeout = Duration::from_secs(BEP15_BASE_TIMEOUT_SECS * (1 << attempt));
-
-        let (connection_id, was_cached) = match obtain_connection_id(
-            &socket,
-            &addr,
-            budget,
-            attempt_timeout,
-            connect_transaction_id,
-        ) {
-            Ok(pair) => pair,
-            Err(e) if is_timeout(&e) => {
-                last_err = Some(e);
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-
-        match send_scrape(
-            &socket,
-            connection_id,
-            info_hash,
-            budget,
-            attempt_timeout,
-            scrape_transaction_id,
-        ) {
-            Ok(resp) => return Ok(resp),
-            Err(e) if is_timeout(&e) => {
-                if was_cached {
-                    clear_cached_connection_id(&addr);
-                }
-                last_err = Some(e);
-                continue;
-            }
-            Err(e) => {
-                if was_cached {
-                    clear_cached_connection_id(&addr);
-                    last_err = Some(e);
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
-
-    budget.remaining()?;
-    Err(last_err.unwrap_or(Error::InvalidResponse))
-}
-
 #[cfg(test)]
 fn parse_udp_url(url: &str) -> Result<SocketAddr, Error> {
     parse_udp_urls_with_budget(
@@ -780,52 +613,22 @@ fn parse_udp_urls_with_budget(url: &str, budget: RequestBudget) -> Result<Vec<So
         };
     }
 
-    if ACTIVE_UDP_RESOLVERS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_UDP_RESOLVER_WORKERS).then_some(active + 1)
-        })
-        .is_err()
-    {
-        return Err(Error::Timeout);
+    let (host, port) = host_port.rsplit_once(':').ok_or(Error::InvalidUrl)?;
+    let port = port.parse::<u16>().map_err(|_| Error::InvalidUrl)?;
+    let mut candidates = Vec::new();
+    let resolved = crate::http::resolve_host(host, port, budget.deadline)
+        .map_err(|err| Error::Io(std::io::Error::other(err)))?;
+    for addr in resolved {
+        let addr = normalize_udp_tracker_addr(addr);
+        if addr.port() != 0 && !addr.ip().is_unspecified() && !candidates.contains(&addr) {
+            candidates.push(addr);
+        }
     }
-    let host_port = host_port.to_string();
-    let (tx, rx) = mpsc::sync_channel(1);
-    if let Err(err) = thread::Builder::new()
-        .name("udp-tracker-resolve".to_string())
-        .spawn(move || {
-            let _guard = UdpResolverGuard;
-            let resolved = host_port
-                .to_socket_addrs()
-                .map_err(Error::Io)
-                .and_then(|addrs| {
-                    let mut candidates = Vec::new();
-                    for addr in addrs.take(MAX_UDP_RESOLVED_ADDRESSES) {
-                        let addr = normalize_udp_tracker_addr(addr);
-                        if addr.port() != 0
-                            && !addr.ip().is_unspecified()
-                            && !candidates.contains(&addr)
-                        {
-                            candidates.push(addr);
-                        }
-                    }
-                    if candidates.is_empty() {
-                        Err(Error::InvalidUrl)
-                    } else {
-                        Ok(candidates)
-                    }
-                });
-            let _ = tx.try_send(resolved);
-        })
-    {
-        ACTIVE_UDP_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
-        return Err(Error::Io(err));
-    }
-
-    let resolved = rx
-        .recv_timeout(budget.remaining()?)
-        .map_err(|_| Error::Timeout)??;
     budget.remaining()?;
-    Ok(resolved)
+    if candidates.is_empty() {
+        return Err(Error::InvalidUrl);
+    }
+    Ok(candidates)
 }
 
 fn normalize_udp_tracker_addr(addr: SocketAddr) -> SocketAddr {
@@ -940,6 +743,18 @@ mod tests {
     }
 
     #[test]
+    fn announce_response_skips_port_zero_peers() {
+        let transaction = 7u32;
+        let mut response = Vec::new();
+        for word in [ACTION_ANNOUNCE, transaction, 60, 0, 2] {
+            response.extend_from_slice(&word.to_be_bytes());
+        }
+        response.extend_from_slice(&[10, 0, 0, 1, 0, 0, 10, 0, 0, 2, 0x1A, 0xE1]);
+        let parsed = parse_announce_response(&response, transaction, false).unwrap();
+        assert_eq!(parsed.peers, vec!["10.0.0.2:6881".parse().unwrap()]);
+    }
+
+    #[test]
     fn connect_response_allows_trailing_extension_bytes() {
         let tracker = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1035,7 +850,7 @@ mod tests {
         for addr in &addrs {
             clear_cached_connection_id(addr);
         }
-        let (key_tx, key_rx) = mpsc::channel();
+        let (key_tx, key_rx) = std::sync::mpsc::channel();
 
         let first_key_tx = key_tx.clone();
         let first = std::thread::spawn(move || {
@@ -1137,42 +952,6 @@ mod tests {
         assert_eq!(first, again);
         assert_ne!(first, other);
         assert_ne!(first, other_swarm);
-    }
-
-    #[test]
-    fn scrape_response_allows_trailing_extension_bytes() {
-        let tracker = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.connect(tracker.local_addr().unwrap()).unwrap();
-        let server = std::thread::spawn(move || {
-            let mut request = [0u8; 64];
-            let (length, source) = tracker.recv_from(&mut request).unwrap();
-            assert_eq!(length, 36);
-            let transaction = &request[12..16];
-            let mut response = Vec::new();
-            response.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
-            response.extend_from_slice(transaction);
-            response.extend_from_slice(&7u32.to_be_bytes());
-            response.extend_from_slice(&11u32.to_be_bytes());
-            response.extend_from_slice(&13u32.to_be_bytes());
-            response.extend_from_slice(b"extension");
-            tracker.send_to(&response, source).unwrap();
-        });
-
-        let budget = RequestBudget::new(Instant::now() + Duration::from_secs(1));
-        let result = send_scrape(
-            &client,
-            99,
-            [3u8; 20],
-            budget,
-            Duration::from_secs(1),
-            0x1234_5678,
-        )
-        .unwrap();
-        assert_eq!(result.seeders, 7);
-        assert_eq!(result.completed, 11);
-        assert_eq!(result.leechers, 13);
-        server.join().unwrap();
     }
 
     #[test]

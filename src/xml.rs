@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 pub struct XmlNode {
     pub tag: String,
     pub attrs: Vec<(String, String)>,
@@ -188,7 +186,6 @@ impl Parser<'_> {
         self.nodes += 1;
 
         let mut attrs = Vec::new();
-        let mut attribute_names = HashSet::new();
         loop {
             self.skip_whitespace();
             if self.remaining().starts_with("/>") {
@@ -207,7 +204,7 @@ impl Parser<'_> {
             let key = self.parse_name()?;
             if attrs.len() >= MAX_XML_ATTRIBUTES_PER_ELEMENT
                 || self.attributes >= MAX_XML_ATTRIBUTES
-                || !attribute_names.insert(key.clone())
+                || attrs.iter().any(|(existing, _)| *existing == key)
             {
                 return None;
             }
