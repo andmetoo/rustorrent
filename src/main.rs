@@ -11160,12 +11160,13 @@ impl<'a> PeerConn<'a> {
                         // Endgame can hand back this peer's own piece.
                         Some(_) => self.next_reserve_at = now + PIECE_RESERVE_RETRY,
                         None => {
-                            if self.active_pieces.is_empty()
-                                && self.pending.is_empty()
-                                && !pieces.has_needed_piece(bits)
-                                && !(endgame && pieces.remaining_blocks() > 0)
-                                && !pieces.is_complete()
-                            {
+                            // A peer with nothing we need is still worth
+                            // keeping while it downloads from us.
+                            let useful = self.peer_interested
+                                || pieces.has_needed_piece(bits)
+                                || (endgame && pieces.remaining_blocks() > 0)
+                                || pieces.is_complete();
+                            if self.active_pieces.is_empty() && self.pending.is_empty() && !useful {
                                 log_debug!("peer {} has no needed pieces", self.addr);
                                 return Ok(PeerStep::Close);
                             }
@@ -15590,6 +15591,33 @@ mod core_helpers_tests {
             assert_eq!(pieces.reserve_piece_for_peer(2, &[0x80], false), Some(0));
         }
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn peer_without_needed_pieces_is_kept_while_it_downloads_from_us() {
+        let root = temp_path("keep-interested-peer");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(38, &root);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        let mut stream = PeerStream::tcp(client);
+        let addr: SocketAddr = "203.0.113.9:6881".parse().unwrap();
+        let mut conn = PeerConn::new(&context, addr, 1);
+        conn.bitfield = Some(vec![0]);
+        conn.choked = false;
+        conn.peer_interested = true;
+        assert!(matches!(
+            conn.fill_requests(&mut stream).unwrap(),
+            PeerStep::Continue
+        ));
+        conn.peer_interested = false;
+        conn.next_reserve_at = Instant::now();
+        assert!(matches!(
+            conn.fill_requests(&mut stream).unwrap(),
+            PeerStep::Close
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 
