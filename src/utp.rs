@@ -572,13 +572,7 @@ struct SynLimiter {
 
 impl SynLimiter {
     fn normalized_ip(addr: SocketAddr) -> IpAddr {
-        match addr.ip() {
-            IpAddr::V6(ip) => ip
-                .to_ipv4_mapped()
-                .map(IpAddr::V4)
-                .unwrap_or(IpAddr::V6(ip)),
-            ip => ip,
-        }
+        normalize_ip(addr.ip())
     }
 
     fn allows(&self, addr: SocketAddr) -> bool {
