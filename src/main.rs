@@ -4546,60 +4546,31 @@ fn run_torrent_once(
     publish_piece_state(&context, &lock_or_recover(&pieces));
     cancelled()?;
     register_session(registry, Arc::clone(&context))?;
-    let resume_handle = match start_resume_worker(
-        resume_path.clone(),
-        meta.info_hash,
-        meta.info.piece_length,
-        Arc::clone(&pieces),
-        Arc::clone(&storage),
-        Arc::clone(&file_priorities),
-        Arc::clone(&file_spans),
-        Arc::clone(&downloaded),
-        Arc::clone(&uploaded),
-        Arc::clone(&peer_queue),
-        Arc::clone(&stop_flag),
-        Arc::clone(&context.file_renames),
-        Arc::clone(&context.resume_save_requested),
-    ) {
+    let resume_handle = match start_resume_worker(resume_path.clone(), Arc::clone(&context)) {
         Ok(handle) => handle,
         Err(err) => {
             unregister_session(registry, meta.info_hash, request.id);
             return Err(err);
         }
     };
-    let webseed_handle = match start_webseed_worker(
-        web_seeds.clone(),
-        Arc::clone(&pieces),
-        Arc::clone(&storage),
-        Arc::clone(&completed_log),
-        Arc::clone(&file_spans),
-        getright_multi_file,
-        meta.info.piece_length,
-        meta.info_hash,
-        limits.clone(),
-        Arc::clone(&downloaded),
-        Arc::clone(&stop_flag),
-        piece_buffer_budgets.clone(),
-        Arc::clone(&paused_flag),
-        ui_state.clone(),
-        request.id,
-    ) {
-        Ok(handle) => handle,
-        Err(err) => {
-            stop_flag.store(true, Ordering::SeqCst);
-            let stopped = join_worker_before(
-                resume_handle,
-                "resume",
-                Instant::now() + TORRENT_WORKER_SHUTDOWN_TIMEOUT,
-            );
-            if stopped {
-                unregister_session(registry, meta.info_hash, request.id);
-            } else {
-                retain_context_after_teardown_failure(registry, &context);
+    let webseed_handle =
+        match start_webseed_worker(web_seeds.clone(), getright_multi_file, Arc::clone(&context)) {
+            Ok(handle) => handle,
+            Err(err) => {
+                stop_flag.store(true, Ordering::SeqCst);
+                let stopped = join_worker_before(
+                    resume_handle,
+                    "resume",
+                    Instant::now() + TORRENT_WORKER_SHUTDOWN_TIMEOUT,
+                );
+                if stopped {
+                    unregister_session(registry, meta.info_hash, request.id);
+                } else {
+                    retain_context_after_teardown_failure(registry, &context);
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-    };
+        };
 
     let decentralized_discovery = !meta.info.private && args.proxy.is_none();
     let has_network_sources = tracker_set_has_usable_source(&trackers, args.proxy.is_none())
@@ -7666,161 +7637,130 @@ fn try_reserve_webseed_memory(
 }
 
 #[cfg(feature = "webseed")]
-#[allow(clippy::too_many_arguments)]
 fn start_webseed_worker(
     web_seeds: Vec<WebSeed>,
-    pieces: Arc<Mutex<piece::PieceManager>>,
-    storage: Arc<Mutex<storage::Storage>>,
-    completed_log: Arc<Mutex<Vec<u32>>>,
-    file_spans: Arc<Vec<FileSpan>>,
     getright_multi_file: bool,
-    _base_piece_length: u64,
-    info_hash: [u8; 20],
-    limits: TransferLimits,
-    downloaded: Arc<AtomicU64>,
-    stop_flag: Arc<AtomicBool>,
-    piece_buffer_budgets: piece::PieceBufferBudgets,
-    paused_flag: Arc<AtomicBool>,
-    ui_state: Option<Arc<Mutex<ui::UiState>>>,
-    torrent_id: u64,
+    context: Arc<TorrentContext>,
 ) -> Result<Option<thread::JoinHandle<()>>, String> {
     if web_seeds.is_empty() {
         return Ok(None);
     }
     spawn_worker(
-        format!("webseed-{torrent_id}"),
+        format!("webseed-{}", context.id),
         0,
-        Box::new(move || loop {
-            if torrent_stop_requested(&stop_flag) {
-                break;
-            }
-            if torrent_paused(&paused_flag) {
-                sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, &stop_flag);
-                continue;
-            }
-            let (index, piece_start, piece_len, expected) = {
-                let mut p = lock_or_recover(&pieces);
-                let available = vec![u8::MAX; p.bitfield_len()];
-                let index =
-                    match p.reserve_piece_for_peer(WEBSEED_RESERVATION_ID, &available, false) {
-                        Some(index) => index,
-                        None => {
-                            drop(p);
-                            sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, &stop_flag);
-                            continue;
-                        }
-                    };
-                let length = match p.piece_length(index) {
-                    Some(length) => length,
-                    None => {
-                        p.release_piece(WEBSEED_RESERVATION_ID, index);
-                        break;
-                    }
-                };
-                let offset = match p.piece_offset(index) {
-                    Some(offset) => offset,
-                    None => {
-                        p.release_piece(WEBSEED_RESERVATION_ID, index);
-                        break;
-                    }
-                };
-                let expected = match p.piece_hash(index) {
-                    Some(hash) => hash.clone(),
-                    None => {
-                        p.release_piece(WEBSEED_RESERVATION_ID, index);
-                        break;
-                    }
-                };
-                (index, offset, length, expected)
-            };
-
-            let Some(memory_reservation) =
-                try_reserve_webseed_memory(&pieces, index, piece_len, &piece_buffer_budgets)
-            else {
-                // Shared memory pressure is routine backpressure. Give peer
-                // and other torrent workers a chance to release buffers.
-                sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, &stop_flag);
-                continue;
-            };
-            let data = match fetch_piece_from_web_seeds(
-                &web_seeds,
-                &file_spans,
-                getright_multi_file,
-                info_hash,
-                index,
-                piece_start,
-                piece_len,
-            ) {
-                Ok(data) => data,
-                Err(_) => {
-                    lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
-                    sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
-                    continue;
-                }
-            };
-            if !verify_piece_hash(&data, &expected) {
-                lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
-                sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
-                continue;
-            }
-            if torrent_stop_requested(&stop_flag)
-                || torrent_paused(&paused_flag)
-                || !lock_or_recover(&pieces).is_piece_wanted(index)
-            {
-                lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
-                continue;
-            }
-            let write_ok = {
-                let mut s = lock_or_recover(&storage);
-                s.write_at(piece_start, &data).is_ok()
-            };
-            if !write_ok {
-                lock_or_recover(&pieces).release_piece(WEBSEED_RESERVATION_ID, index);
-                continue;
-            }
-            drop(data);
-            drop(memory_reservation);
-            let was_new = {
-                let mut p = lock_or_recover(&pieces);
-                p.mark_piece_complete(index).unwrap_or(false)
-            };
-            if !was_new {
-                continue;
-            }
-            SESSION_DOWNLOADED_BYTES.fetch_add(piece_len as u64, Ordering::SeqCst);
-            downloaded.fetch_add(piece_len as u64, Ordering::SeqCst);
-            if !limits
-                .global_down
-                .throttle_until(piece_len as usize, &stop_flag)
-                || !limits
-                    .torrent_down
-                    .throttle_until(piece_len as usize, &stop_flag)
-            {
-                break;
-            }
-            if let Ok(mut log) = completed_log.lock() {
-                log.push(index);
-            }
-            let piece_len_u64 = piece_len as u64;
-            let completed_pieces = {
-                let p = lock_or_recover(&pieces);
-                p.completed_pieces()
-            };
-            update_ui(&ui_state, |state| {
-                apply_piece_completion_ui(
-                    state,
-                    torrent_id,
-                    completed_pieces,
-                    &file_spans,
-                    piece_start,
-                    piece_len_u64,
-                    true,
-                );
-            });
-        }),
+        Box::new(move || webseed_worker_loop(&web_seeds, getright_multi_file, &context)),
     )
     .map(Some)
     .map_err(|err| format!("web seed worker could not start: {err}"))
+}
+
+#[cfg(feature = "webseed")]
+fn webseed_worker_loop(web_seeds: &[WebSeed], getright_multi_file: bool, ctx: &TorrentContext) {
+    let pieces = &ctx.pieces;
+    let stop_flag = &ctx.stop_requested;
+    let release = |index: u32| lock_or_recover(pieces).release_piece(WEBSEED_RESERVATION_ID, index);
+    loop {
+        if torrent_stop_requested(stop_flag) {
+            break;
+        }
+        if torrent_paused(&ctx.paused) {
+            sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, stop_flag);
+            continue;
+        }
+        let reserved = {
+            let mut p = lock_or_recover(pieces);
+            let available = vec![u8::MAX; p.bitfield_len()];
+            p.reserve_piece_for_peer(WEBSEED_RESERVATION_ID, &available, false)
+                .map(|index| {
+                    let details = (
+                        p.piece_offset(index),
+                        p.piece_length(index),
+                        p.piece_hash(index).cloned(),
+                    );
+                    (index, details)
+                })
+        };
+        let Some((index, details)) = reserved else {
+            sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, stop_flag);
+            continue;
+        };
+        let (Some(piece_start), Some(piece_len), Some(expected)) = details else {
+            release(index);
+            break;
+        };
+
+        let Some(memory_reservation) =
+            try_reserve_webseed_memory(pieces, index, piece_len, &ctx.piece_buffer_budgets)
+        else {
+            // Shared memory pressure is routine backpressure. Give peer
+            // and other torrent workers a chance to release buffers.
+            sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, stop_flag);
+            continue;
+        };
+        let data = fetch_piece_from_web_seeds(
+            web_seeds,
+            &ctx.file_spans,
+            getright_multi_file,
+            ctx.info_hash,
+            index,
+            piece_start,
+            piece_len,
+        )
+        .ok()
+        .filter(|data| verify_piece_hash(data, &expected));
+        let Some(data) = data else {
+            release(index);
+            sleep_with_shutdown_or_stop(Duration::from_secs(1), stop_flag);
+            continue;
+        };
+        if torrent_stop_requested(stop_flag)
+            || torrent_paused(&ctx.paused)
+            || !lock_or_recover(pieces).is_piece_wanted(index)
+            || lock_or_recover(&ctx.storage)
+                .write_at(piece_start, &data)
+                .is_err()
+        {
+            release(index);
+            continue;
+        }
+        drop(data);
+        drop(memory_reservation);
+        let (was_new, completed_pieces) = {
+            let mut p = lock_or_recover(pieces);
+            let was_new = p.mark_piece_complete(index).unwrap_or(false);
+            publish_piece_state(ctx, &p);
+            (was_new, p.completed_pieces())
+        };
+        if !was_new {
+            continue;
+        }
+        SESSION_DOWNLOADED_BYTES.fetch_add(piece_len as u64, Ordering::SeqCst);
+        ctx.downloaded.fetch_add(piece_len as u64, Ordering::SeqCst);
+        lock_or_recover(&ctx.completed_log).push(index);
+        let torrent_id = ctx.id;
+        update_ui(&ctx.ui_state, |state| {
+            apply_piece_completion_ui(
+                state,
+                torrent_id,
+                completed_pieces,
+                &ctx.file_spans,
+                piece_start,
+                piece_len as u64,
+                true,
+            );
+        });
+        if !ctx
+            .limits
+            .global_down
+            .throttle_until(piece_len as usize, stop_flag)
+            || !ctx
+                .limits
+                .torrent_down
+                .throttle_until(piece_len as usize, stop_flag)
+        {
+            break;
+        }
+    }
 }
 
 #[cfg(not(feature = "webseed"))]
@@ -7829,130 +7769,124 @@ fn collect_web_seeds(_meta: &torrent::TorrentMeta) -> Vec<String> {
 }
 
 #[cfg(not(feature = "webseed"))]
-#[allow(clippy::too_many_arguments)]
 fn start_webseed_worker(
     _web_seeds: Vec<String>,
-    _pieces: Arc<Mutex<piece::PieceManager>>,
-    _storage: Arc<Mutex<storage::Storage>>,
-    _completed_log: Arc<Mutex<Vec<u32>>>,
-    _file_spans: Arc<Vec<FileSpan>>,
     _getright_multi_file: bool,
-    _base_piece_length: u64,
-    _info_hash: [u8; 20],
-    _limits: TransferLimits,
-    _downloaded: Arc<AtomicU64>,
-    _stop_flag: Arc<AtomicBool>,
-    _piece_buffer_budgets: piece::PieceBufferBudgets,
-    _paused_flag: Arc<AtomicBool>,
-    _ui_state: Option<Arc<Mutex<ui::UiState>>>,
-    _torrent_id: u64,
+    _context: Arc<TorrentContext>,
 ) -> Result<Option<thread::JoinHandle<()>>, String> {
     Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start_resume_worker(
     resume_path: PathBuf,
-    info_hash: [u8; 20],
-    base_piece_length: u64,
-    pieces: Arc<Mutex<piece::PieceManager>>,
-    storage: Arc<Mutex<storage::Storage>>,
-    file_priorities: Arc<Mutex<Vec<u8>>>,
-    file_spans: Arc<Vec<FileSpan>>,
-    downloaded: Arc<AtomicU64>,
-    uploaded: Arc<AtomicU64>,
-    peer_queue: Arc<Mutex<PeerQueue>>,
-    stop_flag: Arc<AtomicBool>,
-    file_renames: Arc<Mutex<HashMap<usize, String>>>,
-    save_requested: Arc<AtomicBool>,
+    context: Arc<TorrentContext>,
 ) -> Result<thread::JoinHandle<()>, String> {
     spawn_worker(
-        format!("resume-{}", hex(&info_hash[..4])),
+        format!("resume-{}", hex(&context.info_hash[..4])),
         0,
-        Box::new(move || {
-            let mut last_save = instant_ago(RESUME_SAVE_INTERVAL);
-            let mut last_complete: Option<bool> = None;
-            loop {
-                let stopping = torrent_stop_requested(&stop_flag);
-                let complete = {
-                    let p = lock_or_recover(&pieces);
-                    p.is_complete()
-                };
-                let requested = save_requested.swap(false, Ordering::AcqRel);
-                let completion_changed = last_complete.is_some_and(|last| last != complete);
-                if last_save.elapsed() >= RESUME_SAVE_INTERVAL
-                    || completion_changed
-                    || requested
-                    || stopping
-                {
-                    let priorities = lock_or_recover(&file_priorities).clone();
-                    let downloaded = downloaded.load(Ordering::SeqCst);
-                    let uploaded = uploaded.load(Ordering::SeqCst);
-                    let peers = lock_or_recover(&peer_queue).sample(256);
-                    let snapshot = {
-                        // Nested runtime locks always follow pieces -> storage -> renames.
-                        // This gives the saved bitfield and rename map the exact bytes and
-                        // filesystem paths that were made durable by the flush.
-                        let p = lock_or_recover(&pieces);
-                        let mut s = lock_or_recover(&storage);
-                        match s.flush() {
-                            Ok(()) => {
-                                let renames = lock_or_recover(&file_renames)
-                                    .iter()
-                                    .map(|(index, name)| (*index, name.clone()))
-                                    .collect::<Vec<_>>();
-                                Ok((
-                                    build_bitfield(&p),
-                                    collect_storage_file_stats(&s, &file_spans),
-                                    renames,
-                                    p.is_complete(),
-                                ))
-                            }
-                            Err(err) => Err(err.to_string()),
+        Box::new(move || resume_worker_loop(&resume_path, &context)),
+    )
+    .map_err(|err| format!("resume worker could not start: {err}"))
+}
+
+/// Periodically persist resume data. Nothing is written while the torrent
+/// is idle (for example seeding without uploads), and the payload files are
+/// only flushed when new pieces were written since the last flush.
+fn resume_worker_loop(resume_path: &Path, ctx: &TorrentContext) {
+    let stop_flag = &ctx.stop_requested;
+    let mut last_save: Option<Instant> = None;
+    let mut last_complete: Option<bool> = None;
+    // (completed-piece log length, downloaded, uploaded) at the last save.
+    let mut saved: Option<(usize, u64, u64)> = None;
+    let mut flushed_pieces: Option<usize> = None;
+    loop {
+        let stopping = torrent_stop_requested(stop_flag);
+        let complete = ctx.piece_complete.load(Ordering::Acquire);
+        let requested = ctx.resume_save_requested.swap(false, Ordering::AcqRel);
+        let completion_changed = last_complete.is_some_and(|last| last != complete);
+        let due = last_save.is_none_or(|at| at.elapsed() >= RESUME_SAVE_INTERVAL);
+        if due || completion_changed || requested || stopping {
+            let written = lock_or_recover(&ctx.completed_log).len();
+            let state = (
+                written,
+                ctx.downloaded.load(Ordering::SeqCst),
+                ctx.uploaded.load(Ordering::SeqCst),
+            );
+            if saved == Some(state) && !requested && !completion_changed {
+                last_save = Some(Instant::now());
+            } else {
+                let flush = stopping || flushed_pieces != Some(written);
+                match save_resume_snapshot(resume_path, ctx, flush) {
+                    Ok(snapshot_complete) => {
+                        last_save = Some(Instant::now());
+                        last_complete = Some(snapshot_complete);
+                        saved = Some(state);
+                        if flush {
+                            flushed_pieces = Some(written);
                         }
-                    };
-                    match snapshot {
-                        Ok((bitfield, files, renames, snapshot_complete)) => {
-                            match save_resume_data(
-                                &resume_path,
-                                info_hash,
-                                base_piece_length,
-                                bitfield,
-                                &priorities,
-                                files,
-                                downloaded,
-                                uploaded,
-                                peers,
-                                &renames,
-                            ) {
-                                Ok(()) => {
-                                    last_save = Instant::now();
-                                    last_complete = Some(snapshot_complete);
-                                }
-                                Err(err) => {
-                                    log_warn!("resume save failed: {err}");
-                                    if !stopping {
-                                        save_requested.store(true, Ordering::Release);
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            log_warn!("resume flush failed: {err}");
-                            if !stopping {
-                                save_requested.store(true, Ordering::Release);
-                            }
+                    }
+                    Err(err) => {
+                        log_warn!("resume save failed: {err}");
+                        if !stopping {
+                            ctx.resume_save_requested.store(true, Ordering::Release);
                         }
                     }
                 }
-                if stopping {
-                    break;
-                }
-                sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
             }
-        }),
-    )
-    .map_err(|err| format!("resume worker could not start: {err}"))
+        }
+        if stopping {
+            break;
+        }
+        sleep_with_shutdown_or_stop(Duration::from_secs(1), stop_flag);
+    }
+}
+
+/// Write one resume snapshot. The bitfield is captured before the payload
+/// flush, so every piece it lists was written before the flush made the data
+/// durable, and peers keep working while the (possibly slow) sync runs.
+fn save_resume_snapshot(
+    resume_path: &Path,
+    ctx: &TorrentContext,
+    flush: bool,
+) -> Result<bool, String> {
+    let priorities = lock_or_recover(&ctx.file_priorities).clone();
+    let downloaded = ctx.downloaded.load(Ordering::SeqCst);
+    let uploaded = ctx.uploaded.load(Ordering::SeqCst);
+    let peers = lock_or_recover(&ctx.peer_queue).sample(256);
+    let (bitfield, complete) = {
+        let pieces = lock_or_recover(&ctx.pieces);
+        (build_bitfield(&pieces), pieces.is_complete())
+    };
+    // Lock order: storage -> renames, matching the rename path.
+    let (files, renames) = {
+        let mut storage = lock_or_recover(&ctx.storage);
+        if flush {
+            storage
+                .flush()
+                .map_err(|err| format!("payload flush failed: {err}"))?;
+        }
+        let renames = lock_or_recover(&ctx.file_renames)
+            .iter()
+            .map(|(index, name)| (*index, name.clone()))
+            .collect::<Vec<_>>();
+        (
+            collect_storage_file_stats(&storage, &ctx.file_spans),
+            renames,
+        )
+    };
+    save_resume_data(
+        resume_path,
+        ctx.info_hash,
+        ctx.base_piece_length,
+        bitfield,
+        &priorities,
+        files,
+        downloaded,
+        uploaded,
+        peers,
+        &renames,
+    )?;
+    Ok(complete)
 }
 
 #[cfg(feature = "webseed")]
@@ -15590,6 +15524,27 @@ mod core_helpers_tests {
             assert_eq!(pieces.reserve_piece_for_peer(2, &[0x80], false), Some(0));
         }
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resume_snapshot_records_verified_pieces_and_counters() {
+        let root = temp_path("resume-snapshot");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(36, &root);
+        lock_or_recover(&context.pieces)
+            .mark_piece_complete(0)
+            .unwrap();
+        context.downloaded.store(16, Ordering::SeqCst);
+        context.uploaded.store(7, Ordering::SeqCst);
+        let path = resume_path(&root, context.info_hash);
+        ensure_private_state_directory(&root).unwrap();
+
+        assert!(save_resume_snapshot(&path, &context, true).unwrap());
+        let resume = load_resume_data(&path).unwrap();
+        assert_eq!(resume.info_hash, context.info_hash);
+        assert_eq!(resume.bitfield, vec![0x80]);
+        assert_eq!((resume.downloaded, resume.uploaded), (16, 7));
         let _ = fs::remove_dir_all(&root);
     }
 
