@@ -41,16 +41,14 @@ Works on **macOS 11 or newer** and **Linux**. Windows support is partial (builds
 
 ## Dependencies
 
-The full build has five direct Rust dependencies:
+The full build has three direct Rust dependencies:
 
 - `native-tls` — HTTPS tracker support
-- `libc` — safe Unix file-opening flags
+- `libc` — safe Unix file-opening flags and terminal control
 - `getrandom` — operating-system entropy for protocol identifiers, temporary names, and MSE
-- `num-bigint` — MSE Diffie-Hellman (optional, `mse` feature)
-- `num-traits` — bigint helpers (optional, `mse` feature)
 
-Everything else — bencode, SHA-1/SHA-256, HTTP, peer protocol, DHT, uTP, UPnP, NAT-PMP, and the
-web UI — is implemented in the repository. Exact dependency versions are recorded in
+Everything else — bencode, SHA-1/SHA-256, MSE key exchange, HTTP, peer protocol, DHT, uTP, UPnP,
+NAT-PMP, and the web UI — is implemented in the repository. Exact dependency versions are recorded in
 `Cargo.lock`.
 
 ## Build
@@ -67,12 +65,6 @@ cargo build --release
 The release profile is optimized for size (`opt-level = "z"`, LTO, one codegen unit, and stripped
 symbols) while retaining integer-overflow checks. Binary size varies by platform and toolchain;
 current builds are typically around 1–2 MiB.
-
-To build without peer-stream encryption (omits the MSE bigint dependencies):
-
-```
-cargo build --release --no-default-features --features udp_tracker,dht,utp,lpd,natpmp,upnp,webseed
-```
 
 ## Platform support
 
