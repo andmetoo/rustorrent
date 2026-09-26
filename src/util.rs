@@ -1,4 +1,4 @@
-//! Small shared helpers.
+// Small shared helpers.
 
 /// Unstable in-place heapsort. The standard library's sorts are specialised
 /// for every call site and cost several kilobytes each; this one stays small

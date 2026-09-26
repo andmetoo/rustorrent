@@ -5,6 +5,10 @@ use libfuzzer_sys::fuzz_target;
 
 pub fn log_stderr(_args: std::fmt::Arguments<'_>) {}
 
+mod util {
+    include!("../../src/util.rs");
+}
+
 mod bencode {
     include!("../../src/bencode.rs");
 }
