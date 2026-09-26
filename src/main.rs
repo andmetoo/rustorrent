@@ -277,7 +277,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -444,6 +444,8 @@ struct TorrentRequest {
     preallocate: bool,
     initial_label: String,
     initial_options: ui::AddOptions,
+    /// Stopped (or failed) while queued: kept for resume but not started.
+    held: bool,
 }
 
 #[derive(Clone)]
@@ -720,14 +722,41 @@ impl Drop for PeerSlotGuard {
     }
 }
 
-struct ActiveTorrentGuard {
-    counter: Arc<AtomicUsize>,
-}
-
 struct InFlightTorrentGuard {
     reservations: InFlightTorrents,
     info_hash: [u8; 20],
     torrent_id: u64,
+    control: Arc<LoadControl>,
+}
+
+/// What a lifecycle command asked a worker to do when it is not (or no
+/// longer) registered: fetching metadata, verifying resume data, starting up
+/// or tearing down. Larger values take precedence.
+const LOAD_STOP: u8 = 0;
+const LOAD_PAUSE: u8 = 1;
+const LOAD_ARCHIVE: u8 = 2;
+const LOAD_DELETE: u8 = 3;
+
+/// Cancellation handle shared by the main loop and one torrent worker.
+#[derive(Default)]
+struct LoadControl {
+    cancel: AtomicBool,
+    action: AtomicU8,
+}
+
+impl LoadControl {
+    fn request(&self, action: u8) {
+        // A removal is never downgraded to a stop by a later command.
+        self.action.fetch_max(action, Ordering::SeqCst);
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Take a pending request, if any.
+    fn take(&self) -> Option<u8> {
+        self.cancel
+            .swap(false, Ordering::SeqCst)
+            .then(|| self.action.load(Ordering::SeqCst))
+    }
 }
 
 struct PidFileGuard {
@@ -817,7 +846,27 @@ struct TorrentContext {
 }
 
 type SessionRegistry = Arc<Mutex<HashMap<[u8; 20], Arc<TorrentContext>>>>;
-type InFlightTorrents = Arc<Mutex<HashMap<[u8; 20], u64>>>;
+
+/// Process-wide services shared by every torrent worker.
+struct TorrentRuntime {
+    args: Args,
+    ui_state: Option<Arc<Mutex<ui::UiState>>>,
+    registry: SessionRegistry,
+    session_store: Arc<SessionStore>,
+    dht: dht::Dht,
+    lpd: lpd::Lpd,
+    utp: Option<utp::UtpConnector>,
+    ip_filter: Option<Arc<IpFilter>>,
+    global_down: Arc<RateLimiter>,
+    global_up: Arc<RateLimiter>,
+    peer_settings: Arc<PeerRuntimeSettings>,
+    peer_slots: Arc<PeerSlots>,
+    global_piece_buffer_budget: Arc<piece::PieceBufferBudget>,
+    /// Requests handed back to the main queue (held) by workers that were
+    /// cancelled or failed before running, so they can be resumed or removed.
+    requeue: mpsc::Sender<TorrentRequest>,
+}
+type InFlightTorrents = Arc<Mutex<HashMap<[u8; 20], (u64, Arc<LoadControl>)>>>;
 
 macro_rules! log_info {
     ($($t:tt)*) => {
@@ -2119,12 +2168,6 @@ impl PeerSlots {
     }
 }
 
-impl ActiveTorrentGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
-        Self { counter }
-    }
-}
-
 impl InFlightTorrentGuard {
     fn acquire(
         reservations: &InFlightTorrents,
@@ -2135,26 +2178,47 @@ impl InFlightTorrentGuard {
         if guard.contains_key(&info_hash) {
             return Err("torrent is already loading or active".to_string());
         }
-        guard.insert(info_hash, torrent_id);
+        let control = Arc::new(LoadControl::default());
+        guard.insert(info_hash, (torrent_id, Arc::clone(&control)));
         drop(guard);
         Ok(Self {
             reservations: Arc::clone(reservations),
             info_hash,
             torrent_id,
+            control,
         })
     }
 }
 
-impl Drop for ActiveTorrentGuard {
-    fn drop(&mut self) {
-        let _ = self.counter.fetch_sub(1, Ordering::SeqCst);
-    }
+fn in_flight_control(in_flight: &InFlightTorrents, torrent_id: u64) -> Option<Arc<LoadControl>> {
+    lock_or_recover(in_flight)
+        .values()
+        .find(|(id, _)| *id == torrent_id)
+        .map(|(_, control)| Arc::clone(control))
+}
+
+/// Torrents that occupy an active download slot: loading, or registered and
+/// still downloading. Paused, stopping and seeding torrents do not.
+fn active_download_count(registry: &SessionRegistry, in_flight: &InFlightTorrents) -> usize {
+    let idle: HashSet<[u8; 20]> = lock_or_recover(registry)
+        .iter()
+        .filter(|(_, context)| {
+            context.paused.load(Ordering::SeqCst)
+                || context.piece_complete.load(Ordering::SeqCst)
+                || context.stop_requested.load(Ordering::SeqCst)
+        })
+        .map(|(info_hash, _)| *info_hash)
+        .collect();
+    lock_or_recover(in_flight)
+        .keys()
+        .filter(|info_hash| !idle.contains(*info_hash))
+        .count()
 }
 
 impl Drop for InFlightTorrentGuard {
     fn drop(&mut self) {
         let mut guard = lock_or_recover(&self.reservations);
-        if guard.get(&self.info_hash) == Some(&self.torrent_id) {
+        if guard.get(&self.info_hash).map(|(id, _)| *id) == Some(self.torrent_id) {
             guard.remove(&self.info_hash);
         }
     }
@@ -2749,7 +2813,6 @@ fn run() -> Result<(), String> {
     let peer_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_global()));
     let global_piece_buffer_budget =
         Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES));
-    let active_torrents = Arc::new(AtomicUsize::new(0));
     let session_store = Arc::new(SessionStore::load(&args.download_dir)?);
 
     let state = Arc::new(Mutex::new(ui::UiState::default()));
@@ -2979,6 +3042,7 @@ fn run() -> Result<(), String> {
             preallocate: args.preallocate,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         };
         if enqueue_request_if_new(
             &registry,
@@ -3001,6 +3065,7 @@ fn run() -> Result<(), String> {
             preallocate: args.preallocate,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         };
         if enqueue_request_if_new(
             &registry,
@@ -3017,6 +3082,23 @@ fn run() -> Result<(), String> {
 
     update_idle_state(&ui_state, &args, queue.len());
 
+    let (requeue_tx, requeue_rx) = mpsc::channel::<TorrentRequest>();
+    let runtime = Arc::new(TorrentRuntime {
+        args: args.clone(),
+        ui_state: ui_state.clone(),
+        registry: registry.clone(),
+        session_store: session_store.clone(),
+        dht: dht.clone(),
+        lpd: lpd.clone(),
+        utp: utp_connector.clone(),
+        ip_filter: ip_filter.clone(),
+        global_down: global_down.clone(),
+        global_up: global_up.clone(),
+        peer_settings: peer_settings.clone(),
+        peer_slots: peer_slots.clone(),
+        global_piece_buffer_budget: Arc::clone(&global_piece_buffer_budget),
+        requeue: requeue_tx,
+    });
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut last_watch_scan = Instant::now();
 
@@ -3039,6 +3121,9 @@ fn run() -> Result<(), String> {
             last_watch_scan = Instant::now();
         }
 
+        while let Ok(request) = requeue_rx.try_recv() {
+            queue.push_back(request);
+        }
         drain_ui_commands(
             &cmd_rx,
             &mut queue,
@@ -3100,114 +3185,18 @@ fn run() -> Result<(), String> {
         );
 
         let can_start = args.max_active_torrents == 0
-            || active_torrents.load(Ordering::SeqCst) < args.max_active_torrents;
-        if can_start {
-            if let Some(mut request) = queue.pop_front() {
-                let request_id = request.id;
-                let in_flight_guard = match freeze_request_source(&mut request) {
-                    Ok(info_hash) => {
-                        InFlightTorrentGuard::acquire(&in_flight, info_hash, request_id)
-                    }
-                    Err(err) => Err(err),
-                };
-                let in_flight_guard = match in_flight_guard {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        update_ui(&ui_state, |state| {
-                            state.queue_len = queue.len();
-                            state.status = "error".to_string();
-                            state.last_error = err.clone();
-                            update_torrent_entry(state, request_id, |torrent| {
-                                torrent.status = "error".to_string();
-                                torrent.last_error = err.clone();
-                            });
-                        });
-                        continue;
-                    }
-                };
-                let retry_request = request.clone();
-                let is_magnet = matches!(request.source, TorrentSource::Magnet(_));
-                let load_status = if is_magnet {
-                    "fetching metadata"
-                } else {
-                    "loading"
-                };
-                update_ui(&ui_state, |state| {
-                    state.queue_len = queue.len();
-                    state.status = load_status.to_string();
-                    state.last_error.clear();
-                    update_torrent_entry(state, request_id, |torrent| {
-                        torrent.status = load_status.to_string();
-                        torrent.last_error.clear();
-                    });
-                });
-                active_torrents.fetch_add(1, Ordering::SeqCst);
-                let active_guard = ActiveTorrentGuard::new(active_torrents.clone());
-                let args_clone = args.clone();
-                let ui_clone = ui_state.clone();
-                let registry_clone = registry.clone();
-                let dht_clone = dht.clone();
-                let lpd_clone = lpd.clone();
-                let session_clone = session_store.clone();
-                let utp_clone = utp_connector.clone();
-                let filter_clone = ip_filter.clone();
-                let global_down = global_down.clone();
-                let global_up = global_up.clone();
-                let peer_slots = peer_slots.clone();
-                let peer_settings = peer_settings.clone();
-                let global_piece_buffer_budget = Arc::clone(&global_piece_buffer_budget);
-                match thread::Builder::new()
-                    .name(format!("torrent-{request_id}"))
-                    .spawn(move || {
-                        let _in_flight_guard = in_flight_guard;
-                        let _guard = active_guard;
-                        if let Err(err) = run_torrent(
-                            request,
-                            &args_clone,
-                            &ui_clone,
-                            &registry_clone,
-                            &session_clone,
-                            &dht_clone,
-                            &lpd_clone,
-                            utp_clone,
-                            filter_clone,
-                            global_down,
-                            global_up,
-                            peer_settings,
-                            peer_slots,
-                            global_piece_buffer_budget,
-                        ) {
-                            log_warn!("torrent error: {err}");
-                            update_ui(&ui_clone, |state| {
-                                state.status = "error".to_string();
-                                state.last_error = err;
-                                let last_error = state.last_error.clone();
-                                update_torrent_entry(state, request_id, |torrent| {
-                                    torrent.status = "error".to_string();
-                                    torrent.last_error = last_error;
-                                });
-                            });
-                        }
-                    }) {
-                    Ok(handle) => {
-                        handles.push(handle);
-                        continue;
-                    }
-                    Err(err) => {
-                        log_warn!("torrent worker could not start: {err}");
-                        queue.push_front(retry_request);
-                        update_ui(&ui_state, |state| {
-                            state.queue_len = queue.len();
-                            state.status = "queued".to_string();
-                            state.last_error = format!("torrent worker could not start: {err}");
-                            update_torrent_entry(state, request_id, |torrent| {
-                                torrent.status = "queued".to_string();
-                                torrent.last_error =
-                                    format!("torrent worker could not start: {err}");
-                            });
-                        });
-                    }
-                }
+            || active_download_count(&registry, &in_flight) < args.max_active_torrents;
+        let next_request = if can_start {
+            queue
+                .iter()
+                .position(|request| !request.held)
+                .and_then(|index| queue.remove(index))
+        } else {
+            None
+        };
+        if let Some(request) = next_request {
+            if start_torrent_worker(request, &runtime, &in_flight, &mut queue, &mut handles) {
+                continue;
             }
         }
 
@@ -3219,6 +3208,10 @@ fn run() -> Result<(), String> {
         sleep_with_shutdown(Duration::from_millis(200));
     }
 
+    // Abort metadata fetches and resume checks promptly.
+    for (_, control) in lock_or_recover(&in_flight).values() {
+        control.request(LOAD_STOP);
+    }
     let shutdown_deadline = Instant::now() + TORRENT_WORKER_SHUTDOWN_TIMEOUT;
     for handle in handles {
         join_worker_before(handle, "torrent", shutdown_deadline);
@@ -3302,6 +3295,7 @@ fn drain_ui_commands(
                         preallocate,
                         initial_label: String::new(),
                         initial_options: options,
+                        held: false,
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
                         if is_duplicate_torrent(
@@ -3359,6 +3353,7 @@ fn drain_ui_commands(
                         preallocate,
                         initial_label: String::new(),
                         initial_options: options,
+                        held: false,
                     };
                     if let Ok(info_hash) = info_hash_for_source(&request.source) {
                         if is_duplicate_torrent(
@@ -3382,9 +3377,15 @@ fn drain_ui_commands(
                     let _ = reply.send(Ok(ui::UiCommandSuccess::TorrentAdded { torrent_id }));
                 }
                 ui::UiCommand::PauseTorrent { torrent_id, reply } => {
-                    let result =
-                        set_torrent_paused(registry, ui_state, session_store, torrent_id, true)
-                            .map(|_| ui::UiCommandSuccess::Ok);
+                    let result = pause_torrent(
+                        registry,
+                        ui_state,
+                        queue,
+                        torrent_id,
+                        session_store,
+                        in_flight,
+                    )
+                    .map(|_| ui::UiCommandSuccess::Ok);
                     if let Err(err) = result.as_ref() {
                         log_warn!("pause torrent error: {err}");
                         update_ui(ui_state, |state| {
@@ -3705,6 +3706,7 @@ fn restore_session_entries(
             preallocate: entry.preallocate,
             initial_label: entry.label.clone(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         };
         *next_id = next_id.saturating_add(1);
         enqueue_request_with_label(queue, ui_state, request, label);
@@ -3833,68 +3835,309 @@ fn update_idle_state(ui_state: &Option<Arc<Mutex<ui::UiState>>>, args: &Args, qu
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Start a worker for `request`. Returns false when nothing was started and
+/// the main loop should wait before trying again.
+fn start_torrent_worker(
+    mut request: TorrentRequest,
+    runtime: &Arc<TorrentRuntime>,
+    in_flight: &InFlightTorrents,
+    queue: &mut VecDeque<TorrentRequest>,
+    handles: &mut Vec<thread::JoinHandle<()>>,
+) -> bool {
+    let ui_state = &runtime.ui_state;
+    let request_id = request.id;
+    let reservation = freeze_request_source(&mut request).and_then(|info_hash| {
+        InFlightTorrentGuard::acquire(in_flight, info_hash, request_id)
+            .map(|guard| (info_hash, guard))
+    });
+    let (info_hash, in_flight_guard) = match reservation {
+        Ok(reservation) => reservation,
+        Err(err) => {
+            // Keep the entry so it can still be removed or retried.
+            request.held = true;
+            queue.push_back(request);
+            set_torrent_status_ui(ui_state, request_id, "error", Some(&err), None, queue.len());
+            return true;
+        }
+    };
+    let load_status = if matches!(request.source, TorrentSource::Magnet(_)) {
+        "fetching metadata"
+    } else {
+        "loading"
+    };
+    set_torrent_status_ui(
+        ui_state,
+        request_id,
+        load_status,
+        Some(""),
+        None,
+        queue.len(),
+    );
+    let retry_request = request.clone();
+    let worker_runtime = Arc::clone(runtime);
+    match thread::Builder::new()
+        .name(format!("torrent-{request_id}"))
+        .spawn(move || {
+            let fallback = request.clone();
+            let result = run_torrent(request, &worker_runtime, &in_flight_guard.control);
+            finish_torrent_worker(
+                result,
+                in_flight_guard,
+                fallback,
+                info_hash,
+                &worker_runtime,
+            );
+        }) {
+        Ok(handle) => {
+            handles.push(handle);
+            true
+        }
+        Err(err) => {
+            let message = format!("torrent worker could not start: {err}");
+            log_warn!("{message}");
+            queue.push_front(retry_request);
+            set_torrent_status_ui(
+                ui_state,
+                request_id,
+                "queued",
+                Some(&message),
+                None,
+                queue.len(),
+            );
+            false
+        }
+    }
+}
+
+/// Rebuild a start request from durable session state.
+fn request_from_session_entry(entry: &SessionEntry, id: u64) -> TorrentRequest {
+    TorrentRequest {
+        id,
+        source: TorrentSource::Bytes(entry.torrent_bytes.clone()),
+        download_dir: entry.download_dir.clone(),
+        preallocate: entry.preallocate,
+        initial_label: entry.label.clone(),
+        initial_options: ui::AddOptions::default(),
+        held: false,
+    }
+}
+
+/// Settle a worker that ended without completing a normal lifecycle: apply
+/// a stop/pause/remove request that arrived while it was not registered, or
+/// keep a failed request so the user can retry or remove it.
+fn finish_torrent_worker(
+    result: Result<(), String>,
+    in_flight_guard: InFlightTorrentGuard,
+    request: TorrentRequest,
+    info_hash: [u8; 20],
+    runtime: &TorrentRuntime,
+) {
+    let control = Arc::clone(&in_flight_guard.control);
+    let ui_state = &runtime.ui_state;
+    let session_store = &runtime.session_store;
+    let torrent_id = request.id;
+    let queue_len = ui_queue_len(ui_state);
+    let action = control.take().filter(|_| !shutdown_requested());
+    if let Some(action) = action.filter(|action| *action >= LOAD_ARCHIVE) {
+        let removed = {
+            let _operation = session_store.lock_operation();
+            remove_stored_torrent(
+                session_store,
+                ui_state,
+                torrent_id,
+                info_hash,
+                action == LOAD_DELETE,
+                queue_len,
+            )
+        };
+        match removed {
+            Ok(()) => return,
+            Err(err) => {
+                log_warn!("remove torrent error: {err}");
+                let mut request = request;
+                request.held = true;
+                drop(in_flight_guard);
+                let _ = runtime.requeue.send(request);
+                mark_delete_failed_ui(ui_state, torrent_id, &err, queue_len);
+                return;
+            }
+        }
+    }
+    let (status, error) = match (&result, action) {
+        (_, Some(action)) => {
+            if session_store.contains(info_hash) {
+                if let Err(err) = session_store.set_paused(info_hash, true) {
+                    log_warn!("pause state save failed: {err}");
+                }
+            }
+            (
+                if action == LOAD_PAUSE {
+                    "paused"
+                } else {
+                    "stopped"
+                },
+                None,
+            )
+        }
+        (Err(err), None) => {
+            log_warn!("torrent error: {err}");
+            ("error", Some(err.as_str()))
+        }
+        (Ok(()), None) => return,
+    };
+    if shutdown_requested() {
+        return;
+    }
+    // Prefer durable state: a completion move may have changed the directory.
+    let mut request = session_store
+        .get(info_hash)
+        .map(|entry| request_from_session_entry(&entry, torrent_id))
+        .unwrap_or(request);
+    request.held = true;
+    // Hand the request back before publishing the new status, so a resume
+    // issued in reaction to that status always finds it queued.
+    drop(in_flight_guard);
+    let _ = runtime.requeue.send(request);
+    set_torrent_status_ui(
+        ui_state,
+        torrent_id,
+        status,
+        error,
+        Some(status == "paused"),
+        queue_len,
+    );
+}
+
+/// A stop/pause/remove command can reach the load handle just as the torrent
+/// registers; apply it to the running torrent like the registered command.
+fn apply_late_lifecycle_request(
+    context: &TorrentContext,
+    session_store: &SessionStore,
+    action: u8,
+) {
+    if action != LOAD_DELETE && action != LOAD_ARCHIVE {
+        if let Err(err) = session_store.set_paused(context.info_hash, true) {
+            log_warn!("pause state save failed: {err}");
+        }
+    }
+    match action {
+        LOAD_PAUSE => {
+            context.paused.store(true, Ordering::SeqCst);
+            return;
+        }
+        LOAD_DELETE => {
+            let _operation = session_store.lock_operation();
+            match session_store.begin_delete(context.info_hash) {
+                Ok(_) => context.delete_data_requested.store(true, Ordering::Release),
+                Err(err) => {
+                    log_warn!("delete request failed: {err}");
+                }
+            }
+        }
+        LOAD_ARCHIVE => context.archive_requested.store(true, Ordering::Release),
+        _ => {}
+    }
+    context
+        .allow_completion_reentry
+        .store(false, Ordering::SeqCst);
+    context.stop_requested.store(true, Ordering::SeqCst);
+    cancel_peer_connections(&context.peer_cancellations);
+}
+
+fn ui_queue_len(ui_state: &Option<Arc<Mutex<ui::UiState>>>) -> usize {
+    ui_state
+        .as_ref()
+        .map(|state| lock_or_recover(state).queue_len)
+        .unwrap_or(0)
+}
+
+/// Update a torrent's lifecycle status and clear its live transfer figures.
+/// `error` of `Some("")` clears the last error; `paused` updates the flag.
+fn set_torrent_status_ui(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    status: &str,
+    error: Option<&str>,
+    paused: Option<bool>,
+    queue_len: usize,
+) {
+    update_ui(ui_state, |state| {
+        state.queue_len = queue_len;
+        state.status = status.to_string();
+        if let Some(error) = error {
+            state.last_error = error.to_string();
+        }
+        if state.current_id == Some(torrent_id) {
+            if let Some(paused) = paused {
+                state.paused = paused || is_paused();
+            }
+            state.download_rate_bps = 0.0;
+            state.upload_rate_bps = 0.0;
+            state.active_peers = 0;
+            state.eta_secs = 0;
+        }
+        update_torrent_entry(state, torrent_id, |torrent| {
+            torrent.status = status.to_string();
+            if let Some(error) = error {
+                torrent.last_error = error.to_string();
+            }
+            if let Some(paused) = paused {
+                torrent.paused = paused;
+            }
+            torrent.download_rate_bps = 0.0;
+            torrent.upload_rate_bps = 0.0;
+            torrent.active_peers = 0;
+            torrent.eta_secs = 0;
+        });
+    });
+}
+
 fn run_torrent(
     mut request: TorrentRequest,
-    args: &Args,
-    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
-    registry: &SessionRegistry,
-    session_store: &Arc<SessionStore>,
-    dht: &dht::Dht,
-    lpd: &lpd::Lpd,
-    utp: Option<utp::UtpConnector>,
-    ip_filter: Option<Arc<IpFilter>>,
-    global_down: Arc<RateLimiter>,
-    global_up: Arc<RateLimiter>,
-    peer_settings: Arc<PeerRuntimeSettings>,
-    peer_slots: Arc<PeerSlots>,
-    global_piece_buffer_budget: Arc<piece::PieceBufferBudget>,
+    runtime: &TorrentRuntime,
+    control: &LoadControl,
 ) -> Result<(), String> {
     loop {
-        let next = run_torrent_once(
-            request,
-            args,
-            ui_state,
-            registry,
-            session_store,
-            dht,
-            lpd,
-            utp.clone(),
-            ip_filter.clone(),
-            Arc::clone(&global_down),
-            Arc::clone(&global_up),
-            Arc::clone(&peer_settings),
-            Arc::clone(&peer_slots),
-            Arc::clone(&global_piece_buffer_budget),
-        )?;
-        match next {
+        match run_torrent_once(request, runtime, control)? {
             Some(next) if !shutdown_requested() => request = next,
             _ => return Ok(()),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_torrent_once(
     request: TorrentRequest,
-    args: &Args,
-    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
-    registry: &SessionRegistry,
-    session_store: &Arc<SessionStore>,
-    dht: &dht::Dht,
-    lpd: &lpd::Lpd,
-    utp: Option<utp::UtpConnector>,
-    ip_filter: Option<Arc<IpFilter>>,
-    global_down: Arc<RateLimiter>,
-    global_up: Arc<RateLimiter>,
-    peer_settings: Arc<PeerRuntimeSettings>,
-    peer_slots: Arc<PeerSlots>,
-    global_piece_buffer_budget: Arc<piece::PieceBufferBudget>,
+    runtime: &TorrentRuntime,
+    control: &LoadControl,
 ) -> Result<Option<TorrentRequest>, String> {
+    let TorrentRuntime {
+        args,
+        ui_state,
+        registry,
+        session_store,
+        dht,
+        lpd,
+        utp,
+        ip_filter,
+        global_down,
+        global_up,
+        peer_settings,
+        peer_slots,
+        global_piece_buffer_budget,
+        requeue: _,
+    } = runtime;
+    let cancel = &control.cancel;
+    let cancelled = || -> Result<(), String> {
+        if torrent_stop_requested(cancel) {
+            Err("torrent load cancelled".to_string())
+        } else {
+            Ok(())
+        }
+    };
     let mut request = request;
     let connect_cfg = ConnectionConfig {
         encryption: args.encryption,
-        utp,
+        utp: utp.clone(),
         ip_filter: ip_filter.clone(),
         proxy: args.proxy.clone(),
     };
@@ -3909,7 +4152,9 @@ fn run_torrent_once(
         dht,
         &connect_cfg,
         peer_settings.metadata_peer_limit(),
+        cancel,
     )?;
+    cancelled()?;
     let meta = torrent::parse_torrent(&data).map_err(|err| format!("parse error: {err}"))?;
     ensure_private_state_directory(&request.download_dir)?;
     let hybrid_v2_info_hash = if meta.meta_version == 3 {
@@ -4090,8 +4335,12 @@ fn run_torrent_once(
         meta.info.piece_length,
         &file_spans,
         resume_data.as_ref(),
+        cancel,
     )
     .map_err(|err| format!("resume error: {err}"))?;
+    // A cancelled verification leaves an incomplete bitfield; never start
+    // transfers from it.
+    cancelled()?;
     let resume_downloaded = resume.completed_bytes.max(
         resume_data
             .as_ref()
@@ -4298,7 +4547,7 @@ fn run_torrent_once(
     let storage = Arc::new(Mutex::new(storage));
     let completed_log = Arc::new(Mutex::new(Vec::new()));
     let piece_buffer_budgets = piece::PieceBufferBudgets::new(
-        Arc::clone(&global_piece_buffer_budget),
+        Arc::clone(global_piece_buffer_budget),
         Arc::new(piece::PieceBufferBudget::new(
             MAX_TORRENT_PIECE_BUFFER_BYTES,
         )),
@@ -4325,7 +4574,7 @@ fn run_torrent_once(
         allow_pex: !meta.info.private,
         piece_buffer_budgets: piece_buffer_budgets.clone(),
         ui_state: ui_state.clone(),
-        global_peer_slots: Arc::clone(&peer_slots),
+        global_peer_slots: Arc::clone(peer_slots),
         torrent_peer_slots: Arc::clone(&per_torrent_slots),
         pieces: Arc::clone(&pieces),
         storage: Arc::clone(&storage),
@@ -4360,6 +4609,7 @@ fn run_torrent_once(
         endgame: AtomicBool::new(false),
     });
     publish_piece_state(&context, &lock_or_recover(&pieces));
+    cancelled()?;
     register_session(registry, Arc::clone(&context))?;
     let resume_handle = match start_resume_worker(
         resume_path.clone(),
@@ -4506,6 +4756,9 @@ fn run_torrent_once(
 
         let mut seed_start: Option<Instant> = None;
         while !torrent_stop_requested(&stop_flag) {
+            if let Some(action) = control.take() {
+                apply_late_lifecycle_request(&context, session_store, action);
+            }
             reap_finished_workers(&mut handles, "peer");
             let desired_workers = peer_settings.max_peers_torrent();
             let startup_burst = downloaded.load(Ordering::SeqCst) < STARTUP_BURST_BYTES;
@@ -5363,6 +5616,7 @@ fn run_torrent_once(
                                         preallocate: request.preallocate,
                                         initial_label: request.initial_label.clone(),
                                         initial_options: ui::AddOptions::default(),
+                                        held: false,
                                     });
                                 }
                             }
@@ -5422,6 +5676,7 @@ fn resolve_torrent_data(
     dht: &dht::Dht,
     connect_cfg: &ConnectionConfig,
     metadata_peer_limit: usize,
+    cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let data = match &request.source {
         TorrentSource::Path(path) => read_file_limited(Path::new(path), MAX_TORRENT_BYTES, false)
@@ -5433,7 +5688,7 @@ fn resolve_torrent_data(
             data.clone()
         }
         TorrentSource::Magnet(link) => {
-            fetch_torrent_from_magnet(link, port, dht, connect_cfg, metadata_peer_limit)?
+            fetch_torrent_from_magnet(link, port, dht, connect_cfg, metadata_peer_limit, cancel)?
         }
     };
     if data.len() > MAX_TORRENT_BYTES {
@@ -5535,6 +5790,7 @@ fn fetch_torrent_from_magnet(
     dht: &dht::Dht,
     connect_cfg: &ConnectionConfig,
     metadata_peer_limit: usize,
+    cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let meta = parse_magnet(link)?;
     let expected_hashes = meta.expected_hashes();
@@ -5563,7 +5819,7 @@ fn fetch_torrent_from_magnet(
     let mut source_err: Option<String> = None;
     let mut metadata_err: Option<String> = None;
     for source in meta.sources.iter().filter(|_| connect_cfg.proxy.is_none()) {
-        if shutdown_requested() {
+        if torrent_stop_requested(cancel) {
             return Err("metadata fetch cancelled".to_string());
         }
         if Instant::now() >= deadline {
@@ -5571,7 +5827,7 @@ fn fetch_torrent_from_magnet(
         }
         let source_label = safe_network_url_label(source);
         log_info!("magnet: fetching source {source_label}");
-        match http::get_public_until(source, MAX_TORRENT_BYTES, deadline, Some(&SHUTDOWN)) {
+        match http::get_public_until(source, MAX_TORRENT_BYTES, deadline, Some(cancel)) {
             Ok(data) => match validate_magnet_torrent(&data, expected_hashes) {
                 Ok(()) => {
                     log_info!("magnet: source fetch and hash validation ok ({source_label})");
@@ -5595,7 +5851,7 @@ fn fetch_torrent_from_magnet(
     if let Some(v1_hash) = meta.info_hash_v1.filter(|_| connect_cfg.proxy.is_none()) {
         let info_hash = hex(&v1_hash);
         for base in MAGNET_CACHE_URLS {
-            if shutdown_requested() {
+            if torrent_stop_requested(cancel) {
                 return Err("metadata fetch cancelled".to_string());
             }
             if Instant::now() >= deadline {
@@ -5603,7 +5859,7 @@ fn fetch_torrent_from_magnet(
             }
             let url = format!("{base}{info_hash}.torrent");
             log_info!("magnet: fetching cache {url}");
-            match http::get_public_until(&url, MAX_TORRENT_BYTES, deadline, Some(&SHUTDOWN)) {
+            match http::get_public_until(&url, MAX_TORRENT_BYTES, deadline, Some(cancel)) {
                 Ok(data) => match validate_magnet_torrent(&data, expected_hashes) {
                     Ok(()) => {
                         log_info!("magnet: cache fetch and hash validation ok ({url})");
@@ -5639,7 +5895,17 @@ fn fetch_torrent_from_magnet(
                 break;
             }
             log_info!("metadata: trying explicit peer {addr}");
-            match fetch_metadata_from_peer(*addr, expected_hashes, peer_id, deadline, connect_cfg) {
+            if torrent_stop_requested(cancel) {
+                return Err("metadata fetch cancelled".to_string());
+            }
+            match fetch_metadata_from_peer(
+                *addr,
+                expected_hashes,
+                peer_id,
+                deadline,
+                connect_cfg,
+                cancel,
+            ) {
                 Ok(info_bytes) => {
                     log_info!("metadata: explicit peer {addr} delivered metadata");
                     let data = wrap_torrent_with_info(&info_bytes, &meta.trackers, &meta.web_seeds);
@@ -5665,6 +5931,7 @@ fn fetch_torrent_from_magnet(
             deadline,
             connect_cfg,
             metadata_peer_limit,
+            cancel,
         ) {
             Ok(info_bytes) => {
                 log_info!("magnet: metadata fetched from trackers");
@@ -5679,7 +5946,7 @@ fn fetch_torrent_from_magnet(
             }
         }
     }
-    if connect_cfg.proxy.is_none() {
+    if connect_cfg.proxy.is_none() && !torrent_stop_requested(cancel) {
         let peer_id = generate_peer_id();
         log_info!("magnet: fetching metadata from dht");
         match fetch_metadata_from_dht(
@@ -5690,6 +5957,7 @@ fn fetch_torrent_from_magnet(
             dht,
             connect_cfg,
             metadata_peer_limit,
+            cancel,
         ) {
             Ok(info_bytes) => {
                 log_info!("magnet: metadata fetched from dht");
@@ -5703,6 +5971,9 @@ fn fetch_torrent_from_magnet(
                 }
             }
         }
+    }
+    if torrent_stop_requested(cancel) {
+        return Err("metadata fetch cancelled".to_string());
     }
     if let Some(err) = metadata_err {
         return Err(err);
@@ -5882,6 +6153,7 @@ fn base32_value(ch: char) -> Option<u8> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_metadata_from_trackers(
     expected_hashes: ExpectedInfoHashes,
     peer_id: [u8; 20],
@@ -5890,6 +6162,7 @@ fn fetch_metadata_from_trackers(
     deadline: Instant,
     connect_cfg: &ConnectionConfig,
     metadata_peer_limit: usize,
+    cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let info_hash = expected_hashes.swarm_id()?;
     log_info!(
@@ -5933,7 +6206,7 @@ fn fetch_metadata_from_trackers(
     let mut seen = HashSet::new();
     let mut unique = Vec::new();
     let announce_deadline = Instant::now() + TRACKER_ANNOUNCE_WAIT_BUDGET;
-    while announce_pending > 0 {
+    while announce_pending > 0 && !torrent_stop_requested(cancel) {
         let Some(remaining) = announce_deadline.checked_duration_since(Instant::now()) else {
             break;
         };
@@ -5996,11 +6269,18 @@ fn fetch_metadata_from_trackers(
     log_info!("metadata: {} unique peers from trackers", unique.len());
 
     for addr in unique {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || torrent_stop_requested(cancel) {
             break;
         }
         log_info!("metadata: trying peer {addr}");
-        match fetch_metadata_from_peer(addr, expected_hashes, peer_id, deadline, connect_cfg) {
+        match fetch_metadata_from_peer(
+            addr,
+            expected_hashes,
+            peer_id,
+            deadline,
+            connect_cfg,
+            cancel,
+        ) {
             Ok(data) => {
                 log_info!("metadata: peer {addr} delivered metadata");
                 return Ok(data);
@@ -6015,6 +6295,7 @@ fn fetch_metadata_from_trackers(
     Err(last_err.unwrap_or_else(|| "metadata fetch timed out".to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_metadata_from_dht(
     expected_hashes: ExpectedInfoHashes,
     peer_id: [u8; 20],
@@ -6023,6 +6304,7 @@ fn fetch_metadata_from_dht(
     dht: &dht::Dht,
     connect_cfg: &ConnectionConfig,
     metadata_peer_limit: usize,
+    cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let info_hash = expected_hashes.swarm_id()?;
     if !cfg!(feature = "dht") {
@@ -6042,17 +6324,24 @@ fn fetch_metadata_from_dht(
     let mut total_seen = 0usize;
 
     while Instant::now() < deadline {
-        if shutdown_requested() {
-            last_err = Some("shutdown requested".to_string());
+        if torrent_stop_requested(cancel) {
+            last_err = Some("metadata fetch cancelled".to_string());
             break;
         }
 
         while let Some(addr) = queue.pop_front() {
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || torrent_stop_requested(cancel) {
                 break;
             }
             log_info!("metadata: trying dht peer {addr}");
-            match fetch_metadata_from_peer(addr, expected_hashes, peer_id, deadline, connect_cfg) {
+            match fetch_metadata_from_peer(
+                addr,
+                expected_hashes,
+                peer_id,
+                deadline,
+                connect_cfg,
+                cancel,
+            ) {
                 Ok(data) => {
                     log_info!("metadata: dht peer {addr} delivered metadata");
                     result = Some(data);
@@ -6113,6 +6402,7 @@ fn fetch_metadata_from_peer(
     peer_id: [u8; 20],
     deadline: Instant,
     connect_cfg: &ConnectionConfig,
+    cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let info_hash = expected_hashes.swarm_id()?;
     let hybrid_v2_info_hash = expected_hashes.hybrid_v2_swarm_id();
@@ -6161,8 +6451,8 @@ fn fetch_metadata_from_peer(
     let mut last_receive = Instant::now();
 
     while start.elapsed() < METADATA_FETCH_TIMEOUT && Instant::now() < deadline {
-        if shutdown_requested() {
-            return Err("shutdown requested".to_string());
+        if torrent_stop_requested(cancel) {
+            return Err("metadata fetch cancelled".to_string());
         }
         match reader.read_message(&mut stream) {
             Ok(Some(message)) => {
@@ -6336,7 +6626,7 @@ fn fetch_metadata_from_peer(
                     _ => {}
                 }
             }
-            Ok(None) => continue,
+            Ok(None) => {}
             Err(err) => return Err(format!("message read failed: {err}")),
         }
 
@@ -8298,6 +8588,7 @@ fn resume_from_storage(
     base_piece_length: u64,
     file_spans: &[FileSpan],
     resume: Option<&ResumeData>,
+    cancel: &AtomicBool,
 ) -> Result<ResumeStats, String> {
     let piece_count = pieces.piece_count();
     if piece_count == 0 {
@@ -8318,28 +8609,37 @@ fn resume_from_storage(
             {
                 // A crash may leave verified pieces on disk newer than the last
                 // resume snapshot. Recover them, not just the saved set bits.
-                return full_recheck(pieces, storage, base_piece_length, Some(&SHUTDOWN));
+                return full_recheck(pieces, storage, base_piece_length, Some(cancel));
             }
-            let max_len = base_piece_length
-                .try_into()
-                .map_err(|_| "piece length too large".to_string())?;
-            let mut buffer = vec![0u8; max_len];
+            let mut verifier = PieceVerifier::new(base_piece_length)?;
             for index in 0..piece_count {
+                if torrent_stop_requested(cancel) {
+                    break;
+                }
                 if !bitfield_has(&resume.bitfield, index) {
                     continue;
                 }
                 // Length and modification time are only cache hints: they can
                 // survive bit rot or deliberate metadata restoration. Never
                 // advertise resumed data until its piece hash is verified.
-                let _ = verify_piece(storage, pieces, index as u32, &mut buffer)?;
+                let _ = verifier.verify(storage, pieces, index as u32)?;
             }
             return Ok(ResumeStats {
                 completed_bytes: pieces.completed_bytes(),
             });
         }
     }
-
-    full_recheck(pieces, storage, base_piece_length, None)
+    // A new torrent whose files do not exist yet has nothing to verify.
+    let nothing_on_disk = (0..storage.file_count()).all(|index| {
+        storage
+            .file_path(index)
+            .and_then(|path| fs::metadata(path).ok())
+            .is_none_or(|metadata| metadata.len() == 0)
+    });
+    if nothing_on_disk {
+        return Ok(ResumeStats { completed_bytes: 0 });
+    }
+    full_recheck(pieces, storage, base_piece_length, Some(cancel))
 }
 
 fn full_recheck(
@@ -8348,48 +8648,81 @@ fn full_recheck(
     base_piece_length: u64,
     stop_flag: Option<&AtomicBool>,
 ) -> Result<ResumeStats, String> {
-    let piece_count = pieces.piece_count();
-    let max_len = base_piece_length
-        .try_into()
-        .map_err(|_| "piece length too large".to_string())?;
-    let mut buffer = vec![0u8; max_len];
-    for index in 0..piece_count {
+    let mut verifier = PieceVerifier::new(base_piece_length)?;
+    for index in 0..pieces.piece_count() {
         if stop_flag.is_some_and(torrent_stop_requested) {
             break;
         }
-        verify_piece(storage, pieces, index as u32, &mut buffer)?;
+        verifier.verify(storage, pieces, index as u32)?;
     }
     Ok(ResumeStats {
         completed_bytes: pieces.completed_bytes(),
     })
 }
 
-fn verify_piece(
-    storage: &mut storage::Storage,
-    pieces: &mut piece::PieceManager,
-    index: u32,
-    buffer: &mut [u8],
-) -> Result<bool, String> {
-    let length = pieces
-        .piece_length(index)
-        .ok_or_else(|| "missing piece length".to_string())? as usize;
-    let offset = pieces
-        .piece_offset(index)
-        .ok_or_else(|| "missing piece offset".to_string())?;
-    let target = &mut buffer[..length];
-    if storage.read_at(offset, target).is_err() {
-        return Ok(false);
+/// Reads and hashes pieces for resume and recheck. Preallocated but never
+/// written regions read back as zeros; their SHA-1 is computed once per piece
+/// length instead of once per piece.
+struct PieceVerifier {
+    buffer: Vec<u8>,
+    zero_sha1: Option<(usize, [u8; 20])>,
+}
+
+impl PieceVerifier {
+    fn new(base_piece_length: u64) -> Result<Self, String> {
+        let max_len = usize::try_from(base_piece_length)
+            .ok()
+            .filter(|len| *len as u64 <= torrent::MAX_PIECE_LENGTH)
+            .ok_or_else(|| "piece length too large".to_string())?;
+        Ok(Self {
+            buffer: vec![0u8; max_len],
+            zero_sha1: None,
+        })
     }
-    let expected = pieces
-        .piece_hash(index)
-        .ok_or_else(|| "missing piece hash".to_string())?;
-    if verify_piece_hash(target, expected) {
-        pieces
-            .mark_piece_complete(index)
-            .map_err(|err| format!("resume mark failed: {err}"))?;
-        return Ok(true);
+
+    fn verify(
+        &mut self,
+        storage: &mut storage::Storage,
+        pieces: &mut piece::PieceManager,
+        index: u32,
+    ) -> Result<bool, String> {
+        let length = pieces
+            .piece_length(index)
+            .ok_or_else(|| "missing piece length".to_string())? as usize;
+        let offset = pieces
+            .piece_offset(index)
+            .ok_or_else(|| "missing piece offset".to_string())?;
+        let target = self
+            .buffer
+            .get_mut(..length)
+            .ok_or_else(|| "piece longer than the piece length".to_string())?;
+        if storage.read_at(offset, target).is_err() {
+            return Ok(false);
+        }
+        let expected = pieces
+            .piece_hash(index)
+            .ok_or_else(|| "missing piece hash".to_string())?;
+        let valid = match expected {
+            piece::PieceHash::Sha1(digest) if target.iter().all(|byte| *byte == 0) => {
+                let zero_sha1 = match self.zero_sha1 {
+                    Some((len, zero_sha1)) if len == length => zero_sha1,
+                    _ => {
+                        let zero_sha1 = sha1::sha1(target);
+                        self.zero_sha1 = Some((length, zero_sha1));
+                        zero_sha1
+                    }
+                };
+                zero_sha1 == *digest
+            }
+            _ => verify_piece_hash(target, expected),
+        };
+        if valid {
+            pieces
+                .mark_piece_complete(index)
+                .map_err(|err| format!("resume mark failed: {err}"))?;
+        }
+        Ok(valid)
     }
-    Ok(false)
 }
 
 fn resume_path(download_dir: &Path, info_hash: [u8; 20]) -> PathBuf {
@@ -13274,6 +13607,7 @@ fn drain_rss_poll_results(
                     preallocate: args.preallocate,
                     initial_label: String::new(),
                     initial_options: ui::AddOptions::default(),
+                    held: false,
                 };
                 let queued = enqueue_request_if_new(
                     registry,
@@ -13353,6 +13687,7 @@ fn drain_rss_download_results(
                     preallocate: args.preallocate,
                     initial_label: String::new(),
                     initial_options: ui::AddOptions::default(),
+                    held: false,
                 };
                 let queued = enqueue_request_if_new(
                     registry,
@@ -14648,6 +14983,7 @@ mod core_helpers_tests {
             preallocate: false,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         };
 
         assert!(is_duplicate_torrent(
@@ -14697,6 +15033,7 @@ mod core_helpers_tests {
             preallocate: false,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         };
         let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
         let session_store = SessionStore::load(&root).unwrap();
@@ -14720,7 +15057,7 @@ mod core_helpers_tests {
     }
 
     #[test]
-    fn loading_torrent_cannot_enter_offline_stop_delete_or_archive_paths() {
+    fn loading_torrent_commands_cancel_the_load_without_touching_its_files() {
         let root = temp_path("loading-lifecycle-guard");
         fs::create_dir_all(&root).unwrap();
         let torrent_bytes = test_torrent_bytes();
@@ -14736,14 +15073,22 @@ mod core_helpers_tests {
                 false,
             )
             .unwrap();
-        let in_flight: InFlightTorrents =
-            Arc::new(Mutex::new(HashMap::from([(meta.info_hash, 9)])));
+        let control = Arc::new(LoadControl::default());
+        let in_flight: InFlightTorrents = Arc::new(Mutex::new(HashMap::from([(
+            meta.info_hash,
+            (9, Arc::clone(&control)),
+        )])));
         let mut queue = VecDeque::new();
 
-        assert!(
-            stop_torrent(&registry, &None, &mut queue, 9, &session_store, &in_flight,).is_err()
-        );
-        assert!(delete_torrent(
+        // A loading torrent (for example a magnet waiting for metadata) can
+        // always be stopped or removed; the worker applies the request once it
+        // has released its files.
+        stop_torrent(&registry, &None, &mut queue, 9, &session_store, &in_flight).unwrap();
+        assert!(control.cancel.load(Ordering::SeqCst));
+        assert_eq!(control.action.load(Ordering::SeqCst), LOAD_STOP);
+        archive_torrent(&registry, &None, &mut queue, 9, &session_store, &in_flight).unwrap();
+        assert_eq!(control.action.load(Ordering::SeqCst), LOAD_ARCHIVE);
+        delete_torrent(
             &registry,
             &None,
             &mut queue,
@@ -14752,14 +15097,181 @@ mod core_helpers_tests {
             &session_store,
             &in_flight,
         )
-        .is_err());
-        assert!(
-            archive_torrent(&registry, &None, &mut queue, 9, &session_store, &in_flight,).is_err()
-        );
+        .unwrap();
+        // A later stop never downgrades a removal.
+        stop_torrent(&registry, &None, &mut queue, 9, &session_store, &in_flight).unwrap();
+        assert_eq!(control.take(), Some(LOAD_DELETE));
         assert!(session_store.contains(meta.info_hash));
         assert!(!session_store.get(meta.info_hash).unwrap().pending_delete);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stopped_queued_torrent_stays_listed_and_can_resume() {
+        let root = temp_path("stop-queued-held");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
+        session_store
+            .upsert(
+                meta.info_hash,
+                "held".to_string(),
+                torrent_bytes.clone(),
+                &root,
+                false,
+            )
+            .unwrap();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let mut queue = VecDeque::from([TorrentRequest {
+            id: 5,
+            source: TorrentSource::Bytes(torrent_bytes),
+            download_dir: root.clone(),
+            preallocate: false,
+            initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
+            held: false,
+        }]);
+        let in_flight = empty_in_flight();
+
+        stop_torrent(&registry, &None, &mut queue, 5, &session_store, &in_flight).unwrap();
+        assert!(queue[0].held);
+        // Stopping is durable: a restart restores the torrent stopped.
+        assert!(session_store.get(meta.info_hash).unwrap().paused);
+
+        resume_torrent(&registry, &None, &mut queue, 5, &session_store, &in_flight).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(!queue[0].held);
+        assert!(!session_store.get(meta.info_hash).unwrap().paused);
+
+        pause_torrent(&registry, &None, &mut queue, 5, &session_store, &in_flight).unwrap();
+        assert!(!queue[0].held);
+        assert!(queue[0].initial_options.paused);
+        assert!(session_store.get(meta.info_hash).unwrap().paused);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn queued_magnet_without_metadata_can_be_deleted_with_data() {
+        let root = temp_path("delete-queued-magnet");
+        fs::create_dir_all(&root).unwrap();
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ui = Arc::new(Mutex::new(ui::UiState {
+            torrents: vec![ui::UiTorrent {
+                id: 6,
+                status: "error".to_string(),
+                ..ui::UiTorrent::default()
+            }],
+            ..ui::UiState::default()
+        }));
+        let ui_state = Some(Arc::clone(&ui));
+        let mut queue = VecDeque::from([TorrentRequest {
+            id: 6,
+            source: TorrentSource::Magnet(
+                "magnet:?xt=urn:btih:4b07d0071f9ceb21af6b8ba05b3a3c6f507e3fb2&dn=Test".to_string(),
+            ),
+            download_dir: root.clone(),
+            preallocate: false,
+            initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
+            held: true,
+        }]);
+
+        delete_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            6,
+            true,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .unwrap();
+        assert!(queue.is_empty());
+        assert!(lock_or_recover(&ui).torrents.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_cancelled_load_without_session_state_only_drops_the_row() {
+        let root = temp_path("remove-unstored");
+        fs::create_dir_all(&root).unwrap();
+        let session_store = SessionStore::load(&root).unwrap();
+        let ui = Arc::new(Mutex::new(ui::UiState {
+            torrents: vec![ui::UiTorrent {
+                id: 8,
+                status: "fetching metadata".to_string(),
+                ..ui::UiTorrent::default()
+            }],
+            ..ui::UiState::default()
+        }));
+        let ui_state = Some(Arc::clone(&ui));
+        remove_stored_torrent(&session_store, &ui_state, 8, [7u8; 20], true, 0).unwrap();
+        let state = lock_or_recover(&ui);
+        assert!(state.torrents.is_empty());
+        assert!(state.deleted_torrents.contains(&8));
+        drop(state);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_magnet_fetch_returns_without_network_work() {
+        let cancel = AtomicBool::new(true);
+        let cfg = ConnectionConfig {
+            encryption: EncryptionMode::Prefer,
+            utp: None,
+            ip_filter: None,
+            proxy: None,
+        };
+        let started = Instant::now();
+        let error = fetch_torrent_from_magnet(
+            "magnet:?xt=urn:btih:4b07d0071f9ceb21af6b8ba05b3a3c6f507e3fb2&dn=Test\
+             &tr=udp%3A%2F%2F203.0.113.1%3A6969&x.pe=203.0.113.2:6881",
+            0,
+            &dht::disabled(),
+            &cfg,
+            8,
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn paused_stopping_and_seeding_torrents_do_not_use_download_slots() {
+        let root = temp_path("active-download-slots");
+        fs::create_dir_all(&root).unwrap();
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let in_flight = empty_in_flight();
+        let mut guards = Vec::new();
+        for id in 1..=4u64 {
+            let mut info_hash = [0u8; 20];
+            info_hash[0] = id as u8;
+            let dir = root.join(id.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            let context = make_test_context(id, &dir);
+            let mut fields = Arc::try_unwrap(context).ok().unwrap();
+            fields.info_hash = info_hash;
+            match id {
+                1 => fields.paused.store(true, Ordering::SeqCst),
+                2 => fields.piece_complete.store(true, Ordering::SeqCst),
+                3 => fields.stop_requested.store(true, Ordering::SeqCst),
+                _ => {}
+            }
+            register_session(&registry, Arc::new(fields)).unwrap();
+            guards.push(InFlightTorrentGuard::acquire(&in_flight, info_hash, id).unwrap());
+        }
+        // One more torrent is still loading.
+        guards.push(InFlightTorrentGuard::acquire(&in_flight, [9u8; 20], 9).unwrap());
+        assert_eq!(active_download_count(&registry, &in_flight), 2);
+        drop(guards);
+        assert_eq!(active_download_count(&registry, &in_flight), 0);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -15034,6 +15546,7 @@ mod core_helpers_tests {
             meta.info.piece_length,
             &spans,
             Some(&resume),
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(stats.completed_bytes, 16);
@@ -15071,6 +15584,7 @@ mod core_helpers_tests {
             meta.info.piece_length,
             &spans,
             Some(&resume),
+            &AtomicBool::new(false),
         )
         .unwrap();
 
@@ -15115,6 +15629,7 @@ mod core_helpers_tests {
             preallocate: false,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         };
         let (_, _, paths) =
             delete_info_from_request(&request, &[(0, "saved-name.bin".to_string())]).unwrap();
@@ -15157,6 +15672,7 @@ mod core_helpers_tests {
             preallocate: false,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         }]);
         let ui_state = Some(Arc::new(Mutex::new(ui::UiState {
             torrents: vec![ui::UiTorrent {
@@ -17645,6 +18161,7 @@ mod core_helpers_tests {
             preallocate: false,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         }]);
 
         stop_torrent(
@@ -17657,7 +18174,7 @@ mod core_helpers_tests {
         )
         .unwrap();
 
-        assert!(queue.is_empty());
+        assert!(queue.len() == 1 && queue[0].held);
         let state = lock_or_recover(&ui);
         assert_eq!(state.status, "stopped");
         assert_eq!(state.download_rate_bps, 0.0);
@@ -18167,6 +18684,57 @@ fn apply_file_rename(
     Ok(())
 }
 
+/// Persist the paused flag of a queued request whose torrent is already in
+/// the session (a torrent that has never started has no durable entry yet).
+fn set_queued_paused(
+    session_store: &SessionStore,
+    request: &TorrentRequest,
+    paused: bool,
+) -> Result<(), String> {
+    match info_hash_for_source(&request.source) {
+        Ok(info_hash) if session_store.contains(info_hash) => {
+            session_store.set_paused(info_hash, paused)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn pause_torrent(
+    registry: &SessionRegistry,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    queue: &mut VecDeque<TorrentRequest>,
+    torrent_id: u64,
+    session_store: &SessionStore,
+    in_flight: &InFlightTorrents,
+) -> Result<(), String> {
+    if find_context_by_id(registry, torrent_id).is_some() {
+        return set_torrent_paused(registry, ui_state, session_store, torrent_id, true);
+    }
+    if let Some(control) = in_flight_control(in_flight, torrent_id) {
+        control.request(LOAD_PAUSE);
+        set_torrent_status_ui(
+            ui_state,
+            torrent_id,
+            "paused",
+            None,
+            Some(true),
+            queue.len(),
+        );
+        return Ok(());
+    }
+    let queue_len = queue.len();
+    let request = queue
+        .iter_mut()
+        .find(|request| request.id == torrent_id)
+        .ok_or_else(|| "unknown torrent".to_string())?;
+    set_queued_paused(session_store, request, true)?;
+    // The torrent keeps its queue position and starts paused.
+    request.initial_options.paused = true;
+    let status = if request.held { "paused" } else { "queued" };
+    set_torrent_status_ui(ui_state, torrent_id, status, None, Some(true), queue_len);
+    Ok(())
+}
+
 fn set_torrent_paused(
     registry: &SessionRegistry,
     ui_state: &Option<Arc<Mutex<ui::UiState>>>,
@@ -18221,77 +18789,62 @@ fn resume_torrent(
         }
         return set_torrent_paused(registry, ui_state, session_store, torrent_id, false);
     }
-
-    let info_hash = info_hash_from_ui(ui_state, torrent_id)
-        .ok_or_else(|| "torrent cannot be resumed".to_string())?;
-    let already_loading = lock_or_recover(in_flight).contains_key(&info_hash);
-    if queue_contains_info_hash(queue, info_hash) || already_loading {
-        update_ui(ui_state, |state| {
-            update_torrent_entry(state, torrent_id, |torrent| {
-                torrent.paused = false;
-                torrent.status = if already_loading {
-                    "loading".to_string()
-                } else {
-                    "queued".to_string()
-                };
-                torrent.download_rate_bps = 0.0;
-                torrent.upload_rate_bps = 0.0;
-                torrent.active_peers = 0;
-                torrent.eta_secs = 0;
-                torrent.last_error.clear();
-            });
-            if state.current_id == Some(torrent_id) {
-                state.status = if already_loading {
-                    "loading".to_string()
-                } else {
-                    "queued".to_string()
-                };
-                state.paused = false;
-                state.download_rate_bps = 0.0;
-                state.upload_rate_bps = 0.0;
-                state.active_peers = 0;
-                state.eta_secs = 0;
-                state.last_error.clear();
-            }
-        });
+    if let Some(control) = in_flight_control(in_flight, torrent_id) {
+        if control.cancel.load(Ordering::SeqCst) {
+            return Err("torrent is still stopping; try again in a moment".to_string());
+        }
+        set_torrent_status_ui(
+            ui_state,
+            torrent_id,
+            "loading",
+            Some(""),
+            Some(false),
+            queue.len(),
+        );
+        return Ok(());
+    }
+    let queue_len = queue.len();
+    if let Some(request) = queue.iter_mut().find(|request| request.id == torrent_id) {
+        set_queued_paused(session_store, request, false)?;
+        request.held = false;
+        request.initial_options.paused = false;
+        set_torrent_status_ui(
+            ui_state,
+            torrent_id,
+            "queued",
+            Some(""),
+            Some(false),
+            queue_len,
+        );
         return Ok(());
     }
 
-    let entry = session_store.get(info_hash).ok_or_else(|| {
-        "torrent cannot be resumed because its session metadata is unavailable".to_string()
-    })?;
-    if entry.pending_delete {
-        return Err("torrent deletion is pending; retry deletion instead".to_string());
-    }
-    session_store.set_paused(info_hash, false)?;
-    let label = session_entry_label(&entry);
-    let request = TorrentRequest {
-        id: torrent_id,
-        source: TorrentSource::Bytes(entry.torrent_bytes.clone()),
-        download_dir: entry.download_dir.clone(),
-        preallocate: entry.preallocate,
-        initial_label: entry.label.clone(),
-        initial_options: ui::AddOptions::default(),
-    };
-    enqueue_request_with_label(queue, ui_state, request, label);
-    update_ui(ui_state, |state| {
-        update_torrent_entry(state, torrent_id, |torrent| {
-            torrent.paused = false;
-            torrent.download_rate_bps = 0.0;
-            torrent.upload_rate_bps = 0.0;
-            torrent.active_peers = 0;
-            torrent.eta_secs = 0;
-        });
-        if state.current_id == Some(torrent_id) {
-            state.status = "queued".to_string();
-            state.paused = false;
-            state.download_rate_bps = 0.0;
-            state.upload_rate_bps = 0.0;
-            state.active_peers = 0;
-            state.eta_secs = 0;
-            state.last_error.clear();
+    let info_hash = info_hash_from_ui(ui_state, torrent_id)
+        .ok_or_else(|| "torrent cannot be resumed".to_string())?;
+    if !queue_contains_info_hash(queue, info_hash) {
+        let entry = session_store.get(info_hash).ok_or_else(|| {
+            "torrent cannot be resumed because its session metadata is unavailable".to_string()
+        })?;
+        if entry.pending_delete {
+            return Err("torrent deletion is pending; retry deletion instead".to_string());
         }
-    });
+        session_store.set_paused(info_hash, false)?;
+        let label = session_entry_label(&entry);
+        enqueue_request_with_label(
+            queue,
+            ui_state,
+            request_from_session_entry(&entry, torrent_id),
+            label,
+        );
+    }
+    set_torrent_status_ui(
+        ui_state,
+        torrent_id,
+        "queued",
+        Some(""),
+        Some(false),
+        queue.len(),
+    );
     Ok(())
 }
 
@@ -18303,6 +18856,7 @@ fn stop_torrent(
     session_store: &Arc<SessionStore>,
     in_flight: &InFlightTorrents,
 ) -> Result<(), String> {
+    let queue_len = queue.len();
     if let Some(context) = find_context_by_id(registry, torrent_id) {
         if session_store.contains(context.info_hash) {
             session_store.set_paused(context.info_hash, true)?;
@@ -18316,91 +18870,46 @@ fn stop_torrent(
         context
             .allow_completion_reentry
             .store(false, Ordering::SeqCst);
-        if context.stop_requested.load(Ordering::SeqCst) {
-            cancel_peer_connections(&context.peer_cancellations);
-            update_ui(ui_state, |state| {
-                update_torrent_entry(state, torrent_id, |torrent| {
-                    torrent.status = "stopping".to_string();
-                    torrent.paused = false;
-                    torrent.download_rate_bps = 0.0;
-                    torrent.upload_rate_bps = 0.0;
-                    torrent.active_peers = 0;
-                    torrent.eta_secs = 0;
-                });
-                if state.current_id == Some(torrent_id) {
-                    state.status = "stopping".to_string();
-                    state.paused = false;
-                    state.download_rate_bps = 0.0;
-                    state.upload_rate_bps = 0.0;
-                    state.active_peers = 0;
-                    state.eta_secs = 0;
-                }
-            });
-            return Ok(());
-        }
         context.stop_requested.store(true, Ordering::SeqCst);
         cancel_peer_connections(&context.peer_cancellations);
-        update_ui(ui_state, |state| {
-            update_torrent_entry(state, torrent_id, |torrent| {
-                torrent.status = "stopping".to_string();
-                torrent.paused = false;
-                torrent.download_rate_bps = 0.0;
-                torrent.upload_rate_bps = 0.0;
-                torrent.active_peers = 0;
-                torrent.eta_secs = 0;
-            });
-            if state.current_id == Some(torrent_id) {
-                state.status = "stopping".to_string();
-                state.paused = false;
-                state.download_rate_bps = 0.0;
-                state.upload_rate_bps = 0.0;
-                state.active_peers = 0;
-                state.eta_secs = 0;
-            }
-        });
+        set_torrent_status_ui(
+            ui_state,
+            torrent_id,
+            "stopping",
+            None,
+            Some(false),
+            queue_len,
+        );
         return Ok(());
     }
-
-    if lock_or_recover(in_flight)
-        .values()
-        .any(|loading_id| *loading_id == torrent_id)
-    {
-        return Err("torrent is still loading; try again in a moment".to_string());
-    }
-
-    let mut removed = false;
-    queue.retain(|request| {
-        if request.id == torrent_id {
-            removed = true;
-            false
-        } else {
-            true
-        }
-    });
-    if removed {
-        update_ui(ui_state, |state| {
-            state.queue_len = queue.len();
-            update_torrent_entry(state, torrent_id, |torrent| {
-                torrent.status = "stopped".to_string();
-                torrent.paused = false;
-                torrent.download_rate_bps = 0.0;
-                torrent.upload_rate_bps = 0.0;
-                torrent.active_peers = 0;
-                torrent.eta_secs = 0;
-            });
-            if state.current_id == Some(torrent_id) {
-                state.status = "stopped".to_string();
-                state.paused = false;
-                state.download_rate_bps = 0.0;
-                state.upload_rate_bps = 0.0;
-                state.active_peers = 0;
-                state.eta_secs = 0;
-            }
-        });
+    if let Some(control) = in_flight_control(in_flight, torrent_id) {
+        control.request(LOAD_STOP);
+        set_torrent_status_ui(
+            ui_state,
+            torrent_id,
+            "stopping",
+            None,
+            Some(false),
+            queue_len,
+        );
         return Ok(());
     }
-
-    Err("unknown torrent".to_string())
+    let request = queue
+        .iter_mut()
+        .find(|request| request.id == torrent_id)
+        .ok_or_else(|| "unknown torrent".to_string())?;
+    set_queued_paused(session_store, request, true)?;
+    request.held = true;
+    request.initial_options.paused = false;
+    set_torrent_status_ui(
+        ui_state,
+        torrent_id,
+        "stopped",
+        None,
+        Some(false),
+        queue_len,
+    );
+    Ok(())
 }
 
 fn archive_torrent(
@@ -18537,11 +19046,17 @@ fn delete_torrent(
         return Ok(());
     }
 
-    if lock_or_recover(in_flight)
-        .values()
-        .any(|loading_id| *loading_id == torrent_id)
-    {
-        return Err("torrent is still loading; try again in a moment".to_string());
+    if let Some(control) = in_flight_control(in_flight, torrent_id) {
+        // The worker is fetching metadata, verifying data or starting up.
+        // It performs the removal itself once it has released the files.
+        control.request(if remove_data {
+            LOAD_DELETE
+        } else {
+            LOAD_ARCHIVE
+        });
+        let status = if remove_data { "deleting" } else { "archiving" };
+        set_torrent_status_ui(ui_state, torrent_id, status, None, None, queue.len());
+        return Ok(());
     }
 
     if let Some(queue_index) = queue.iter().position(|request| request.id == torrent_id) {
@@ -18561,7 +19076,10 @@ fn delete_torrent(
                             .map_err(|err| format!("read failed: {err}"))?
                     }
                     TorrentSource::Magnet(_) => {
-                        return Err("magnet metadata unavailable for safe deletion".to_string())
+                        // Metadata was never fetched, so nothing was written.
+                        let _ = queue.remove(queue_index);
+                        remove_torrent_ui(ui_state, torrent_id, queue.len());
+                        return Ok(());
                     }
                 };
                 let meta =
@@ -18612,9 +19130,34 @@ fn delete_torrent(
 
     let info_hash =
         info_hash_from_ui(ui_state, torrent_id).ok_or_else(|| "unknown torrent".to_string())?;
-    let mut entry = session_store
-        .get(info_hash)
-        .ok_or_else(|| "torrent metadata unavailable; refusing unsafe deletion".to_string())?;
+    if !session_store.contains(info_hash) {
+        return Err("torrent metadata unavailable; refusing unsafe deletion".to_string());
+    }
+    remove_stored_torrent(
+        session_store,
+        ui_state,
+        torrent_id,
+        info_hash,
+        remove_data,
+        queue.len(),
+    )
+}
+
+/// Remove a torrent that has no running worker, deleting its payload when
+/// requested. The caller holds the session operation lock. A torrent that
+/// never reached the session has nothing on disk and only leaves the list.
+fn remove_stored_torrent(
+    session_store: &SessionStore,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    torrent_id: u64,
+    info_hash: [u8; 20],
+    remove_data: bool,
+    queue_len: usize,
+) -> Result<(), String> {
+    let Some(mut entry) = session_store.get(info_hash) else {
+        remove_torrent_ui(ui_state, torrent_id, queue_len);
+        return Ok(());
+    };
     if remove_data {
         if entry.file_renames.is_empty() {
             let legacy_renames = legacy_resume_file_renames(&entry.download_dir, info_hash)?;
@@ -18624,18 +19167,22 @@ fn delete_torrent(
         entry = session_store
             .get(info_hash)
             .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if let Err(err) = delete_session_entry_payload(&entry) {
-            mark_delete_failed_ui(ui_state, torrent_id, &err, queue.len());
-            return Err(err);
-        }
+        retain_delete_error(
+            delete_session_entry_payload(&entry),
+            ui_state,
+            torrent_id,
+            queue_len,
+        )?;
     } else if entry.pending_delete {
         return Err("data deletion is pending; retry delete with data".to_string());
     }
-    if let Err(err) = session_store.remove(info_hash) {
-        mark_delete_failed_ui(ui_state, torrent_id, &err, queue.len());
-        return Err(err);
-    }
-    remove_torrent_ui(ui_state, torrent_id, queue.len());
+    retain_delete_error(
+        session_store.remove(info_hash),
+        ui_state,
+        torrent_id,
+        queue_len,
+    )?;
+    remove_torrent_ui(ui_state, torrent_id, queue_len);
     Ok(())
 }
 
@@ -18687,6 +19234,7 @@ fn delete_info_from_session_entry(
         preallocate: entry.preallocate,
         initial_label: entry.label.clone(),
         initial_options: ui::AddOptions::default(),
+        held: false,
     };
     let info = delete_info_from_request(&request, &entry.file_renames)?;
     if info.0 != entry.info_hash {
@@ -20609,6 +21157,7 @@ fn scan_watch_dir(
             preallocate,
             initial_label: String::new(),
             initial_options: ui::AddOptions::default(),
+            held: false,
         };
         let label = path
             .file_name()
