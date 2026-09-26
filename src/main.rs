@@ -3670,23 +3670,10 @@ fn restore_session_entries(
                 }
             }
         }
+        // Session entries are unique per info hash, so no queue scan (which
+        // would re-parse every queued torrent per entry) is needed here.
         let label = session_entry_label(&entry);
-        if queue_contains_info_hash(queue, entry.info_hash) {
-            log_warn!(
-                "duplicate restored session ignored: {}",
-                hex(&entry.info_hash)
-            );
-            continue;
-        }
-        let request = TorrentRequest {
-            id: *next_id,
-            source: TorrentSource::Bytes(entry.torrent_bytes.clone()),
-            download_dir: entry.download_dir.clone(),
-            preallocate: entry.preallocate,
-            initial_label: entry.label.clone(),
-            initial_options: ui::AddOptions::default(),
-            held: false,
-        };
+        let request = request_from_session_entry(&entry, *next_id);
         *next_id = next_id.saturating_add(1);
         enqueue_request_with_label(queue, ui_state, request, label);
     }
@@ -4848,6 +4835,8 @@ fn run_torrent_once(
                 "stopping"
             } else if paused {
                 "paused"
+            } else if context.rechecking.load(Ordering::Acquire) {
+                "checking"
             } else if is_complete {
                 "seeding"
             } else if tracker_error.is_some() && known_count == 0 && active_count == 0 {
@@ -8193,12 +8182,38 @@ impl PieceVerifier {
         pieces: &mut piece::PieceManager,
         index: u32,
     ) -> Result<bool, String> {
-        let length = pieces
-            .piece_length(index)
-            .ok_or_else(|| "missing piece length".to_string())? as usize;
-        let offset = pieces
-            .piece_offset(index)
-            .ok_or_else(|| "missing piece offset".to_string())?;
+        let (offset, length, expected) = piece_location(pieces, index)?;
+        let valid = self.read_and_check(storage, offset, length, &expected)?;
+        if valid {
+            mark_verified(pieces, index)?;
+        }
+        Ok(valid)
+    }
+
+    /// Like `verify`, but each shared lock is only held for its own step, so
+    /// peers keep transferring while a long recheck runs.
+    fn verify_shared(
+        &mut self,
+        storage: &Mutex<storage::Storage>,
+        pieces: &Mutex<piece::PieceManager>,
+        index: u32,
+    ) -> Result<bool, String> {
+        let (offset, length, expected) = piece_location(&lock_or_recover(pieces), index)?;
+        let valid =
+            self.read_and_check(&mut lock_or_recover(storage), offset, length, &expected)?;
+        if valid {
+            mark_verified(&mut lock_or_recover(pieces), index)?;
+        }
+        Ok(valid)
+    }
+
+    fn read_and_check(
+        &mut self,
+        storage: &mut storage::Storage,
+        offset: u64,
+        length: usize,
+        expected: &piece::PieceHash,
+    ) -> Result<bool, String> {
         let target = self
             .buffer
             .get_mut(..length)
@@ -8206,10 +8221,7 @@ impl PieceVerifier {
         if storage.read_at(offset, target).is_err() {
             return Ok(false);
         }
-        let expected = pieces
-            .piece_hash(index)
-            .ok_or_else(|| "missing piece hash".to_string())?;
-        let valid = match expected {
+        Ok(match expected {
             piece::PieceHash::Sha1(digest) if target.iter().all(|byte| *byte == 0) => {
                 let zero_sha1 = match self.zero_sha1 {
                     Some((len, zero_sha1)) if len == length => zero_sha1,
@@ -8222,14 +8234,30 @@ impl PieceVerifier {
                 zero_sha1 == *digest
             }
             _ => verify_piece_hash(target, expected),
-        };
-        if valid {
-            pieces
-                .mark_piece_complete(index)
-                .map_err(|err| format!("resume mark failed: {err}"))?;
-        }
-        Ok(valid)
+        })
     }
+}
+
+/// Offset, length and expected hash of a piece.
+fn piece_location(
+    pieces: &piece::PieceManager,
+    index: u32,
+) -> Result<(u64, usize, piece::PieceHash), String> {
+    match (
+        pieces.piece_offset(index),
+        pieces.piece_length(index),
+        pieces.piece_hash(index),
+    ) {
+        (Some(offset), Some(length), Some(hash)) => Ok((offset, length as usize, hash.clone())),
+        _ => Err("missing piece metadata".to_string()),
+    }
+}
+
+fn mark_verified(pieces: &mut piece::PieceManager, index: u32) -> Result<(), String> {
+    pieces
+        .mark_piece_complete(index)
+        .map(|_| ())
+        .map_err(|err| format!("resume mark failed: {err}"))
 }
 
 fn resume_path(download_dir: &Path, info_hash: [u8; 20]) -> PathBuf {
@@ -12246,15 +12274,22 @@ fn recheck_torrent(
                 }
             }
             let _guard = RecheckGuard(rechecking);
-            let result = {
-                // Acquire both locks before resetting so resume saves and peer
-                // workers can never observe a transient all-missing bitfield.
-                let mut p = lock_or_recover(&pieces_arc);
-                let mut s = lock_or_recover(&storage_arc);
-                p.reset_verified();
-                full_recheck(&mut p, &mut s, base_piece_length, Some(&stop_flag))
-                    .map(|_| (p.completed_pieces(), p.piece_count(), p.completed_bytes()))
-            };
+            // Verify piece by piece, holding the shared locks only per step,
+            // so peers of this torrent keep working (and stay connected)
+            // during a long recheck. Pieces completed by peers meanwhile are
+            // verified by those peers.
+            lock_or_recover(&pieces_arc).reset_verified();
+            let piece_count = lock_or_recover(&pieces_arc).piece_count();
+            let result = PieceVerifier::new(base_piece_length).and_then(|mut verifier| {
+                for index in 0..piece_count {
+                    if torrent_stop_requested(&stop_flag) {
+                        break;
+                    }
+                    verifier.verify_shared(&storage_arc, &pieces_arc, index as u32)?;
+                }
+                let p = lock_or_recover(&pieces_arc);
+                Ok((p.completed_pieces(), p.wanted_pieces(), p.completed_bytes()))
+            });
             match result {
                 Ok((completed, total, completed_bytes)) => {
                     save_requested.store(true, Ordering::Release);
@@ -12926,7 +12961,12 @@ fn execute_schedule_command(
         log_info!("schedule: resumed all torrents");
     } else if command == "stop_ratio_reached" {
         if let Ok(guard) = registry.lock() {
-            for ctx in guard.values() {
+            // The ratio limit applies to seeding torrents only; a download
+            // that already uploaded a lot must still finish.
+            for ctx in guard
+                .values()
+                .filter(|ctx| ctx.piece_complete.load(Ordering::Acquire))
+            {
                 check_seed_ratio(&ctx.uploaded, &ctx.downloaded, &ctx.stop_requested);
             }
         }
@@ -15524,6 +15564,48 @@ mod core_helpers_tests {
             assert_eq!(pieces.reserve_piece_for_peer(2, &[0x80], false), Some(0));
         }
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn piece_verifier_checks_data_and_all_zero_pieces_with_shared_locks() {
+        let root = temp_path("piece-verifier");
+        fs::create_dir_all(&root).unwrap();
+        let data = *b"0123456789abcdef";
+        let mut piece_hashes = sha1::sha1(&data).to_vec();
+        piece_hashes.extend_from_slice(&sha1::sha1(&[0u8; 16]));
+        let torrent_bytes = bencode::encode(&Value::Dict(vec![(
+            b"info".to_vec(),
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(48)),
+                (b"name".to_vec(), Value::Bytes(b"verify.bin".to_vec())),
+                (b"piece length".to_vec(), Value::Int(16)),
+                (
+                    b"pieces".to_vec(),
+                    Value::Bytes({
+                        let mut all = piece_hashes.clone();
+                        all.extend_from_slice(&[7u8; 20]);
+                        all
+                    }),
+                ),
+            ]),
+        )]));
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let storage = Mutex::new(
+            storage::Storage::new(&meta, &root, storage::StorageOptions::default()).unwrap(),
+        );
+        lock_or_recover(&storage).write_at(0, &data).unwrap();
+        lock_or_recover(&storage).write_at(16, &[0u8; 32]).unwrap();
+        let pieces = Mutex::new(piece::PieceManager::new(&meta).unwrap());
+        let mut verifier = PieceVerifier::new(16).unwrap();
+        assert!(verifier.verify_shared(&storage, &pieces, 0).unwrap());
+        // All-zero piece whose hash is the SHA-1 of zeros.
+        assert!(verifier.verify_shared(&storage, &pieces, 1).unwrap());
+        // All-zero data that does not match its hash.
+        assert!(!verifier.verify_shared(&storage, &pieces, 2).unwrap());
+        let p = lock_or_recover(&pieces);
+        assert!(p.is_piece_complete(0) && p.is_piece_complete(1) && !p.is_piece_complete(2));
+        drop(p);
         let _ = fs::remove_dir_all(&root);
     }
 
