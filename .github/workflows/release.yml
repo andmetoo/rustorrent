@@ -1,0 +1,100 @@
+name: Release
+
+# Pushing a version tag (for example v0.1.0-beta.2) builds the macOS DMGs and
+# a Linux archive, then publishes a GitHub release with docs/releases/<tag>.md
+# as its notes. Tags containing a hyphen are marked as prereleases.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS DMGs
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Select current stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - name: Check the tag matches the crate version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml $version"; exit 1; }
+      - name: Build the Apple silicon and universal apps
+        run: |
+          ./macos/package_app.sh --dmg --output "$RUNNER_TEMP/dist"
+          ./macos/package_app.sh --universal --dmg --output "$RUNNER_TEMP/dist"
+      - name: Verify the artifacts
+        run: |
+          cd "$RUNNER_TEMP/dist"
+          for dmg in *.dmg; do hdiutil verify "$dmg"; done
+          ls -l
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Select current stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Build and package
+        run: |
+          cargo build --release --locked
+          name="rustorrent-${GITHUB_REF_NAME#v}-linux-x86_64"
+          mkdir -p "$RUNNER_TEMP/$name" "$RUNNER_TEMP/dist"
+          cp target/release/rustorrent README.md LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/$name/"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/dist/$name.tar.gz" "$name"
+          ls -l target/release/rustorrent "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          test -f "$notes" || { echo "missing release notes: $notes"; exit 1; }
+          title="$(head -n 1 "$notes" | sed 's/^# *//')"
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          tail -n +2 "$notes" > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$title" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${prerelease[@]}"
