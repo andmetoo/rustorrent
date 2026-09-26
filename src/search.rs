@@ -832,30 +832,35 @@ fn update_catalog(force_refresh: bool) -> Result<(), String> {
 }
 
 fn ensure_runtime(root: &Path) -> Result<(), String> {
+    const FILES: [(&str, &str); 7] = [
+        ("__init__.py", ""),
+        ("engines/__init__.py", ""),
+        (
+            "helpers.py",
+            include_str!("../assets/search_runtime/helpers.py"),
+        ),
+        (
+            "nova2.py",
+            include_str!("../assets/search_runtime/nova2.py"),
+        ),
+        (
+            "nova2dl.py",
+            include_str!("../assets/search_runtime/nova2dl.py"),
+        ),
+        (
+            "novaprinter.py",
+            include_str!("../assets/search_runtime/novaprinter.py"),
+        ),
+        (
+            "socks.py",
+            include_str!("../assets/search_runtime/socks.py"),
+        ),
+    ];
     ensure_real_directory(root)?;
     ensure_real_directory(&root.join("engines"))?;
-    write_if_changed(&root.join("__init__.py"), "")?;
-    write_if_changed(&root.join("engines").join("__init__.py"), "")?;
-    write_if_changed(
-        &root.join("helpers.py"),
-        include_str!("../assets/search_runtime/helpers.py"),
-    )?;
-    write_if_changed(
-        &root.join("nova2.py"),
-        include_str!("../assets/search_runtime/nova2.py"),
-    )?;
-    write_if_changed(
-        &root.join("nova2dl.py"),
-        include_str!("../assets/search_runtime/nova2dl.py"),
-    )?;
-    write_if_changed(
-        &root.join("novaprinter.py"),
-        include_str!("../assets/search_runtime/novaprinter.py"),
-    )?;
-    write_if_changed(
-        &root.join("socks.py"),
-        include_str!("../assets/search_runtime/socks.py"),
-    )?;
+    for (name, content) in FILES {
+        write_if_changed(&root.join(name), content)?;
+    }
     Ok(())
 }
 
@@ -2338,6 +2343,55 @@ mod tests {
         sort_results(&mut results);
         let ids = results.iter().map(|r| r.result_id).collect::<Vec<_>>();
         assert_eq!(ids, [0, 1, 2, 3]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_runtime_searches_mixed_case_engines_with_option_like_keywords() {
+        let Some(python) = detect_python() else {
+            return;
+        };
+        let base = create_plugin_temp_dir().unwrap();
+        let root = base.join("nova3");
+        ensure_runtime(&root).unwrap();
+        fs::write(
+            root.join("engines/MyEngine.py"),
+            "from novaprinter import prettyPrinter\n\
+             class MyEngine:\n\
+             \x20   name = 'Mine'\n\
+             \x20   url = 'https://mine.example'\n\
+             \x20   supported_categories = {'all': '0', 'tv': '5'}\n\
+             \x20   def search(self, what, cat='all'):\n\
+             \x20       prettyPrinter({'link': 'magnet:?xt=urn:btih:' + what, 'name': 'N|x',\n\
+             \x20           'size': '1 KB', 'seeds': 3, 'leech': 1, 'engine_url': self.url})\n",
+        )
+        .unwrap();
+        let runtime = SearchRuntime {
+            root: root.clone(),
+            python: Some(python),
+        };
+        let output = run_python_script(
+            &runtime,
+            "nova2.py",
+            &["--capabilities".to_string()],
+            CAPABILITIES_TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("<MyEngine>"));
+
+        let (results, _) = run_search_process(
+            &runtime,
+            "hello --capabilities",
+            "tv",
+            &["MyEngine".to_string()],
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "N x");
+        assert_eq!(results[0].size_bytes, 1024);
+        assert!(results[0].link.ends_with("hello%20--capabilities"));
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]

@@ -43,7 +43,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import Enum
 from glob import glob
-from multiprocessing import Pool, cpu_count
 from os import path
 from typing import Optional
 
@@ -56,12 +55,6 @@ import helpers
 
 # enable SOCKS proxy for all plugins by default
 helpers.enable_socks_proxy(True)
-
-THREADED: bool = True
-try:
-    MAX_THREADS: int = min(cpu_count(), 8)
-except NotImplementedError:
-    MAX_THREADS = 1  # pyright: ignore[reportConstantRedefinition]
 
 Category = Enum('Category', ['all', 'anime', 'books', 'games', 'movies', 'music', 'pictures', 'software', 'tv'])
 
@@ -205,24 +198,20 @@ if __name__ == "__main__":
 
         prog_name = sys.argv[0]
         prog_usage = (f"Usage: {prog_name} all|engine1[,engine2]* <category> <keywords>\n"
-                      f"To list available engines: {prog_name} --capabilities [--names]\n"
-                      f"Found engines: {','.join(found_engines)}")
+                      f"To list available engines: {prog_name} --capabilities")
 
         # Only the first argument selects capabilities mode; search keywords
         # (sys.argv[3:]) are user input and must never switch modes.
         if len(sys.argv) > 1 and sys.argv[1] == "--capabilities":
-            if "--names" in sys.argv[2:]:
-                print(",".join((e for e in found_engines if import_engine(e) is not None)))
-                return ExitCode.OK.value
-
             print(get_capabilities(found_engines))
             return ExitCode.OK.value
         elif len(sys.argv) < 4:
             print(prog_usage, file=sys.stderr)
             return ExitCode.ArgError.value
 
-        # get unique engines
-        engs = set(arg.strip().lower() for arg in sys.argv[1].split(','))
+        # Module names are case-sensitive (rustorrent accepts `MyEngine.py`),
+        # so they are matched exactly.
+        engs = set(arg.strip() for arg in sys.argv[1].split(','))
         engines = found_engines if 'all' in engs else [e for e in found_engines if e in engs]
 
         cat = sys.argv[2].lower()
@@ -235,13 +224,9 @@ if __name__ == "__main__":
         what = urllib.parse.quote(' '.join(sys.argv[3:]))
         params = ((engine_class, what, category) for e in engines if (engine_class := import_engine(e)) is not None)
 
-        search_success = False
-        if THREADED and len(engines) > 1:
-            processes = max(min(len(engines), MAX_THREADS), 1)
-            with Pool(processes) as pool:
-                search_success = all(pool.map(run_search, params))
-        else:
-            search_success = all(map(run_search, params))
+        # rustorrent runs one process per engine, so engines run in sequence
+        # here and the slow multiprocessing import is avoided.
+        search_success = all([run_search(p) for p in params])
 
         return ExitCode.OK.value if search_success else ExitCode.AppError.value
 
