@@ -31,9 +31,8 @@ a{color:var(--accent)}
 .nav-h,.sect h3,.lh,.tbl th{color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
 .vh{position:absolute!important;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);border:0;white-space:nowrap}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.no-anim *{transition:none!important}
 
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:30px;padding:0 12px;border:1px solid var(--line2);border-radius:var(--r);background:var(--field);color:var(--fg);font-weight:500;cursor:pointer;white-space:nowrap;transition:background .15s,border-color .15s,box-shadow .15s}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:30px;padding:0 12px;border:1px solid var(--line2);border-radius:var(--r);background:var(--field);color:var(--fg);font-weight:500;cursor:pointer;white-space:nowrap;transition:background .15s}
 .btn:hover{background:var(--hover)}
 .btn:disabled{opacity:.5;cursor:default}
 .btn.primary{background:var(--accent-bg);border-color:var(--accent-bg);color:var(--on-accent)}
@@ -162,6 +161,7 @@ input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--accent-b
 .field small{grid-column:2;color:var(--muted)}
 .unit{display:flex;align-items:center;gap:8px}
 .unit .in{width:120px}
+.card kbd{margin-right:2px}
 .sform{display:flex;gap:8px;flex-wrap:wrap}
 .sform .in:first-child{flex:1 1 240px}
 .note{margin:12px 0;padding:12px 14px;border-radius:8px;background:var(--warn-soft);color:var(--warn)}
@@ -185,7 +185,7 @@ details.card[open]>summary{margin-bottom:12px}
 .sect h3 .ib{width:24px;height:24px;vertical-align:middle}
 .inline select.in{flex:0 1 auto}
 .field select.in{max-width:260px}
-kbd{display:inline-block;min-width:20px;padding:0 5px;border:1px solid var(--line2);border-bottom-width:2px;border-radius:4px;font:11px/18px ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center}
+kbd{display:inline-block;padding:0 5px;border:1px solid var(--line2);border-bottom-width:2px;border-radius:4px;font:11px/18px ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center}
 
 .dlg{width:min(560px,calc(100vw - 32px));max-height:calc(100dvh - 48px);padding:0;border:0;border-radius:12px;background:var(--panel);color:var(--fg);box-shadow:var(--shadow);overflow:auto}
 .dlg.sm{width:min(420px,calc(100vw - 32px))}

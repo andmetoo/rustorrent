@@ -7,8 +7,8 @@ const store={
 };
 const ICONS={
   plus:'M12 5v14M5 12h14',down:'M12 5v14m-5.5-5.5L12 19l5.5-5.5',up:'M12 19V5M6.5 10.5 12 5l5.5 5.5',
-  pause:'M9 6.5v11M15 6.5v11',play:'M8 5.8v12.4a.8.8 0 0 0 1.2.7l10-6.2a.8.8 0 0 0 0-1.4l-10-6.2a.8.8 0 0 0-1.2.7z',
-  folder:'M3.5 7A1.5 1.5 0 0 1 5 5.5h4.3l2 2H19A1.5 1.5 0 0 1 20.5 9v8.5A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5z',
+  pause:'M9 6.5v11M15 6.5v11',play:'M8 5.5v13L19 12z',
+  folder:'M3.5 6.5a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z',
   trash:'M4.5 7h15M10 4h4M6.5 7l.8 11.2a1.5 1.5 0 0 0 1.5 1.3h6.4a1.5 1.5 0 0 0 1.5-1.3L17.5 7M10 11v5M14 11v5',
   chev:'m9.5 6.5 5.5 5.5-5.5 5.5',list:'M9 6.5h11M9 12h11M9 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01',
   dl:'M12 4v10.5m-4.5-4.5 4.5 4.5 4.5-4.5M5 19.5h14',
@@ -17,10 +17,10 @@ const ICONS={
   search:'M10.5 17a6.5 6.5 0 1 0 0-13 6.5 6.5 0 0 0 0 13zM20 20l-4.8-4.8',
   rss:'M5.5 18.5h.01M5 11.5a7.5 7.5 0 0 1 7.5 7.5M5 5a14 14 0 0 1 14 14',
   sliders:'M4 7.5h9M17 7.5h3M15 5v5M4 16.5h3M11 16.5h9M9 14v5',
-  sun:'M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 2.8v1.7M12 19.5v1.7M5.5 5.5l1.2 1.2M17.3 17.3l1.2 1.2M2.8 12h1.7M19.5 12h1.7M5.5 18.5l1.2-1.2M17.3 6.7l1.2-1.2',
+  sun:'M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 3v2M12 19v2M5.6 5.6 7 7M17 17l1.4 1.4M3 12h2M19 12h2M5.6 18.4 7 17M17 7l1.4-1.4',
   moon:'M19.5 14.6A7.5 7.5 0 0 1 9.4 4.5a7.8 7.8 0 1 0 10.1 10.1z',
   x:'M6.5 6.5l11 11M17.5 6.5l-11 11',recheck:'M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4',
-  stop:'M7 8.5A1.5 1.5 0 0 1 8.5 7h7A1.5 1.5 0 0 1 17 8.5v7a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 7 15.5z',
+  stop:'M7 7h10v10H7z',
   archive:'M4.5 9h15v9.5a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1zM3.5 4.5h17V9h-17zM10 12.5h4',
   file:'M13.5 3.5H7A1.5 1.5 0 0 0 5.5 5v14A1.5 1.5 0 0 0 7 20.5h10a1.5 1.5 0 0 0 1.5-1.5V8.5zM13.5 3.5v5h5M12 17.5v-6m-2.5 2.5L12 11.5l2.5 2.5',
   pen:'M4.5 19.5h4l10-10a2 2 0 0 0-4-4l-10 10zM13.5 6.5l4 4',ok:'m5.5 12.5 4 4 9-9'
@@ -86,7 +86,7 @@ function toast(title,msg,bad){
   while(toasts.children.length>4)toasts.firstChild.remove();
 }
 
-/* page skeleton (static markup only; dynamic text is always set with textContent) */
+/* skeleton: static markup only; dynamic text is set with textContent */
 const NAV=[['all','All','list'],['downloading','Downloading','down'],['seeding','Seeding','up'],['paused','Paused','pause'],['completed','Completed','ok'],['error','Errors','alert']];
 const TITLES={all:'All transfers',downloading:'Downloading',seeding:'Seeding',paused:'Paused',completed:'Completed',error:'Errors',search:'Search',rss:'RSS feeds',settings:'Settings'};
 const navBtn=(n,label,data)=>`<button class="nav" ${data}>${ic(n)}<span>${label}</span><b class="c"></b></button>`;
@@ -141,7 +141,7 @@ $('app').outerHTML=`<div class="app" id="app">
   <section class="card"><h2>Connections</h2>${field('profile','Peer profile',choice('profile',[['conservative','Conservative'],['balanced','Balanced'],['aggressive','Aggressive']]),'<span id="profileNote"></span>')}</section>
   <section class="card"><h2>Appearance</h2>${field('appearance','Theme',choice('appearance',[['system','Match system'],['light','Light'],['dark','Dark']]))}</section>
   <section class="card"><h2>Session</h2><dl class="kv" id="session"></dl></section>
-  <section class="card"><h2>Keyboard shortcuts</h2><dl class="kv">${[['/','Filter transfers'],['A','Add a torrent'],['↑ ↓','Move between transfers'],['Enter','Show or hide details'],['Space','Pause or resume'],['Delete','Remove transfer'],['Esc','Close dialog']].map(([k,v])=>`<dt><kbd>${k}</kbd></dt><dd>${v}</dd>`).join('')}</dl></section>
+  <section class="card"><h2>Keyboard shortcuts</h2><p class="muted">${[['/','filter'],['A','add'],['↑ ↓','move'],['Enter','details'],['Space','pause or resume'],['Delete','remove'],['Esc','close']].map(([k,v])=>`<kbd>${k}</kbd> ${v}`).join(' · ')}</p></section>
  </div></section>
 </main></div>
 <dialog class="dlg" id="addDlg" aria-labelledby="addTitle"><div class="dc">
@@ -170,7 +170,7 @@ const mq=matchMedia('(prefers-color-scheme: dark)');
 const themePref=()=>{const t=store.get('theme');return t==='light'||t==='dark'?t:''};
 function applyTheme(pref){
   const t=pref||(mq.matches?'dark':'light'),r=document.documentElement,b=$('theme');
-  if(r.dataset.theme!==t){r.classList.add('no-anim');r.dataset.theme=t;requestAnimationFrame(()=>requestAnimationFrame(()=>r.classList.remove('no-anim')))}
+  r.dataset.theme=t;
   b.innerHTML=ic(t==='dark'?'sun':'moon');b.title=`Switch to ${t==='dark'?'light':'dark'} appearance`;
   $('appearance').value=pref||'system';
 }
@@ -182,12 +182,12 @@ const T=new Map(),I=new Map(),rows=new Map(),dirty=new Set();
 let order=[],structural=false,raf=0,selected=null,expanded=new Set();
 try{expanded=new Set(JSON.parse(store.get('open','[]')))}catch(e){}
 const INIT=/^(queued|loading|fetching metadata|pending)$/;
-const LABELS={'fetching metadata':'Metadata',loading:'Loading',checking:'Checking',connecting:'Connecting',announcing:'Connecting','waiting for peers':'Waiting',pending:'Pending',ready:'Ready',archiving:'Archiving',deleting:'Removing',complete:'Verifying',seeding:'Verifying'};
+const LABELS={'fetching metadata':'Metadata',announcing:'Connecting','waiting for peers':'Waiting',deleting:'Removing',complete:'Verifying',seeding:'Verifying'};
 // Derives the one visible state of a transfer from the raw engine status.
 function infoOf(t){
   const s=t.status||'',done=(t.total_pieces>0&&t.completed_pieces>=t.total_pieces)||(t.total_bytes>0&&t.completed_bytes>=t.total_bytes);
   const stopping=s==='stopping',resume=!!t.paused||s==='stopped'||s==='shutdown';
-  let k='downloading',label=LABELS[s]||'Downloading',note;
+  let k='downloading',label=LABELS[s]||(s&&s[0].toUpperCase()+s.slice(1))||'Downloading',note;
   if(resume||s==='paused'||stopping){k='paused';label=stopping?'Stopping':s==='paused'||t.paused?'Paused':'Stopped'}
   else if(/error|failed/.test(s)){k='error';label='Error'}
   else if(s==='queued'){k='queued';label='Queued'}
@@ -337,7 +337,7 @@ function updateDetail(r,t,s){
     const f=r.info;
     txt(f.dir,t.download_dir||'–');txt(f.size,bytes(t.total_bytes));txt(f.pieces,`${t.completed_pieces} of ${t.total_pieces}`);
     txt(f.down,bytes(t.downloaded_bytes));txt(f.up,bytes(t.uploaded_bytes));txt(f.ratio,ratioText(t));txt(f.hash,t.info_hash||'–');
-    txt(f.ver,['BitTorrent v1','BitTorrent v1','BitTorrent v2','Hybrid (v1 + v2)'][t.meta_version]||'BitTorrent v1');txt(f.pre,t.preallocate?'Yes':'No');
+    txt(f.ver,t.meta_version===2?'v2':t.meta_version===3?'Hybrid v1 + v2':'v1');txt(f.pre,t.preallocate?'Yes':'No');
     if(document.activeElement!==r.labelIn&&!r.labelIn.dataset.dirty&&r.labelIn.value!==t.label)r.labelIn.value=t.label;
     r.stop.disabled=s.stopping||/^(loading|fetching metadata)$/.test(t.status);txt(r.stop.lastChild,s.stopping?'Stopping…':'Stop');
   }else if(r.tab==='trackers'){
@@ -700,8 +700,9 @@ const CLICK={
   'rfeed-rm':el=>rssAct('/rss/remove-feed',{url:el.dataset.url},'Feed removed'),
   'rrule-rm':el=>rssAct('/rss/remove-rule',{name:el.dataset.name},'Rule removed')
 };
+const on=(type,fn)=>document.addEventListener(type,fn);
 const rowOf=el=>{const e=el.closest('.row');return e&&rows.get(+e.dataset.id)};
-document.addEventListener('click',e=>{
+on('click',e=>{
   const el=e.target.closest('[data-a],.nav,.row');if(!el)return;
   const a=el.dataset.a,r=rowOf(el);
   if(r)select(r.id);
@@ -728,15 +729,15 @@ const SUBMIT={
   rfeed:()=>{const url=$('rUrl').value.trim();if(url)rssAct('/rss/add-feed',{url,interval:$('rInt').value},'Feed added').then(d=>{if(d)$('rUrl').value=''})},
   rrule:()=>{const name=$('rName').value.trim(),pattern=$('rPat').value.trim();if(name&&pattern)rssAct('/rss/add-rule',{name,pattern},'Rule added').then(d=>{if(d)$('rName').value=$('rPat').value=''})}
 };
-document.addEventListener('submit',e=>{e.preventDefault();const f=e.target,r=rowOf(f),fn=SUBMIT[f.dataset.f];if(fn&&(r||!f.closest('.row')))fn(f,r)});
-document.addEventListener('input',e=>{
+on('submit',e=>{e.preventDefault();const f=e.target,r=rowOf(f),fn=SUBMIT[f.dataset.f];if(fn&&(r||!f.closest('.row')))fn(f,r)});
+on('input',e=>{
   const t=e.target;
   if(t.id==='find'){findText=t.value;store.set('find',findText);applyFilter()}
   else if(t.id==='magnet'){if(t.value.trim()){draft=null;parseSeq++;$('tFile').value=''}renderReview()}
   else if(t.id==='cFilter')renderCatalog();
   else if(t.classList.contains('in'))t.dataset.dirty='1';
 });
-document.addEventListener('change',e=>{
+on('change',e=>{
   const t=e.target,r=rowOf(t),id=t.id;
   if(id==='tFile'){if(t.files[0])setFile(t.files[0])}
   else if(t.classList.contains('rv-f')){draft.files[t.dataset.i].sel=t.checked;renderReview()}
@@ -750,10 +751,10 @@ document.addEventListener('change',e=>{
   else if(id==='pFile'){const file=t.files[0];t.value='';if(file&&trust(file.name))file.arrayBuffer().then(b=>post('/search/install-plugin?filename='+encodeURIComponent(file.name),b,'text/x-python'))
     .then(()=>toast('Plugin installed',file.name),err=>toast('Action failed',err.message,true)).then(pluginsChanged)}
 });
-document.addEventListener('focusin',e=>{const r=e.target.closest&&rowOf(e.target);if(r)select(r.id)});
+on('focusin',e=>{const r=e.target.closest&&rowOf(e.target);if(r)select(r.id)});
 $('plugins').addEventListener('toggle',()=>{if($('plugins').open&&!catalog)loadCatalog()});
 $('theme').addEventListener('click',()=>{const t=document.documentElement.dataset.theme==='dark'?'light':'dark';store.set('theme',t);applyTheme(t)});
-document.addEventListener('keydown',e=>{
+on('keydown',e=>{
   const t=e.target,key=e.key;
   if(modal){if(key==='Escape'){e.preventDefault();closeDialog(modal)}else if(key==='Tab')trapFocus(e);return}
   if((e.metaKey||e.ctrlKey)&&key.toLowerCase()==='o'){e.preventDefault();return openAdd()}
@@ -773,8 +774,8 @@ document.addEventListener('keydown',e=>{
   else if(key==='Delete'||key==='Backspace'){e.preventDefault();confirmRemove(r.t)}
 });
 // Space on a focused transfer name pauses/resumes instead of activating the disclosure button.
-document.addEventListener('keyup',e=>{if(e.key===' '&&e.target.classList.contains('rn'))e.preventDefault()});
-document.addEventListener('paste',e=>{
+on('keyup',e=>{if(e.key===' '&&e.target.classList.contains('rn'))e.preventDefault()});
+on('paste',e=>{
   if(modal||/^(INPUT|TEXTAREA)$/.test(e.target.tagName))return;
   const s=(e.clipboardData&&e.clipboardData.getData('text')||'').trim();
   if(/^magnet:\?/i.test(s)){e.preventDefault();openAdd(s)}
@@ -782,10 +783,10 @@ document.addEventListener('paste',e=>{
 let drag=0;
 const isFiles=e=>e.dataTransfer&&[...e.dataTransfer.types].includes('Files');
 const dragOff=()=>{drag=0;$('overlay').classList.remove('on');$('drop').classList.remove('over')};
-document.addEventListener('dragenter',e=>{if(!isFiles(e))return;e.preventDefault();drag++;$('overlay').classList.toggle('on',modal!==addDlg);$('drop').classList.add('over')});
-document.addEventListener('dragover',e=>{if(isFiles(e)){e.preventDefault();e.dataTransfer.dropEffect='copy'}});
-document.addEventListener('dragleave',()=>{if(--drag<=0)dragOff()});
-document.addEventListener('drop',e=>{
+on('dragenter',e=>{if(!isFiles(e))return;e.preventDefault();drag++;$('overlay').classList.toggle('on',modal!==addDlg);$('drop').classList.add('over')});
+on('dragover',e=>{if(isFiles(e)){e.preventDefault();e.dataTransfer.dropEffect='copy'}});
+on('dragleave',()=>{if(--drag<=0)dragOff()});
+on('drop',e=>{
   if(!isFiles(e))return;e.preventDefault();dragOff();
   const file=[...e.dataTransfer.files].find(f=>/\.torrent$/i.test(f.name));
   if(!file)return toast('Not a torrent file','Drop a file ending in .torrent.',true);
