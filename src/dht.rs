@@ -18,7 +18,10 @@ use crate::bencode::{self, Value};
 use crate::sha1;
 
 const DHT_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const QUERY_INTERVAL: Duration = Duration::from_secs(15);
+/// How often each torrent runs an iterative get_peers lookup (and announce).
+const QUERY_INTERVAL: Duration = Duration::from_secs(60);
+/// Concurrent get_peers lookups across all torrents.
+const MAX_PEER_LOOKUPS: usize = 8;
 const BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(60);
 const SAVE_INTERVAL: Duration = Duration::from_secs(300);
 const K: usize = 8;
@@ -208,40 +211,26 @@ impl RoutingTable {
             self.failures.remove(&node.addr);
             return;
         }
-        if self
-            .buckets
-            .iter()
-            .flatten()
-            .any(|existing| existing.addr == node.addr)
-        {
+        // Most candidates land in a full bucket; check that before scanning
+        // the whole table for duplicates and address concentration.
+        if self.buckets[idx].len() >= K {
             return;
         }
-        let same_ip = self
-            .buckets
-            .iter()
-            .flatten()
-            .filter(|existing| {
-                normalize_dht_ip(existing.addr.ip()) == normalize_dht_ip(node.addr.ip())
-            })
-            .count();
-        if same_ip >= MAX_NODES_PER_IP {
+        let ip = normalize_dht_ip(node.addr.ip());
+        let (mut same_ip, mut same_prefix) = (0, 0);
+        for existing in self.buckets.iter().flatten() {
+            if existing.addr == node.addr {
+                return;
+            }
+            same_ip += usize::from(normalize_dht_ip(existing.addr.ip()) == ip);
+            same_prefix += usize::from(same_network_prefix(existing.addr, node.addr));
+        }
+        if same_ip >= MAX_NODES_PER_IP || same_prefix >= MAX_NODES_PER_PREFIX {
             return;
         }
-        let same_prefix = self
-            .buckets
-            .iter()
-            .flatten()
-            .filter(|existing| same_network_prefix(existing.addr, node.addr))
-            .count();
-        if same_prefix >= MAX_NODES_PER_PREFIX {
-            return;
-        }
-        let bucket = &mut self.buckets[idx];
-        if bucket.len() < K {
-            self.failures.remove(&node.addr);
-            bucket.push(node);
-            self.bucket_refreshed_at[idx] = node.last_seen;
-        }
+        self.failures.remove(&node.addr);
+        self.buckets[idx].push(node);
+        self.bucket_refreshed_at[idx] = node.last_seen;
     }
 
     fn insert_verified(&mut self, node: Node) -> bool {
@@ -534,36 +523,7 @@ fn is_local_dht_address(ip: std::net::IpAddr) -> bool {
 }
 
 fn is_global_dht_address(ip: std::net::IpAddr) -> bool {
-    match normalize_dht_ip(ip) {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            !ip.is_unspecified()
-                && !ip.is_broadcast()
-                && !ip.is_multicast()
-                && !ip.is_loopback()
-                && !ip.is_private()
-                && !ip.is_link_local()
-                && octets[0] != 0
-                && octets[0] < 240
-                && !(octets[0] == 100 && (octets[1] & 0xc0) == 0x40)
-                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                && !(octets[0] == 198 && matches!(octets[1], 18 | 19))
-                && !(octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                && !(octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-        }
-        std::net::IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            // Public IPv6 unicast is currently allocated from 2000::/3.
-            // Explicitly reject special-purpose subranges that can embed or
-            // route to local IPv4, benchmarking, or documentation targets.
-            (segments[0] & 0xe000) == 0x2000
-                && !(segments[0] == 0x2001 && (segments[1] & 0xfe00) == 0)
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
-                && segments[0] != 0x2002
-                && (segments[0] & 0xfff0) != 0x3ff0
-        }
-    }
+    crate::http::is_public_http_ip(normalize_dht_ip(ip))
 }
 
 fn dht_address_scope_allowed(responder: SocketAddr, candidate: SocketAddr) -> bool {
@@ -1140,6 +1100,14 @@ impl PeerStore {
     }
 
     fn prune_swarm(&mut self, info_hash: &[u8; 20]) {
+        // Rebuilding a swarm's index is only needed when something expired.
+        if !self.swarms.get(info_hash).is_some_and(|peers| {
+            peers
+                .iter()
+                .any(|peer| peer.last_seen.elapsed() > PEER_STORE_TTL)
+        }) {
+            return;
+        }
         let Some(mut peers) = self.remove(info_hash) else {
             return;
         };
@@ -1266,7 +1234,6 @@ struct PendingQuery {
 
 #[derive(Clone, Copy)]
 enum PendingKind {
-    GetPeers([u8; 20]),
     FindNode,
     VerifyNode,
     ReplaceNode {
@@ -1277,6 +1244,8 @@ enum PendingKind {
     RefreshBucket(u64),
 }
 
+/// An iterative lookup towards `target`: a bucket refresh (find_node) or,
+/// when `peers` is set, a BEP 5 get_peers search for a torrent.
 struct RefreshLookup {
     bucket_idx: usize,
     target: [u8; 20],
@@ -1285,6 +1254,14 @@ struct RefreshLookup {
     outstanding: usize,
     authenticated_responses: usize,
     deadline: Instant,
+    peers: Option<PeerLookup>,
+}
+
+struct PeerLookup {
+    /// Our listening port to announce.
+    port: u16,
+    /// Responders that handed out write tokens, for the final announce.
+    tokens: Vec<(Node, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -1576,7 +1553,6 @@ fn dht_thread(
     let mut last_save = Instant::now();
     let mut last_peer_store_prune = Instant::now();
     let mut last_bucket_refresh_attempt = Instant::now();
-    let mut query_node_idx = 0usize;
 
     loop {
         loop {
@@ -1637,34 +1613,19 @@ fn dht_thread(
                 }
             }
             for (info_hash, entry) in torrents.iter_mut() {
-                if entry.last_query.elapsed() >= QUERY_INTERVAL {
-                    let closest = rt.closest(info_hash, K);
-                    if !closest.is_empty() && pending.len() < MAX_PENDING_QUERIES {
-                        let start = query_node_idx % closest.len();
-                        let node = closest
-                            .iter()
-                            .cycle()
-                            .skip(start)
-                            .take(closest.len())
-                            .find(|node| !pending.values().any(|query| query.addr == node.addr));
-                        if let (Some(node), Some(tx)) = (node, next_unique_tx(&pending)) {
-                            let query = build_get_peers_query(&node_id, *info_hash, &tx);
-                            if socket.send_to(&query, node.addr).is_ok() {
-                                let sent_at = Instant::now();
-                                pending.insert(
-                                    tx,
-                                    PendingQuery {
-                                        kind: PendingKind::GetPeers(*info_hash),
-                                        addr: node.addr,
-                                        expected_id: Some(node.id),
-                                        sent_at,
-                                    },
-                                );
-                                entry.last_query = sent_at;
-                                query_node_idx = query_node_idx.wrapping_add(1);
-                            }
-                        }
-                    }
+                if entry.last_query.elapsed() >= QUERY_INTERVAL
+                    && start_peer_lookup(
+                        *info_hash,
+                        entry.port,
+                        &mut rt,
+                        &mut pending,
+                        &socket,
+                        &node_id,
+                        &mut refresh_lookups,
+                        &mut next_refresh_lookup_id,
+                    )
+                {
+                    entry.last_query = Instant::now();
                 }
             }
             expire_pending_queries(
@@ -1847,7 +1808,8 @@ fn handle_response(
         complete_refresh_query(
             lookup_id,
             r,
-            pending_query.addr,
+            verified_node,
+            torrents,
             rt,
             pending,
             socket,
@@ -1888,38 +1850,32 @@ fn handle_response(
             node_id,
         );
     }
+}
 
-    if let PendingKind::GetPeers(info_hash) = pending_query.kind {
-        if let Some(Value::List(values)) = dict_get(r, b"values") {
-            let mut peers = Vec::new();
-            for value in values {
-                if let Value::Bytes(bytes) = value {
-                    if let Some(peer) = decode_peer_value(bytes) {
-                        if dht_address_scope_allowed(pending_query.addr, peer) {
-                            peers.push(peer);
-                        }
-                    }
-                }
-            }
-            peers.sort_unstable();
-            peers.dedup();
-            peers.truncate(MAX_PEERS_PER_TORRENT);
-            if !peers.is_empty() {
-                if let Some(entry) = torrents.get(&info_hash) {
-                    let _ = entry.peers_tx.send(peers);
-                }
-            }
-        }
-        if let Some(Value::Bytes(token)) = dict_get(r, b"token") {
-            if token.len() <= 64 {
-                if let Some(entry) = torrents.get(&info_hash) {
-                    let tx = next_tx_id();
-                    let announce =
-                        build_announce_peer_query(node_id, info_hash, entry.port, token, &tx);
-                    let _ = socket.send_to(&announce, pending_query.addr);
-                }
-            }
-        }
+/// Forwards peers from a get_peers response to the torrent, keeping only
+/// addresses the responder may legitimately point us at.
+fn deliver_peer_values(
+    response: &[(Vec<u8>, Value)],
+    responder: SocketAddr,
+    info_hash: [u8; 20],
+    torrents: &HashMap<[u8; 20], TorrentEntry>,
+) {
+    let Some(Value::List(values)) = dict_get(response, b"values") else {
+        return;
+    };
+    let mut peers: Vec<SocketAddr> = values
+        .iter()
+        .filter_map(|value| match value {
+            Value::Bytes(bytes) => decode_peer_value(bytes),
+            _ => None,
+        })
+        .filter(|peer| dht_address_scope_allowed(responder, *peer))
+        .collect();
+    peers.sort_unstable();
+    peers.dedup();
+    peers.truncate(MAX_PEERS_PER_TORRENT);
+    if let (false, Some(entry)) = (peers.is_empty(), torrents.get(&info_hash)) {
+        let _ = entry.peers_tx.send(peers);
     }
 }
 
@@ -2387,31 +2343,57 @@ fn build_response(
     bencode::encode(&dict)
 }
 
+/// Encodes a KRPC query directly as bencode. `args` (after our "id") must
+/// be given in sorted key order, as bencode dictionaries require.
+fn build_query(
+    node_id: &[u8; 20],
+    method: &str,
+    tx: &[u8],
+    args: &[(&str, QueryArg<'_>)],
+) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(bytes.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(bytes);
+    }
+    let mut out = Vec::with_capacity(160);
+    out.extend_from_slice(b"d1:ad2:id20:");
+    out.extend_from_slice(node_id);
+    for (key, value) in args {
+        put(&mut out, key.as_bytes());
+        match value {
+            QueryArg::Bytes(bytes) => put(&mut out, bytes),
+            QueryArg::Int(value) => {
+                out.push(b'i');
+                out.extend_from_slice(value.to_string().as_bytes());
+                out.push(b'e');
+            }
+        }
+    }
+    out.extend_from_slice(b"e1:q");
+    put(&mut out, method.as_bytes());
+    out.extend_from_slice(b"1:t");
+    put(&mut out, tx);
+    out.extend_from_slice(b"1:y1:qe");
+    out
+}
+
+enum QueryArg<'a> {
+    Bytes(&'a [u8]),
+    Int(u16),
+}
+
 fn build_ping_query(node_id: &[u8; 20], tx: &[u8]) -> Vec<u8> {
-    let dict = Value::Dict(vec![
-        (
-            b"a".to_vec(),
-            Value::Dict(vec![(b"id".to_vec(), Value::Bytes(node_id.to_vec()))]),
-        ),
-        (b"q".to_vec(), Value::Bytes(b"ping".to_vec())),
-        (b"t".to_vec(), Value::Bytes(tx.to_vec())),
-        (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
-    ]);
-    bencode::encode(&dict)
+    build_query(node_id, "ping", tx, &[])
 }
 
 fn build_get_peers_query(node_id: &[u8; 20], info_hash: [u8; 20], tx: &[u8]) -> Vec<u8> {
-    let a = Value::Dict(vec![
-        (b"id".to_vec(), Value::Bytes(node_id.to_vec())),
-        (b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec())),
-    ]);
-    let dict = Value::Dict(vec![
-        (b"t".to_vec(), Value::Bytes(tx.to_vec())),
-        (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
-        (b"q".to_vec(), Value::Bytes(b"get_peers".to_vec())),
-        (b"a".to_vec(), a),
-    ]);
-    bencode::encode(&dict)
+    build_query(
+        node_id,
+        "get_peers",
+        tx,
+        &[("info_hash", QueryArg::Bytes(&info_hash))],
+    )
 }
 
 fn build_announce_peer_query(
@@ -2421,19 +2403,25 @@ fn build_announce_peer_query(
     token: &[u8],
     tx: &[u8],
 ) -> Vec<u8> {
-    let a = Value::Dict(vec![
-        (b"id".to_vec(), Value::Bytes(node_id.to_vec())),
-        (b"info_hash".to_vec(), Value::Bytes(info_hash.to_vec())),
-        (b"port".to_vec(), Value::Int(port as i64)),
-        (b"token".to_vec(), Value::Bytes(token.to_vec())),
-    ]);
-    let dict = Value::Dict(vec![
-        (b"t".to_vec(), Value::Bytes(tx.to_vec())),
-        (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
-        (b"q".to_vec(), Value::Bytes(b"announce_peer".to_vec())),
-        (b"a".to_vec(), a),
-    ]);
-    bencode::encode(&dict)
+    build_query(
+        node_id,
+        "announce_peer",
+        tx,
+        &[
+            ("info_hash", QueryArg::Bytes(&info_hash)),
+            ("port", QueryArg::Int(port)),
+            ("token", QueryArg::Bytes(token)),
+        ],
+    )
+}
+
+fn build_find_node_query(node_id: &[u8; 20], target: &[u8; 20], tx: &[u8]) -> Vec<u8> {
+    build_query(
+        node_id,
+        "find_node",
+        tx,
+        &[("target", QueryArg::Bytes(target))],
+    )
 }
 
 fn bootstrap_nodes(
@@ -2484,7 +2472,11 @@ fn schedule_bucket_refresh(
     refresh_lookups: &mut HashMap<u64, RefreshLookup>,
     next_lookup_id: &mut u64,
 ) {
-    if pending.len() >= MAX_PENDING_QUERIES || !refresh_lookups.is_empty() {
+    if pending.len() >= MAX_PENDING_QUERIES
+        || refresh_lookups
+            .values()
+            .any(|lookup| lookup.peers.is_none())
+    {
         return;
     }
     let now = Instant::now();
@@ -2507,9 +2499,81 @@ fn schedule_bucket_refresh(
             outstanding: 0,
             authenticated_responses: 0,
             deadline: now + REFRESH_LOOKUP_DEADLINE,
+            peers: None,
         },
     );
     advance_refresh_lookup(lookup_id, rt, pending, socket, node_id, refresh_lookups);
+}
+
+/// Starts a get_peers lookup for `info_hash` unless one is already running.
+#[allow(clippy::too_many_arguments)]
+fn start_peer_lookup(
+    info_hash: [u8; 20],
+    port: u16,
+    rt: &mut RoutingTable,
+    pending: &mut HashMap<Vec<u8>, PendingQuery>,
+    socket: &UdpSocket,
+    node_id: &[u8; 20],
+    refresh_lookups: &mut HashMap<u64, RefreshLookup>,
+    next_lookup_id: &mut u64,
+) -> bool {
+    let active = refresh_lookups
+        .values()
+        .filter(|lookup| lookup.peers.is_some())
+        .count();
+    let candidates = rt.closest(&info_hash, K);
+    if active >= MAX_PEER_LOOKUPS
+        || candidates.is_empty()
+        || refresh_lookups
+            .values()
+            .any(|lookup| lookup.peers.is_some() && lookup.target == info_hash)
+    {
+        return false;
+    }
+    let lookup_id = *next_lookup_id;
+    *next_lookup_id = next_lookup_id.wrapping_add(1);
+    refresh_lookups.insert(
+        lookup_id,
+        RefreshLookup {
+            bucket_idx: usize::MAX,
+            target: info_hash,
+            candidates,
+            queried: HashSet::new(),
+            outstanding: 0,
+            authenticated_responses: 0,
+            deadline: Instant::now() + REFRESH_LOOKUP_DEADLINE,
+            peers: Some(PeerLookup {
+                port,
+                tokens: Vec::new(),
+            }),
+        },
+    );
+    advance_refresh_lookup(lookup_id, rt, pending, socket, node_id, refresh_lookups);
+    true
+}
+
+/// Completes a lookup: a refresh marks its bucket fresh; a peer search
+/// announces to the closest responders that issued write tokens.
+fn finish_lookup(
+    lookup: RefreshLookup,
+    rt: &mut RoutingTable,
+    socket: &UdpSocket,
+    node_id: &[u8; 20],
+) {
+    let Some(mut peers) = lookup.peers else {
+        if lookup.authenticated_responses > 0 {
+            rt.mark_bucket_refreshed(lookup.bucket_idx, Instant::now());
+        }
+        return;
+    };
+    peers
+        .tokens
+        .sort_unstable_by_key(|(node, _)| xor_distance(&node.id, &lookup.target));
+    for (node, token) in peers.tokens.iter().take(K) {
+        let query =
+            build_announce_peer_query(node_id, lookup.target, peers.port, token, &next_tx_id());
+        let _ = socket.send_to(&query, node.addr);
+    }
 }
 
 fn maintain_refresh_lookups(
@@ -2532,9 +2596,7 @@ fn maintain_refresh_lookups(
             pending.retain(
                 |_, query| !matches!(query.kind, PendingKind::RefreshBucket(id) if id == lookup_id),
             );
-            if lookup.authenticated_responses > 0 {
-                rt.mark_bucket_refreshed(lookup.bucket_idx, now);
-            }
+            finish_lookup(lookup, rt, socket, node_id);
             continue;
         }
         advance_refresh_lookup(lookup_id, rt, pending, socket, node_id, refresh_lookups);
@@ -2589,7 +2651,11 @@ fn advance_refresh_lookup(
         let Some(tx) = next_unique_tx(pending) else {
             break;
         };
-        let query = build_find_node_query(node_id, &lookup.target, &tx);
+        let query = if lookup.peers.is_some() {
+            build_get_peers_query(node_id, lookup.target, &tx)
+        } else {
+            build_find_node_query(node_id, &lookup.target, &tx)
+        };
         if socket.send_to(&query, candidate.addr).is_ok() {
             pending.insert(
                 tx,
@@ -2610,19 +2676,18 @@ fn advance_refresh_lookup(
             .iter()
             .all(|candidate| lookup.queried.contains(&candidate.addr));
     if lookup.outstanding == 0 && exhausted {
-        let bucket_idx = lookup.bucket_idx;
-        let succeeded = lookup.authenticated_responses > 0;
-        refresh_lookups.remove(&lookup_id);
-        if succeeded {
-            rt.mark_bucket_refreshed(bucket_idx, Instant::now());
+        if let Some(lookup) = refresh_lookups.remove(&lookup_id) {
+            finish_lookup(lookup, rt, socket, node_id);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_refresh_query(
     lookup_id: u64,
     response: &[(Vec<u8>, Value)],
-    responder: SocketAddr,
+    responder: Node,
+    torrents: &HashMap<[u8; 20], TorrentEntry>,
     rt: &mut RoutingTable,
     pending: &mut HashMap<Vec<u8>, PendingQuery>,
     socket: &UdpSocket,
@@ -2634,8 +2699,16 @@ fn complete_refresh_query(
     };
     lookup.outstanding = lookup.outstanding.saturating_sub(1);
     lookup.authenticated_responses = lookup.authenticated_responses.saturating_add(1);
+    if let Some(peers) = lookup.peers.as_mut() {
+        deliver_peer_values(response, responder.addr, lookup.target, torrents);
+        if let Some(Value::Bytes(token)) = dict_get(response, b"token") {
+            if token.len() <= 64 && peers.tokens.len() < MAX_REFRESH_LOOKUP_QUERIES {
+                peers.tokens.push((responder, token.clone()));
+            }
+        }
+    }
 
-    let allow_local = is_local_dht_address(responder.ip());
+    let allow_local = is_local_dht_address(responder.addr.ip());
     let mut returned = Vec::new();
     if let Some(Value::Bytes(nodes)) = dict_get(response, b"nodes") {
         returned.extend(
@@ -2707,20 +2780,6 @@ fn random_target_for_bucket(own_id: &[u8; 20], bucket_idx: usize) -> Option<[u8;
     let mask = 0x80 >> (differing_bit % 8);
     target[byte] = (target[byte] & !mask) | ((!own_id[byte]) & mask);
     Some(target)
-}
-
-fn build_find_node_query(node_id: &[u8; 20], target: &[u8; 20], tx: &[u8]) -> Vec<u8> {
-    let a = Value::Dict(vec![
-        (b"id".to_vec(), Value::Bytes(node_id.to_vec())),
-        (b"target".to_vec(), Value::Bytes(target.to_vec())),
-    ]);
-    let dict = Value::Dict(vec![
-        (b"t".to_vec(), Value::Bytes(tx.to_vec())),
-        (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
-        (b"q".to_vec(), Value::Bytes(b"find_node".to_vec())),
-        (b"a".to_vec(), a),
-    ]);
-    bencode::encode(&dict)
 }
 
 fn decode_nodes(bytes: &[u8]) -> Vec<Node> {
@@ -3357,6 +3416,35 @@ mod tests {
         );
     }
 
+    fn peer_lookup(target: [u8; 20], candidates: Vec<Node>) -> RefreshLookup {
+        RefreshLookup {
+            bucket_idx: usize::MAX,
+            target,
+            candidates,
+            queried: HashSet::new(),
+            outstanding: 0,
+            authenticated_responses: 0,
+            deadline: Instant::now() + REFRESH_LOOKUP_DEADLINE,
+            peers: Some(PeerLookup {
+                port: 6881,
+                tokens: Vec::new(),
+            }),
+        }
+    }
+
+    fn torrent_entry(port: u16) -> (TorrentEntry, mpsc::Receiver<Vec<SocketAddr>>) {
+        let (peers_tx, peers_rx) = mpsc::channel();
+        (
+            TorrentEntry {
+                peers_tx,
+                port,
+                last_query: Instant::now(),
+                last_bootstrap: Instant::now(),
+            },
+            peers_rx,
+        )
+    }
+
     #[test]
     fn public_responder_cannot_trigger_local_node_or_peer_probes() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -3368,12 +3456,20 @@ mod tests {
         pending.insert(
             b"scope".to_vec(),
             PendingQuery {
-                kind: PendingKind::GetPeers(info_hash),
+                kind: PendingKind::RefreshBucket(1),
                 addr: responder,
                 expected_id: Some(responder_id),
                 sent_at: Instant::now(),
             },
         );
+        let responder_node = Node {
+            id: responder_id,
+            addr: responder,
+            last_seen: Instant::now(),
+        };
+        let mut lookups = HashMap::from([(1, peer_lookup(info_hash, vec![responder_node]))]);
+        lookups.get_mut(&1).unwrap().queried.insert(responder);
+        lookups.get_mut(&1).unwrap().outstanding = 1;
 
         let mut local_node = Vec::new();
         local_node.extend_from_slice(&[3u8; 20]);
@@ -3394,19 +3490,11 @@ mod tests {
                 ]),
             ),
         ];
-        let (peers_tx, peers_rx) = mpsc::channel();
-        let torrents = HashMap::from([(
-            info_hash,
-            TorrentEntry {
-                peers_tx,
-                port: 6881,
-                last_query: Instant::now(),
-                last_bootstrap: Instant::now(),
-            },
-        )]);
+        let (entry, peers_rx) = torrent_entry(6881);
+        let torrents = HashMap::from([(info_hash, entry)]);
         let mut peer_store = PeerStore::new();
 
-        handle_response_test(
+        handle_response(
             &response,
             &responder,
             &mut rt,
@@ -3415,15 +3503,127 @@ mod tests {
             &[9u8; 20],
             &mut peer_store,
             &torrents,
+            &mut Vec::new(),
+            &mut lookups,
         );
 
         assert_eq!(rt.node_count(), 1);
-        assert!(pending.is_empty());
+        assert!(pending.is_empty(), "the local node must not be probed");
         assert!(peer_store.is_empty());
         assert!(matches!(
             peers_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn get_peers_lookup_collects_values_and_announces_with_tokens() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let responder_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        responder_socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let responder = Node {
+            id: [0x42u8; 20],
+            addr: responder_socket.local_addr().unwrap(),
+            last_seen: Instant::now(),
+        };
+        let info_hash = [0x43u8; 20];
+        let node_id = [9u8; 20];
+        let mut rt = RoutingTable::new(node_id);
+        rt.insert(responder);
+        let mut pending = HashMap::new();
+        let mut lookups = HashMap::new();
+        let mut next_id = 0;
+        assert!(start_peer_lookup(
+            info_hash,
+            7000,
+            &mut rt,
+            &mut pending,
+            &socket,
+            &node_id,
+            &mut lookups,
+            &mut next_id,
+        ));
+        // A second lookup for the same torrent is not started concurrently.
+        assert!(!start_peer_lookup(
+            info_hash,
+            7000,
+            &mut rt,
+            &mut pending,
+            &socket,
+            &node_id,
+            &mut lookups,
+            &mut next_id,
+        ));
+
+        let mut packet = [0u8; 1500];
+        let (len, _) = responder_socket.recv_from(&mut packet).unwrap();
+        let Value::Dict(query) = bencode::parse(&packet[..len]).unwrap() else {
+            panic!("lookup query was not a dictionary");
+        };
+        assert_eq!(
+            dict_get(&query, b"q"),
+            Some(&Value::Bytes(b"get_peers".to_vec()))
+        );
+        let (tx, sent) = pending
+            .iter()
+            .next()
+            .map(|(tx, query)| (tx.clone(), *query))
+            .unwrap();
+
+        let peer: SocketAddr = "127.0.0.1:51413".parse().unwrap();
+        let response = vec![
+            (b"t".to_vec(), Value::Bytes(tx)),
+            (
+                b"r".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes(responder.id.to_vec())),
+                    (b"token".to_vec(), Value::Bytes(b"tok".to_vec())),
+                    (
+                        b"values".to_vec(),
+                        Value::List(vec![Value::Bytes(encode_peer(peer))]),
+                    ),
+                ]),
+            ),
+        ];
+        let (entry, peers_rx) = torrent_entry(7000);
+        let torrents = HashMap::from([(info_hash, entry)]);
+        handle_response(
+            &response,
+            &sent.addr,
+            &mut rt,
+            &mut pending,
+            &socket,
+            &node_id,
+            &mut PeerStore::new(),
+            &torrents,
+            &mut Vec::new(),
+            &mut lookups,
+        );
+        assert_eq!(peers_rx.try_recv().unwrap(), vec![peer]);
+        assert!(lookups.is_empty(), "an exhausted lookup finishes");
+
+        let (len, _) = responder_socket.recv_from(&mut packet).unwrap();
+        let Value::Dict(announce) = bencode::parse(&packet[..len]).unwrap() else {
+            panic!("announce was not a dictionary");
+        };
+        assert_eq!(
+            dict_get(&announce, b"q"),
+            Some(&Value::Bytes(b"announce_peer".to_vec()))
+        );
+        let Some(Value::Dict(args)) = dict_get(&announce, b"a") else {
+            panic!("announce had no arguments");
+        };
+        assert_eq!(
+            dict_get(args, b"token"),
+            Some(&Value::Bytes(b"tok".to_vec()))
+        );
+        assert_eq!(dict_get(args, b"port"), Some(&Value::Int(7000)));
+        assert_eq!(
+            dict_get(args, b"info_hash"),
+            Some(&Value::Bytes(info_hash.to_vec()))
+        );
     }
 
     #[test]
@@ -3894,6 +4094,7 @@ mod tests {
                 outstanding: 0,
                 authenticated_responses: 0,
                 deadline: Instant::now() + REFRESH_LOOKUP_DEADLINE,
+                peers: None,
             },
         )]);
         advance_refresh_lookup(
@@ -4142,6 +4343,32 @@ mod tests {
             dict_get(&response, b"ip"),
             Some(&Value::Bytes(encode_peer(requester)))
         );
+    }
+
+    #[test]
+    fn queries_are_canonical_bencode() {
+        let id = [1u8; 20];
+        let queries = [
+            (build_ping_query(&id, b"t1"), &b"ping"[..]),
+            (build_find_node_query(&id, &[2u8; 20], b"t2"), b"find_node"),
+            (build_get_peers_query(&id, [3u8; 20], b"t3"), b"get_peers"),
+            (
+                build_announce_peer_query(&id, [4u8; 20], 51413, b"token", b"t4"),
+                b"announce_peer",
+            ),
+        ];
+        for (bytes, method) in queries {
+            // The strict decoder rejects unsorted dictionary keys.
+            let Value::Dict(query) = bencode::parse(&bytes).unwrap() else {
+                panic!("query was not a dictionary");
+            };
+            assert_eq!(dict_get(&query, b"q"), Some(&Value::Bytes(method.to_vec())));
+            assert_eq!(dict_get(&query, b"y"), Some(&Value::Bytes(b"q".to_vec())));
+            let Some(Value::Dict(args)) = dict_get(&query, b"a") else {
+                panic!("query had no arguments");
+            };
+            assert_eq!(dict_get(args, b"id"), Some(&Value::Bytes(id.to_vec())));
+        }
     }
 
     #[test]
