@@ -17,6 +17,10 @@ Works on **macOS 11 or newer** and **Linux**. Windows support is partial (builds
 
 ![Rustorrent beta dark appearance](docs/screenshots/beta-dark.png)
 
+### Narrow window
+
+<img src="docs/screenshots/beta-mobile.png" alt="Rustorrent on a narrow screen" width="320">
+
 ## Features
 
 - **BitTorrent protocol** — v1, v2, and hybrid metainfo with SHA-1/SHA-256 verification
@@ -62,9 +66,10 @@ distribution (commonly `libssl-dev` on Debian/Ubuntu or `openssl-devel` on Fedor
 cargo build --release
 ```
 
-The release profile is optimized for size (`opt-level = "z"`, LTO, one codegen unit, and stripped
-symbols) while retaining integer-overflow checks. Binary size varies by platform and toolchain;
-current builds are typically around 1–2 MiB.
+The release profile is optimized for size (`opt-level = "z"`, LTO, one codegen unit, abort on
+panic, and stripped symbols) while retaining integer-overflow checks. The web interface and the
+search runtime are gzip-compressed at build time by `build.rs`. A full Linux x86_64 build is about
+1.6 MiB (1.4 MiB with `--no-default-features`); size varies by platform and toolchain.
 
 ## Platform support
 
