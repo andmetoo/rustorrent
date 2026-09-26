@@ -66,6 +66,8 @@ function watchErrors(page) {
   return errors;
 }
 async function axe(page) {
+  // Scan the settled page: mid-fade text would be measured as low contrast.
+  await page.waitForFunction(() => document.getAnimations().every(a => a.playState !== 'running'));
   const scan = await new AxeBuilder({page}).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze();
   return scan.violations.map(v => ({id: v.id, nodes: v.nodes.map(n => n.target)}));
 }

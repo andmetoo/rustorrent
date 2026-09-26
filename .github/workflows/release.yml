@@ -1,17 +1,25 @@
 name: Release
 
-# Pushing a version tag (for example v0.1.0-beta.2) builds the macOS DMGs and
-# a Linux archive, then publishes a GitHub release with docs/releases/<tag>.md
-# as its notes. Tags containing a hyphen are marked as prereleases.
+# Pushing a version tag (for example v0.1.0-beta.2), or running this workflow
+# by hand with a tag name, builds the macOS DMGs and a Linux archive, then
+# publishes a GitHub release with docs/releases/<tag>.md as its notes. A
+# manual run creates the tag on the commit it built. Tags containing a hyphen
+# are marked as prereleases.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create, for example v0.1.0-beta.2
+        required: true
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   macos:
@@ -28,7 +36,7 @@ jobs:
       - name: Check the tag matches the crate version
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml $version"; exit 1; }
+          test "v$version" = "$TAG" || { echo "tag $TAG != Cargo.toml $version"; exit 1; }
       - name: Build the Apple silicon and universal apps
         run: |
           ./macos/package_app.sh --dmg --output "$RUNNER_TEMP/dist"
@@ -57,7 +65,7 @@ jobs:
       - name: Build and package
         run: |
           cargo build --release --locked
-          name="rustorrent-${GITHUB_REF_NAME#v}-linux-x86_64"
+          name="rustorrent-${TAG#v}-linux-x86_64"
           mkdir -p "$RUNNER_TEMP/$name" "$RUNNER_TEMP/dist"
           cp target/release/rustorrent README.md LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/$name/"
           tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/dist/$name.tar.gz" "$name"
@@ -90,11 +98,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          notes="docs/releases/${TAG}.md"
           test -f "$notes" || { echo "missing release notes: $notes"; exit 1; }
           title="$(head -n 1 "$notes" | sed 's/^# *//')"
-          prerelease=()
-          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            flags+=(--target "$GITHUB_SHA")
+          else
+            flags+=(--verify-tag)
+          fi
           tail -n +2 "$notes" > "$RUNNER_TEMP/notes.md"
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$title" \
-            --notes-file "$RUNNER_TEMP/notes.md" "${prerelease[@]}"
+          gh release create "$TAG" dist/* --title "$title" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"
