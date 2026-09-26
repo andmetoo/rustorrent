@@ -448,7 +448,7 @@ struct TorrentRequest {
     held: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct SessionEntry {
     paused: bool,
     info_hash: [u8; 20],
@@ -1239,11 +1239,27 @@ fn reap_finished_workers(handles: &mut Vec<thread::JoinHandle<()>>, label: &str)
     }
 }
 
-fn spawn_detached<F>(name: &str, worker: F) -> bool
-where
-    F: FnOnce() + Send + 'static,
-{
-    match thread::Builder::new().name(name.to_string()).spawn(worker) {
+type Worker = Box<dyn FnOnce() + Send + 'static>;
+
+/// Spawn a named thread (`stack_size` 0 keeps the default). Every call site
+/// shares this one instantiation of the thread start-up machinery.
+#[inline(never)]
+fn spawn_worker(
+    name: String,
+    stack_size: usize,
+    worker: Worker,
+) -> io::Result<thread::JoinHandle<()>> {
+    let builder = thread::Builder::new().name(name);
+    let builder = if stack_size == 0 {
+        builder
+    } else {
+        builder.stack_size(stack_size)
+    };
+    builder.spawn(worker)
+}
+
+fn spawn_detached(name: &str, worker: impl FnOnce() + Send + 'static) -> bool {
+    match spawn_worker(name.to_string(), 0, Box::new(worker)) {
         Ok(_) => true,
         Err(err) => {
             log_warn!("{name} worker could not start: {err}");
@@ -1384,6 +1400,25 @@ fn ensure_session_storage_claim_available(
     Ok(())
 }
 
+fn sort_renames(renames: &mut [(usize, String)]) {
+    renames.sort_unstable_by_key(|(index, _)| *index);
+}
+
+fn normalized_file_renames(renames: &[(usize, String)]) -> Result<Vec<(usize, String)>, String> {
+    let mut normalized = renames.to_vec();
+    sort_renames(&mut normalized);
+    if normalized.windows(2).any(|pair| pair[0].0 == pair[1].0)
+        || normalized
+            .iter()
+            .any(|(_, name)| !valid_renamed_file_name(name))
+    {
+        return Err("invalid persisted file rename".to_string());
+    }
+    Ok(normalized)
+}
+
+type EntryChange<'a> = &'a mut dyn FnMut(&mut SessionEntry) -> Result<bool, String>;
+
 impl SessionStore {
     fn load(root: &Path) -> Result<Self, String> {
         let path = session_path(root);
@@ -1397,44 +1432,73 @@ impl SessionStore {
     }
 
     fn lock_operation(&self) -> MutexGuard<'_, ()> {
-        match self.operations.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        lock_or_recover(&self.operations)
     }
 
     fn list(&self) -> Vec<SessionEntry> {
-        let guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.values().cloned().collect()
+        lock_or_recover(&self.entries).values().cloned().collect()
     }
 
     fn contains(&self, info_hash: [u8; 20]) -> bool {
-        let guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.contains_key(&info_hash)
+        lock_or_recover(&self.entries).contains_key(&info_hash)
     }
 
     fn get(&self, info_hash: [u8; 20]) -> Option<SessionEntry> {
-        let guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.get(&info_hash).cloned()
+        lock_or_recover(&self.entries).get(&info_hash).cloned()
+    }
+
+    /// Apply `change` to a copy of the entry and persist the whole session,
+    /// keeping the previous entry if saving fails. `change` returns false to
+    /// leave the entry untouched; an unchanged entry is not rewritten.
+    fn update_entry(
+        &self,
+        info_hash: [u8; 20],
+        check_claims: bool,
+        change: EntryChange<'_>,
+    ) -> Result<bool, String> {
+        let mut guard = lock_or_recover(&self.entries);
+        let previous = guard
+            .get(&info_hash)
+            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
+        let mut proposed = previous.clone();
+        if !change(&mut proposed)? {
+            return Ok(false);
+        }
+        if proposed == *previous {
+            return Ok(true);
+        }
+        self.store_entry(&mut guard, proposed, check_claims)?;
+        Ok(true)
+    }
+
+    /// Insert `proposed` and save, restoring the previous state on failure.
+    fn store_entry(
+        &self,
+        guard: &mut HashMap<[u8; 20], SessionEntry>,
+        proposed: SessionEntry,
+        check_claims: bool,
+    ) -> Result<(), String> {
+        if check_claims {
+            storage_claims_for_session_entry(&proposed)?;
+            ensure_session_storage_claim_available(guard, &proposed)?;
+        }
+        let info_hash = proposed.info_hash;
+        let previous = guard.insert(info_hash, proposed);
+        if let Err(err) = save_session(&self.path, guard) {
+            match previous {
+                Some(entry) => guard.insert(info_hash, entry),
+                None => guard.remove(&info_hash),
+            };
+            return Err(format!("session save failed: {err}"));
+        }
+        Ok(())
     }
 
     /// Validate the durable claim before crash reconciliation performs any
     /// physical rename, move adoption, or source cleanup. The caller holds
     /// `operations`, serializing this check with every claim transition.
     fn validate_current_storage_claim(&self, info_hash: [u8; 20]) -> Result<(), String> {
-        let guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let guard = lock_or_recover(&self.entries);
         let entry = guard
             .get(&info_hash)
             .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
@@ -1443,29 +1507,16 @@ impl SessionStore {
     }
 
     fn begin_delete(&self, info_hash: [u8; 20]) -> Result<bool, String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.pending_delete {
-            return Ok(false);
-        }
-        if previous.pending_file_rename.is_some() {
-            return Err("file rename recovery is pending".to_string());
-        }
-        guard
-            .get_mut(&info_hash)
-            .ok_or_else(|| "torrent session metadata disappeared".to_string())?
-            .pending_delete = true;
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(true)
+        self.update_entry(info_hash, false, &mut |entry| {
+            if entry.pending_delete {
+                return Ok(false);
+            }
+            if entry.pending_file_rename.is_some() {
+                return Err("file rename recovery is pending".to_string());
+            }
+            entry.pending_delete = true;
+            Ok(true)
+        })
     }
 
     fn import_file_renames_if_empty(
@@ -1476,36 +1527,15 @@ impl SessionStore {
         if file_renames.is_empty() {
             return Ok(());
         }
-        let mut normalized = file_renames.to_vec();
-        normalized.sort_unstable_by_key(|(index, _)| *index);
-        if normalized.windows(2).any(|pair| pair[0].0 == pair[1].0)
-            || normalized
-                .iter()
-                .any(|(_, name)| !valid_renamed_file_name(name))
-        {
-            return Err("invalid persisted file rename".to_string());
-        }
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if !previous.file_renames.is_empty() {
-            return Ok(());
-        }
-        let mut proposed = previous.clone();
-        proposed.file_renames = normalized;
-        storage_claims_for_session_entry(&proposed)?;
-        ensure_session_storage_claim_available(&guard, &proposed)?;
-        guard.insert(info_hash, proposed);
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(())
+        let normalized = normalized_file_renames(file_renames)?;
+        self.update_entry(info_hash, true, &mut |entry| {
+            if !entry.file_renames.is_empty() {
+                return Ok(false);
+            }
+            entry.file_renames.clone_from(&normalized);
+            Ok(true)
+        })
+        .map(|_| ())
     }
 
     fn begin_file_rename(
@@ -1517,37 +1547,23 @@ impl SessionStore {
         if !valid_renamed_file_name(target) {
             return Err("invalid file name".to_string());
         }
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.pending_delete {
-            return Err("torrent deletion is pending".to_string());
-        }
         let pending = PendingFileRename {
             index,
             target: target.to_string(),
         };
-        if previous.pending_file_rename.as_ref() == Some(&pending) {
-            return Ok(false);
-        }
-        if previous.pending_file_rename.is_some() {
-            return Err("another file rename is pending".to_string());
-        }
-        let mut proposed = previous.clone();
-        proposed.pending_file_rename = Some(pending);
-        storage_claims_for_session_entry(&proposed)?;
-        ensure_session_storage_claim_available(&guard, &proposed)?;
-        guard.insert(info_hash, proposed);
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(true)
+        self.update_entry(info_hash, true, &mut |entry| {
+            if entry.pending_delete {
+                return Err("torrent deletion is pending".to_string());
+            }
+            match &entry.pending_file_rename {
+                Some(existing) if *existing == pending => Ok(false),
+                Some(_) => Err("another file rename is pending".to_string()),
+                None => {
+                    entry.pending_file_rename = Some(pending.clone());
+                    Ok(true)
+                }
+            }
+        })
     }
 
     fn commit_file_rename(
@@ -1555,38 +1571,26 @@ impl SessionStore {
         info_hash: [u8; 20],
         pending: &PendingFileRename,
     ) -> Result<bool, String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.pending_file_rename.as_ref() != Some(pending) {
-            return Ok(false);
-        }
-        let entry = guard
-            .get_mut(&info_hash)
-            .ok_or_else(|| "torrent session metadata disappeared".to_string())?;
-        if let Some((_, name)) = entry
-            .file_renames
-            .iter_mut()
-            .find(|(index, _)| *index == pending.index)
-        {
-            *name = pending.target.clone();
-        } else {
-            entry
+        self.update_entry(info_hash, false, &mut |entry| {
+            if entry.pending_file_rename.as_ref() != Some(pending) {
+                return Ok(false);
+            }
+            match entry
                 .file_renames
-                .push((pending.index, pending.target.clone()));
-            entry.file_renames.sort_unstable_by_key(|(index, _)| *index);
-        }
-        entry.pending_file_rename = None;
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(true)
+                .iter_mut()
+                .find(|(index, _)| *index == pending.index)
+            {
+                Some((_, name)) => name.clone_from(&pending.target),
+                None => {
+                    entry
+                        .file_renames
+                        .push((pending.index, pending.target.clone()));
+                    sort_renames(&mut entry.file_renames);
+                }
+            }
+            entry.pending_file_rename = None;
+            Ok(true)
+        })
     }
 
     fn cancel_file_rename(
@@ -1594,26 +1598,13 @@ impl SessionStore {
         info_hash: [u8; 20],
         pending: &PendingFileRename,
     ) -> Result<bool, String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.pending_file_rename.as_ref() != Some(pending) {
-            return Ok(false);
-        }
-        guard
-            .get_mut(&info_hash)
-            .ok_or_else(|| "torrent session metadata disappeared".to_string())?
-            .pending_file_rename = None;
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(true)
+        self.update_entry(info_hash, false, &mut |entry| {
+            if entry.pending_file_rename.as_ref() != Some(pending) {
+                return Ok(false);
+            }
+            entry.pending_file_rename = None;
+            Ok(true)
+        })
     }
 
     #[cfg(test)]
@@ -1625,65 +1616,35 @@ impl SessionStore {
         download_dir: &Path,
         preallocate: bool,
     ) -> Result<(), String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard.get(&info_hash).cloned();
-        let (
-            label,
-            completion_state,
-            completion_move_dir,
-            pending_delete,
-            file_renames,
-            pending_file_rename,
-        ) = previous
-            .as_ref()
-            .map(|entry| {
-                (
-                    entry.label.clone(),
-                    entry.completion_state,
-                    entry.completion_move_dir.clone(),
-                    entry.pending_delete,
-                    entry.file_renames.clone(),
-                    entry.pending_file_rename.clone(),
-                )
-            })
-            .unwrap_or_default();
-        guard.insert(
+        let mut guard = lock_or_recover(&self.entries);
+        let previous = guard.get(&info_hash);
+        let proposed = SessionEntry {
+            paused: false,
             info_hash,
-            SessionEntry {
-                paused: false,
-                info_hash,
-                name,
-                torrent_bytes,
-                download_dir: download_dir.to_path_buf(),
-                preallocate,
-                label,
-                completion_state,
-                completion_move_dir,
-                pending_delete,
-                file_renames,
-                pending_file_rename,
-            },
-        );
-        if let Err(err) = save_session(&self.path, &guard) {
-            match previous {
-                Some(entry) => {
-                    guard.insert(info_hash, entry);
-                }
-                None => {
-                    guard.remove(&info_hash);
-                }
-            }
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(())
+            name,
+            torrent_bytes,
+            download_dir: download_dir.to_path_buf(),
+            preallocate,
+            label: previous
+                .map(|entry| entry.label.clone())
+                .unwrap_or_default(),
+            completion_state: previous
+                .map(|entry| entry.completion_state)
+                .unwrap_or_default(),
+            completion_move_dir: previous.and_then(|entry| entry.completion_move_dir.clone()),
+            pending_delete: previous.is_some_and(|entry| entry.pending_delete),
+            file_renames: previous
+                .map(|entry| entry.file_renames.clone())
+                .unwrap_or_default(),
+            pending_file_rename: previous.and_then(|entry| entry.pending_file_rename.clone()),
+        };
+        self.store_entry(&mut guard, proposed, false)
     }
 
     /// Atomically persist a session entry and its effective storage claim.
     /// The caller holds `operations`; once this returns, later claim changes
-    /// cannot race the Storage open that immediately follows it.
+    /// cannot race the Storage open that immediately follows it. Restarting a
+    /// torrent whose entry is unchanged does not rewrite the session file.
     fn upsert_with_storage_claim(
         &self,
         info_hash: [u8; 20],
@@ -1693,141 +1654,70 @@ impl SessionStore {
         preallocate: bool,
         initial_file_renames: &[(usize, String)],
     ) -> Result<(), String> {
-        let mut normalized_renames = initial_file_renames.to_vec();
-        normalized_renames.sort_unstable_by_key(|(index, _)| *index);
-        if normalized_renames
-            .windows(2)
-            .any(|pair| pair[0].0 == pair[1].0)
-            || normalized_renames
-                .iter()
-                .any(|(_, name)| !valid_renamed_file_name(name))
-        {
-            return Err("invalid storage claim file rename".to_string());
-        }
-
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard.get(&info_hash).cloned();
-        let (
-            label,
-            completion_state,
-            completion_move_dir,
-            pending_delete,
-            file_renames,
-            pending_file_rename,
-        ) = previous
-            .as_ref()
-            .map(|entry| {
-                (
-                    entry.label.clone(),
-                    entry.completion_state,
-                    entry.completion_move_dir.clone(),
-                    entry.pending_delete,
-                    if entry.file_renames.is_empty() {
-                        normalized_renames.clone()
-                    } else {
-                        entry.file_renames.clone()
-                    },
-                    entry.pending_file_rename.clone(),
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    String::new(),
-                    CompletionState::None,
-                    None,
-                    false,
-                    normalized_renames,
-                    None,
-                )
-            });
-        let proposed = SessionEntry {
-            paused: previous.as_ref().is_some_and(|entry| entry.paused),
+        let normalized_renames = normalized_file_renames(initial_file_renames)
+            .map_err(|_| "invalid storage claim file rename".to_string())?;
+        let mut guard = lock_or_recover(&self.entries);
+        let mut proposed = SessionEntry {
+            paused: false,
             info_hash,
             name,
             torrent_bytes,
             download_dir: download_dir.to_path_buf(),
             preallocate,
-            label,
-            completion_state,
-            completion_move_dir,
-            pending_delete,
-            file_renames,
-            pending_file_rename,
+            label: String::new(),
+            completion_state: CompletionState::None,
+            completion_move_dir: None,
+            pending_delete: false,
+            file_renames: normalized_renames,
+            pending_file_rename: None,
         };
-        storage_claims_for_session_entry(&proposed)?;
-        ensure_session_storage_claim_available(&guard, &proposed)?;
-        guard.insert(info_hash, proposed);
-        if let Err(err) = save_session(&self.path, &guard) {
-            match previous {
-                Some(entry) => {
-                    guard.insert(info_hash, entry);
-                }
-                None => {
-                    guard.remove(&info_hash);
-                }
+        if let Some(previous) = guard.get(&info_hash) {
+            proposed.paused = previous.paused;
+            proposed.label.clone_from(&previous.label);
+            proposed.completion_state = previous.completion_state;
+            proposed
+                .completion_move_dir
+                .clone_from(&previous.completion_move_dir);
+            proposed.pending_delete = previous.pending_delete;
+            if !previous.file_renames.is_empty() {
+                proposed.file_renames.clone_from(&previous.file_renames);
             }
-            return Err(format!("session save failed: {err}"));
+            proposed
+                .pending_file_rename
+                .clone_from(&previous.pending_file_rename);
+            if proposed == *previous {
+                // Still validate the claim: another entry may have changed.
+                storage_claims_for_session_entry(&proposed)?;
+                return ensure_session_storage_claim_available(&guard, &proposed);
+            }
         }
-        Ok(())
+        self.store_entry(&mut guard, proposed, true)
     }
 
     fn set_paused(&self, info_hash: [u8; 20], paused: bool) -> Result<(), String> {
-        let mut guard = lock_or_recover(&self.entries);
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.paused == paused {
-            return Ok(());
-        }
-        guard.get_mut(&info_hash).unwrap().paused = paused;
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(err);
-        }
-        Ok(())
+        self.update_entry(info_hash, false, &mut |entry| {
+            entry.paused = paused;
+            Ok(true)
+        })
+        .map(|_| ())
     }
 
     fn set_label(&self, info_hash: [u8; 20], label: &str) -> Result<(), String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.label == label {
-            return Ok(());
-        }
-        guard
-            .get_mut(&info_hash)
-            .ok_or_else(|| "torrent session metadata disappeared".to_string())?
-            .label = label.to_string();
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(())
+        self.update_entry(info_hash, false, &mut |entry| {
+            label.clone_into(&mut entry.label);
+            Ok(true)
+        })
+        .map(|_| ())
     }
 
     fn completion_state(&self, info_hash: [u8; 20]) -> Option<CompletionState> {
-        let guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.get(&info_hash).map(|entry| entry.completion_state)
+        lock_or_recover(&self.entries)
+            .get(&info_hash)
+            .map(|entry| entry.completion_state)
     }
 
     fn completion_move_dir(&self, info_hash: [u8; 20]) -> Option<PathBuf> {
-        let guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard
+        lock_or_recover(&self.entries)
             .get(&info_hash)
             .and_then(|entry| entry.completion_move_dir.clone())
     }
@@ -1846,28 +1736,14 @@ impl SessionStore {
             ),
             None => None,
         };
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.pending_delete || previous.completion_state != CompletionState::None {
-            return Ok(false);
-        }
-        let mut proposed = previous.clone();
-        proposed.completion_state = CompletionState::Pending;
-        proposed.completion_move_dir = move_dir;
-        storage_claims_for_session_entry(&proposed)?;
-        ensure_session_storage_claim_available(&guard, &proposed)?;
-        guard.insert(info_hash, proposed);
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(true)
+        self.update_entry(info_hash, true, &mut |entry| {
+            if entry.pending_delete || entry.completion_state != CompletionState::None {
+                return Ok(false);
+            }
+            entry.completion_state = CompletionState::Pending;
+            entry.completion_move_dir.clone_from(&move_dir);
+            Ok(true)
+        })
     }
 
     fn transition_completion_state(
@@ -1876,32 +1752,18 @@ impl SessionStore {
         expected: CompletionState,
         next: CompletionState,
     ) -> Result<bool, String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.pending_delete || previous.completion_state != expected {
-            return Ok(false);
-        }
-        if expected == next {
-            return Ok(true);
-        }
-        let entry = guard
-            .get_mut(&info_hash)
-            .ok_or_else(|| "torrent session metadata disappeared".to_string())?;
-        entry.completion_state = next;
-        if next == CompletionState::Done {
-            entry.completion_move_dir = None;
-        }
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(true)
+        self.update_entry(info_hash, false, &mut |entry| {
+            if entry.pending_delete || entry.completion_state != expected {
+                return Ok(false);
+            }
+            if expected != next {
+                entry.completion_state = next;
+                if next == CompletionState::Done {
+                    entry.completion_move_dir = None;
+                }
+            }
+            Ok(true)
+        })
     }
 
     fn commit_completion_move(
@@ -1909,35 +1771,19 @@ impl SessionStore {
         info_hash: [u8; 20],
         download_dir: &Path,
     ) -> Result<bool, String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = guard
-            .get(&info_hash)
-            .cloned()
-            .ok_or_else(|| "torrent session metadata is unavailable".to_string())?;
-        if previous.pending_delete || previous.completion_state != CompletionState::Pending {
-            return Ok(false);
-        }
-        let entry = guard
-            .get_mut(&info_hash)
-            .ok_or_else(|| "torrent session metadata disappeared".to_string())?;
-        entry.download_dir = download_dir.to_path_buf();
-        entry.completion_state = CompletionState::Done;
-        entry.completion_move_dir = None;
-        if let Err(err) = save_session(&self.path, &guard) {
-            guard.insert(info_hash, previous);
-            return Err(format!("session save failed: {err}"));
-        }
-        Ok(true)
+        self.update_entry(info_hash, false, &mut |entry| {
+            if entry.pending_delete || entry.completion_state != CompletionState::Pending {
+                return Ok(false);
+            }
+            entry.download_dir = download_dir.to_path_buf();
+            entry.completion_state = CompletionState::Done;
+            entry.completion_move_dir = None;
+            Ok(true)
+        })
     }
 
     fn remove(&self, info_hash: [u8; 20]) -> Result<bool, String> {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = lock_or_recover(&self.entries);
         let Some(previous) = guard.remove(&info_hash) else {
             return Ok(false);
         };
@@ -1960,9 +1806,10 @@ fn spawn_on_complete_script(
     let torrent_name = torrent_name.to_string();
     let torrent_dir = torrent_dir.display().to_string();
     let torrent_hash = hex(&info_hash);
-    if let Err(err) = thread::Builder::new()
-        .name("rustorrent-on-complete".to_string())
-        .spawn(move || {
+    if let Err(err) = spawn_worker(
+        "rustorrent-on-complete".to_string(),
+        0,
+        Box::new(move || {
             match std::process::Command::new(&script)
                 .env("TORRENT_NAME", &torrent_name)
                 .env("TORRENT_DIR", &torrent_dir)
@@ -1979,8 +1826,8 @@ fn spawn_on_complete_script(
                     log_warn!("on-complete script error: {err}");
                 }
             }
-        })
-    {
+        }),
+    ) {
         // Completion is deliberately recorded before spawning. A launch failure is
         // therefore at-most-once, rather than risking duplicate external effects.
         log_warn!("on-complete worker could not start: {err}");
@@ -3259,6 +3106,83 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Reply to a UI command. Errors of commands with a `context` are also logged
+/// and surfaced as the most recent error.
+fn finish_command(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    context: Option<&'static str>,
+    result: Result<(), String>,
+    reply: &mpsc::Sender<ui::UiCommandResult>,
+) {
+    if let (Err(err), Some(context)) = (&result, context) {
+        log_warn!("{context} error: {err}");
+        update_ui(ui_state, |state| state.last_error = err.clone());
+    }
+    let _ = reply.send(result.map(|()| ui::UiCommandSuccess::Ok));
+}
+
+/// Validate and queue a torrent added from the UI. Returns the new id.
+#[allow(clippy::too_many_arguments)]
+fn add_command_request(
+    queue: &mut VecDeque<TorrentRequest>,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    args: &Args,
+    next_id: &mut u64,
+    registry: &SessionRegistry,
+    session_store: &SessionStore,
+    in_flight: &InFlightTorrents,
+    source: TorrentSource,
+    download_dir: String,
+    preallocate: bool,
+    options: ui::AddOptions,
+) -> Result<u64, String> {
+    if queue
+        .len()
+        .saturating_add(lock_or_recover(&session_store.entries).len())
+        .saturating_add(lock_or_recover(in_flight).len())
+        >= MAX_SESSION_ENTRIES
+    {
+        return Err("library capacity reached; remove a transfer before adding more".to_string());
+    }
+    let (info_hash, label) = match &source {
+        TorrentSource::Bytes(data) => {
+            let meta = torrent::parse_torrent(data).map_err(|err| err.to_string())?;
+            let spans = build_file_spans(&meta)?;
+            if options.skip_files.iter().any(|index| *index >= spans.len()) {
+                return Err("file selection index out of range".to_string());
+            }
+            if spans
+                .iter()
+                .enumerate()
+                .all(|(index, span)| span.is_padding || options.skip_files.contains(&index))
+            {
+                return Err("select at least one file".to_string());
+            }
+            (meta.info_hash, "torrent upload")
+        }
+        TorrentSource::Magnet(magnet) => (parse_magnet(magnet)?.info_hash, "magnet link"),
+        TorrentSource::Path(_) => return Err("unsupported torrent source".to_string()),
+    };
+    if is_duplicate_torrent(registry, queue, session_store, in_flight, info_hash) {
+        let message = "torrent already added".to_string();
+        update_ui(ui_state, |state| state.last_error = message.clone());
+        return Err(message);
+    }
+    let torrent_id = *next_id;
+    *next_id = next_id.saturating_add(1);
+    let request = TorrentRequest {
+        id: torrent_id,
+        source,
+        download_dir: normalize_download_dir(download_dir, &args.download_dir),
+        preallocate,
+        initial_label: String::new(),
+        initial_options: options,
+        held: false,
+    };
+    enqueue_request_with_label(queue, ui_state, request, label.to_string());
+    Ok(torrent_id)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_ui_commands(
     rx: &mpsc::Receiver<ui::UiCommand>,
@@ -3275,378 +3199,287 @@ fn drain_ui_commands(
     inbound: &InboundConfig,
     in_flight: &InFlightTorrents,
 ) {
-    loop {
-        match rx.try_recv() {
-            Ok(cmd) => match cmd {
-                ui::UiCommand::AddTorrent {
-                    data,
-                    download_dir,
-                    preallocate,
-                    options,
-                    reply,
-                } => {
-                    if queue
-                        .len()
-                        .saturating_add(lock_or_recover(&session_store.entries).len())
-                        .saturating_add(lock_or_recover(in_flight).len())
-                        >= MAX_SESSION_ENTRIES
-                    {
-                        let _ = reply.send(Err(
-                            "library capacity reached; remove a transfer before adding more"
-                                .to_string(),
-                        ));
-                        continue;
-                    }
-                    if let Err(err) = torrent::parse_torrent(&data)
-                        .map_err(|err| err.to_string())
-                        .and_then(|meta| {
-                            let spans = build_file_spans(&meta)?;
-                            if options.skip_files.iter().any(|index| *index >= spans.len()) {
-                                return Err("file selection index out of range".to_string());
-                            }
-                            if spans.iter().enumerate().all(|(index, span)| {
-                                span.is_padding || options.skip_files.contains(&index)
-                            }) {
-                                return Err("select at least one file".to_string());
-                            }
-                            Ok(())
-                        })
-                    {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                    let request = TorrentRequest {
-                        id: *next_id,
-                        source: TorrentSource::Bytes(data),
-                        download_dir: normalize_download_dir(download_dir, &args.download_dir),
-                        preallocate,
-                        initial_label: String::new(),
-                        initial_options: options,
-                        held: false,
-                    };
-                    if let Ok(info_hash) = info_hash_for_source(&request.source) {
-                        if is_duplicate_torrent(
-                            registry,
-                            queue,
-                            session_store,
-                            in_flight,
-                            info_hash,
-                        ) {
-                            let message = "torrent already added".to_string();
-                            update_ui(ui_state, |state| {
-                                state.last_error = message.clone();
-                            });
-                            let _ = reply.send(Err(message));
-                            continue;
-                        }
-                    }
-                    *next_id = next_id.saturating_add(1);
-                    let torrent_id = request.id;
-                    enqueue_request_with_label(
-                        queue,
-                        ui_state,
-                        request,
-                        "torrent upload".to_string(),
-                    );
-                    let _ = reply.send(Ok(ui::UiCommandSuccess::TorrentAdded { torrent_id }));
-                }
-                ui::UiCommand::AddMagnet {
-                    magnet,
-                    download_dir,
-                    preallocate,
-                    options,
-                    reply,
-                } => {
-                    if queue
-                        .len()
-                        .saturating_add(lock_or_recover(&session_store.entries).len())
-                        .saturating_add(lock_or_recover(in_flight).len())
-                        >= MAX_SESSION_ENTRIES
-                    {
-                        let _ = reply.send(Err(
-                            "library capacity reached; remove a transfer before adding more"
-                                .to_string(),
-                        ));
-                        continue;
-                    }
-                    if let Err(err) = parse_magnet(&magnet) {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                    let request = TorrentRequest {
-                        id: *next_id,
-                        source: TorrentSource::Magnet(magnet),
-                        download_dir: normalize_download_dir(download_dir, &args.download_dir),
-                        preallocate,
-                        initial_label: String::new(),
-                        initial_options: options,
-                        held: false,
-                    };
-                    if let Ok(info_hash) = info_hash_for_source(&request.source) {
-                        if is_duplicate_torrent(
-                            registry,
-                            queue,
-                            session_store,
-                            in_flight,
-                            info_hash,
-                        ) {
-                            let message = "torrent already added".to_string();
-                            update_ui(ui_state, |state| {
-                                state.last_error = message.clone();
-                            });
-                            let _ = reply.send(Err(message));
-                            continue;
-                        }
-                    }
-                    *next_id = next_id.saturating_add(1);
-                    let torrent_id = request.id;
-                    enqueue_request_with_label(queue, ui_state, request, "magnet link".to_string());
-                    let _ = reply.send(Ok(ui::UiCommandSuccess::TorrentAdded { torrent_id }));
-                }
-                ui::UiCommand::PauseTorrent { torrent_id, reply } => {
-                    let result = pause_torrent(
-                        registry,
-                        ui_state,
-                        queue,
-                        torrent_id,
-                        session_store,
-                        in_flight,
-                    )
-                    .map(|_| ui::UiCommandSuccess::Ok);
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("pause torrent error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result);
-                }
-                ui::UiCommand::ResumeTorrent { torrent_id, reply } => {
-                    let result = resume_torrent(
-                        registry,
-                        ui_state,
-                        queue,
-                        torrent_id,
-                        session_store,
-                        in_flight,
-                    )
-                    .map(|_| ui::UiCommandSuccess::Ok);
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("resume torrent error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result);
-                }
-                ui::UiCommand::StopTorrent { torrent_id, reply } => {
-                    let result = stop_torrent(
-                        registry,
-                        ui_state,
-                        queue,
-                        torrent_id,
-                        session_store,
-                        in_flight,
-                    )
-                    .map(|_| ui::UiCommandSuccess::Ok);
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("stop torrent error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result);
-                }
-                ui::UiCommand::ArchiveTorrent { torrent_id, reply } => {
-                    let result = archive_torrent(
-                        registry,
-                        ui_state,
-                        queue,
-                        torrent_id,
-                        session_store,
-                        in_flight,
-                    )
-                    .map(|_| ui::UiCommandSuccess::Ok);
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("archive torrent error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result);
-                }
-                ui::UiCommand::DeleteTorrent {
-                    torrent_id,
-                    remove_data,
-                    reply,
-                } => {
-                    let result = delete_torrent(
-                        registry,
-                        ui_state,
-                        queue,
-                        torrent_id,
-                        remove_data,
-                        session_store,
-                        in_flight,
-                    );
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("delete torrent error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::SetFilePriority {
-                    torrent_id,
-                    file_index,
-                    priority,
-                    reply,
-                } => {
-                    let result =
-                        apply_file_priority(registry, ui_state, torrent_id, file_index, priority);
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("file priority error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::RenameFile {
-                    torrent_id,
-                    file_index,
-                    new_name,
-                    reply,
-                } => {
-                    let result = apply_file_rename(
-                        registry,
-                        ui_state,
-                        session_store,
-                        torrent_id,
-                        file_index,
-                        &new_name,
-                    );
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("file rename error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::SetRateLimits {
-                    download_limit_bps,
-                    upload_limit_bps,
-                    reply,
-                } => {
-                    global_down.set_limit_bps(download_limit_bps);
-                    global_up.set_limit_bps(upload_limit_bps);
-                    update_ui(ui_state, |state| {
-                        state.global_download_limit_bps = download_limit_bps;
-                        state.global_upload_limit_bps = upload_limit_bps;
-                    });
-                    let _ = reply.send(Ok(ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::RecheckTorrent { torrent_id, reply } => {
-                    let result = recheck_torrent(registry, ui_state, torrent_id);
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("recheck torrent error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::SetSeedRatio { ratio, reply } => {
-                    SEED_RATIO_BITS.store(ratio.to_bits(), Ordering::SeqCst);
-                    update_ui(ui_state, |state| {
-                        state.seed_ratio = ratio;
-                    });
-                    let _ = reply.send(Ok(ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::SetPeerProfile { profile, reply } => {
-                    let result = parse_peer_profile(&profile).map(|profile| {
-                        let tuning = peer_settings.apply_profile(profile);
-                        peer_slots.set_max(tuning.max_peers_global);
-                        inbound.set_max_handlers(inbound_handler_slots(tuning.max_peers_global));
-                        log_info!(
-                            "peer profile changed via ui: {} (global={}, per_torrent={}, numwant={}, metadata={})",
-                            profile.as_str(),
-                            tuning.max_peers_global,
-                            tuning.max_peers_torrent,
-                            tuning.numwant,
-                            tuning.metadata_peer_limit
-                        );
-                        update_ui(ui_state, |state| {
-                            state.peer_profile = profile.as_str().to_string();
-                            state.peer_profile_global_limit = tuning.max_peers_global;
-                            state.peer_profile_torrent_limit = tuning.max_peers_torrent;
-                            state.peer_profile_numwant = tuning.numwant;
-                        });
-                        ui::UiCommandSuccess::Ok
-                    });
-                    if let Err(err) = result.as_ref() {
-                        log_warn!("peer profile error: {err}");
-                        update_ui(ui_state, |state| {
-                            state.last_error = err.clone();
-                        });
-                    }
-                    let _ = reply.send(result);
-                }
-                ui::UiCommand::SetLabel {
-                    torrent_id,
-                    label,
-                    reply,
-                } => {
-                    let result =
-                        set_torrent_label(registry, ui_state, session_store, torrent_id, &label);
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::AddTracker {
-                    torrent_id,
-                    url,
-                    reply,
-                } => {
-                    let result = add_torrent_tracker(registry, ui_state, torrent_id, &url);
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::RemoveTracker {
-                    torrent_id,
-                    url,
-                    reply,
-                } => {
-                    let result = remove_torrent_tracker(registry, ui_state, torrent_id, &url);
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::AddRssFeed {
-                    url,
-                    interval,
-                    reply,
-                } => {
-                    let result = rss_add_feed(&url, interval, &args.download_dir);
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::RemoveRssFeed { url, reply } => {
-                    let result = rss_remove_feed(&url, &args.download_dir);
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::AddRssRule {
-                    name,
-                    feed_url,
-                    pattern,
-                    reply,
-                } => {
-                    let result = rss_add_rule(&name, &feed_url, &pattern, &args.download_dir);
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-                ui::UiCommand::RemoveRssRule { name, reply } => {
-                    let result = rss_remove_rule(&name, &args.download_dir);
-                    let _ = reply.send(result.map(|_| ui::UiCommandSuccess::Ok));
-                }
-            },
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => break,
+    use ui::UiCommand as Command;
+    while let Ok(command) = rx.try_recv() {
+        let (source, download_dir, preallocate, options, reply) = match command {
+            Command::AddTorrent {
+                data,
+                download_dir,
+                preallocate,
+                options,
+                reply,
+            } => (
+                TorrentSource::Bytes(data),
+                download_dir,
+                preallocate,
+                options,
+                reply,
+            ),
+            Command::AddMagnet {
+                magnet,
+                download_dir,
+                preallocate,
+                options,
+                reply,
+            } => (
+                TorrentSource::Magnet(magnet),
+                download_dir,
+                preallocate,
+                options,
+                reply,
+            ),
+            command => {
+                let (context, result, reply) = run_ui_command(
+                    command,
+                    queue,
+                    ui_state,
+                    args,
+                    registry,
+                    session_store,
+                    global_down,
+                    global_up,
+                    peer_settings,
+                    peer_slots,
+                    inbound,
+                    in_flight,
+                );
+                finish_command(ui_state, context, result, &reply);
+                continue;
+            }
+        };
+        let result = add_command_request(
+            queue,
+            ui_state,
+            args,
+            next_id,
+            registry,
+            session_store,
+            in_flight,
+            source,
+            download_dir,
+            preallocate,
+            options,
+        );
+        let _ =
+            reply.send(result.map(|torrent_id| ui::UiCommandSuccess::TorrentAdded { torrent_id }));
+    }
+}
+
+type CommandOutcome = (
+    Option<&'static str>,
+    Result<(), String>,
+    mpsc::Sender<ui::UiCommandResult>,
+);
+
+/// Execute a UI command other than adding a torrent.
+#[allow(clippy::too_many_arguments)]
+fn run_ui_command(
+    command: ui::UiCommand,
+    queue: &mut VecDeque<TorrentRequest>,
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    args: &Args,
+    registry: &SessionRegistry,
+    session_store: &Arc<SessionStore>,
+    global_down: &Arc<RateLimiter>,
+    global_up: &Arc<RateLimiter>,
+    peer_settings: &Arc<PeerRuntimeSettings>,
+    peer_slots: &Arc<PeerSlots>,
+    inbound: &InboundConfig,
+    in_flight: &InFlightTorrents,
+) -> CommandOutcome {
+    use ui::UiCommand as Command;
+    match command {
+        Command::AddTorrent { reply, .. } | Command::AddMagnet { reply, .. } => {
+            (None, Err("unexpected add command".to_string()), reply)
+        }
+        Command::PauseTorrent { torrent_id, reply } => (
+            Some("pause torrent"),
+            pause_torrent(
+                registry,
+                ui_state,
+                queue,
+                torrent_id,
+                session_store,
+                in_flight,
+            ),
+            reply,
+        ),
+        Command::ResumeTorrent { torrent_id, reply } => (
+            Some("resume torrent"),
+            resume_torrent(
+                registry,
+                ui_state,
+                queue,
+                torrent_id,
+                session_store,
+                in_flight,
+            ),
+            reply,
+        ),
+        Command::StopTorrent { torrent_id, reply } => (
+            Some("stop torrent"),
+            stop_torrent(
+                registry,
+                ui_state,
+                queue,
+                torrent_id,
+                session_store,
+                in_flight,
+            ),
+            reply,
+        ),
+        Command::ArchiveTorrent { torrent_id, reply } => (
+            Some("archive torrent"),
+            archive_torrent(
+                registry,
+                ui_state,
+                queue,
+                torrent_id,
+                session_store,
+                in_flight,
+            ),
+            reply,
+        ),
+        Command::DeleteTorrent {
+            torrent_id,
+            remove_data,
+            reply,
+        } => (
+            Some("delete torrent"),
+            delete_torrent(
+                registry,
+                ui_state,
+                queue,
+                torrent_id,
+                remove_data,
+                session_store,
+                in_flight,
+            ),
+            reply,
+        ),
+        Command::SetFilePriority {
+            torrent_id,
+            file_index,
+            priority,
+            reply,
+        } => (
+            Some("file priority"),
+            apply_file_priority(registry, ui_state, torrent_id, file_index, priority),
+            reply,
+        ),
+        Command::RenameFile {
+            torrent_id,
+            file_index,
+            new_name,
+            reply,
+        } => (
+            Some("file rename"),
+            apply_file_rename(
+                registry,
+                ui_state,
+                session_store,
+                torrent_id,
+                file_index,
+                &new_name,
+            ),
+            reply,
+        ),
+        Command::SetRateLimits {
+            download_limit_bps,
+            upload_limit_bps,
+            reply,
+        } => {
+            global_down.set_limit_bps(download_limit_bps);
+            global_up.set_limit_bps(upload_limit_bps);
+            update_ui(ui_state, |state| {
+                state.global_download_limit_bps = download_limit_bps;
+                state.global_upload_limit_bps = upload_limit_bps;
+            });
+            (None, Ok(()), reply)
+        }
+        Command::RecheckTorrent { torrent_id, reply } => (
+            Some("recheck torrent"),
+            recheck_torrent(registry, ui_state, torrent_id),
+            reply,
+        ),
+        Command::SetSeedRatio { ratio, reply } => {
+            SEED_RATIO_BITS.store(ratio.to_bits(), Ordering::SeqCst);
+            update_ui(ui_state, |state| state.seed_ratio = ratio);
+            (None, Ok(()), reply)
+        }
+        Command::SetPeerProfile { profile, reply } => {
+            let result = parse_peer_profile(&profile).map(|profile| {
+                let tuning = peer_settings.apply_profile(profile);
+                peer_slots.set_max(tuning.max_peers_global);
+                inbound.set_max_handlers(inbound_handler_slots(tuning.max_peers_global));
+                log_info!(
+                    "peer profile changed via ui: {} (global={}, per_torrent={}, numwant={}, metadata={})",
+                    profile.as_str(),
+                    tuning.max_peers_global,
+                    tuning.max_peers_torrent,
+                    tuning.numwant,
+                    tuning.metadata_peer_limit
+                );
+                update_ui(ui_state, |state| {
+                    state.peer_profile = profile.as_str().to_string();
+                    state.peer_profile_global_limit = tuning.max_peers_global;
+                    state.peer_profile_torrent_limit = tuning.max_peers_torrent;
+                    state.peer_profile_numwant = tuning.numwant;
+                });
+            });
+            (Some("peer profile"), result, reply)
+        }
+        Command::SetLabel {
+            torrent_id,
+            label,
+            reply,
+        } => (
+            None,
+            set_torrent_label(registry, ui_state, session_store, torrent_id, &label),
+            reply,
+        ),
+        Command::AddTracker {
+            torrent_id,
+            url,
+            reply,
+        } => (
+            None,
+            add_torrent_tracker(registry, ui_state, torrent_id, &url),
+            reply,
+        ),
+        Command::RemoveTracker {
+            torrent_id,
+            url,
+            reply,
+        } => (
+            None,
+            remove_torrent_tracker(registry, ui_state, torrent_id, &url),
+            reply,
+        ),
+        Command::AddRssFeed {
+            url,
+            interval,
+            reply,
+        } => (
+            None,
+            rss_add_feed(&url, interval, &args.download_dir),
+            reply,
+        ),
+        Command::RemoveRssFeed { url, reply } => {
+            (None, rss_remove_feed(&url, &args.download_dir), reply)
+        }
+        Command::AddRssRule {
+            name,
+            feed_url,
+            pattern,
+            reply,
+        } => (
+            None,
+            rss_add_rule(&name, &feed_url, &pattern, &args.download_dir),
+            reply,
+        ),
+        Command::RemoveRssRule { name, reply } => {
+            (None, rss_remove_rule(&name, &args.download_dir), reply)
         }
     }
 }
@@ -3902,9 +3735,10 @@ fn start_torrent_worker(
     );
     let retry_request = request.clone();
     let worker_runtime = Arc::clone(runtime);
-    match thread::Builder::new()
-        .name(format!("torrent-{request_id}"))
-        .spawn(move || {
+    match spawn_worker(
+        format!("torrent-{request_id}"),
+        0,
+        Box::new(move || {
             let fallback = request.clone();
             let result = run_torrent(request, &worker_runtime, &in_flight_guard.control);
             finish_torrent_worker(
@@ -3914,7 +3748,8 @@ fn start_torrent_worker(
                 info_hash,
                 &worker_runtime,
             );
-        }) {
+        }),
+    ) {
         Ok(handle) => {
             handles.push(handle);
             true
@@ -4252,7 +4087,7 @@ fn run_torrent_once(
         .filter(|entry| !entry.file_renames.is_empty())
         .map(|entry| entry.file_renames.clone())
         .unwrap_or_else(|| legacy_resume_renames.clone());
-    saved_renames.sort_unstable_by_key(|(index, _)| *index);
+    sort_renames(&mut saved_renames);
     if session_entry
         .as_ref()
         .is_some_and(|entry| entry.pending_file_rename.is_some())
@@ -4740,15 +4575,16 @@ fn run_torrent_once(
         };
         if let Some(rx) = dht_rx {
             let queue_clone = Arc::clone(&peer_queue);
-            match thread::Builder::new()
-                .name(format!("dht-peers-{torrent_id}"))
-                .stack_size(PEER_THREAD_STACK)
-                .spawn(move || {
+            match spawn_worker(
+                format!("dht-peers-{torrent_id}"),
+                PEER_THREAD_STACK,
+                Box::new(move || {
                     for peers in rx {
                         let mut queue = lock_or_recover(&queue_clone);
                         queue.enqueue_with_source(peers, PeerSource::Dht);
                     }
-                }) {
+                }),
+            ) {
                 Ok(handle) => discovery_handles.push(handle),
                 Err(err) => {
                     log_warn!("DHT peer receiver could not start: {err}");
@@ -4764,15 +4600,16 @@ fn run_torrent_once(
         };
         if let Some(rx) = lpd_rx {
             let queue_clone = Arc::clone(&peer_queue);
-            match thread::Builder::new()
-                .name(format!("lpd-peers-{torrent_id}"))
-                .stack_size(PEER_THREAD_STACK)
-                .spawn(move || {
+            match spawn_worker(
+                format!("lpd-peers-{torrent_id}"),
+                PEER_THREAD_STACK,
+                Box::new(move || {
                     for peers in rx {
                         let mut queue = lock_or_recover(&queue_clone);
                         queue.enqueue_with_source(peers, PeerSource::Lpd);
                     }
-                }) {
+                }),
+            ) {
                 Ok(handle) => discovery_handles.push(handle),
                 Err(err) => {
                     log_warn!("LPD peer receiver could not start: {err}");
@@ -4802,10 +4639,11 @@ fn run_torrent_once(
             while handles.len() < live_target {
                 let worker_context = Arc::clone(&context);
                 let worker_connect_cfg = connect_cfg.clone();
-                let spawn_result = thread::Builder::new()
-                    .name(format!("peer-{torrent_id}-{}", handles.len()))
-                    .stack_size(PEER_THREAD_STACK)
-                    .spawn(move || peer_worker_loop(&worker_context, &worker_connect_cfg));
+                let spawn_result = spawn_worker(
+                    format!("peer-{torrent_id}-{}", handles.len()),
+                    PEER_THREAD_STACK,
+                    Box::new(move || peer_worker_loop(&worker_context, &worker_connect_cfg)),
+                );
                 match spawn_result {
                     Ok(handle) => handles.push(handle),
                     Err(err) => {
@@ -5184,9 +5022,10 @@ fn run_torrent_once(
                 }
                 if announce_pending > 0 {
                     let queue_clone = Arc::clone(&peer_queue);
-                    thread::Builder::new()
-                        .stack_size(PEER_THREAD_STACK)
-                        .spawn(move || {
+                    spawn_worker(
+                        "tracker-results".to_string(),
+                        PEER_THREAD_STACK,
+                        Box::new(move || {
                             let mut pending = announce_pending;
                             while pending > 0 {
                                 let Some(remaining) =
@@ -5214,8 +5053,9 @@ fn run_torrent_once(
                                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                                 }
                             }
-                        })
-                        .ok();
+                        }),
+                    )
+                    .ok();
                 }
                 last_announce = Instant::now();
                 started = false;
@@ -8146,9 +7986,10 @@ fn start_webseed_worker(
     if web_seeds.is_empty() {
         return Ok(None);
     }
-    thread::Builder::new()
-        .name(format!("webseed-{torrent_id}"))
-        .spawn(move || loop {
+    spawn_worker(
+        format!("webseed-{torrent_id}"),
+        0,
+        Box::new(move || loop {
             if torrent_stop_requested(&stop_flag) {
                 break;
             }
@@ -8275,9 +8116,10 @@ fn start_webseed_worker(
                     true,
                 );
             });
-        })
-        .map(Some)
-        .map_err(|err| format!("web seed worker could not start: {err}"))
+        }),
+    )
+    .map(Some)
+    .map_err(|err| format!("web seed worker could not start: {err}"))
 }
 
 #[cfg(not(feature = "webseed"))]
@@ -8323,9 +8165,10 @@ fn start_resume_worker(
     file_renames: Arc<Mutex<HashMap<usize, String>>>,
     save_requested: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, String> {
-    thread::Builder::new()
-        .name(format!("resume-{}", hex(&info_hash[..4])))
-        .spawn(move || {
+    spawn_worker(
+        format!("resume-{}", hex(&info_hash[..4])),
+        0,
+        Box::new(move || {
             let mut last_save = instant_ago(RESUME_SAVE_INTERVAL);
             let mut last_complete: Option<bool> = None;
             loop {
@@ -8406,8 +8249,9 @@ fn start_resume_worker(
                 }
                 sleep_with_shutdown_or_stop(Duration::from_secs(1), &stop_flag);
             }
-        })
-        .map_err(|err| format!("resume worker could not start: {err}"))
+        }),
+    )
+    .map_err(|err| format!("resume worker could not start: {err}"))
 }
 
 #[cfg(feature = "webseed")]
@@ -9083,7 +8927,7 @@ fn parse_session_entries(
             None => Vec::new(),
             _ => return Err("invalid session file renames".to_string()),
         };
-        file_renames.sort_unstable_by_key(|(index, _)| *index);
+        sort_renames(&mut file_renames);
         if file_renames.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err("duplicate session file rename index".to_string());
         }
@@ -9378,7 +9222,7 @@ fn parse_resume_data(data: &[u8]) -> Result<ResumeData, String> {
         None => Vec::new(),
         Some(_) => return Err("resume file renames are invalid".to_string()),
     };
-    file_renames.sort_unstable_by_key(|(index, _)| *index);
+    sort_renames(&mut file_renames);
     if file_renames.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err("duplicate resume file rename index".to_string());
     }
@@ -10847,9 +10691,10 @@ fn spawn_tracker_announces(
         let tasks = Arc::clone(&tasks);
         let event = event.clone();
         let proxy_config = proxy_config.clone();
-        match thread::Builder::new()
-            .stack_size(PEER_THREAD_STACK)
-            .spawn(move || {
+        match spawn_worker(
+            "tracker-announce".to_string(),
+            PEER_THREAD_STACK,
+            Box::new(move || {
                 let _worker_guard = worker_guard;
                 loop {
                     if Instant::now() >= stop_at {
@@ -10896,7 +10741,8 @@ fn spawn_tracker_announces(
                         response,
                     });
                 }
-            }) {
+            }),
+        ) {
             Ok(_) => workers_started += 1,
             Err(err) => {
                 log_warn!("tracker worker spawn failed: {err}");
@@ -12241,17 +12087,18 @@ fn connect_peer_with_timeout(
     attempts += 1;
     {
         let result_tx = tx.clone();
-        if let Err(err) = thread::Builder::new()
-            .name("tcp-connect".to_string())
-            .spawn(move || {
+        if let Err(err) = spawn_worker(
+            "tcp-connect".to_string(),
+            0,
+            Box::new(move || {
                 let result = connect_tcp_stream(addr, tcp_timeout).map(|stream| {
                     let _ = stream.set_nodelay(true);
                     configure_keepalive(&stream);
                     PeerStream::tcp(stream)
                 });
                 let _ = result_tx.send(result);
-            })
-        {
+            }),
+        ) {
             let _ = tx.send(Err(format!("TCP connect worker could not start: {err}")));
         }
     }
@@ -12260,13 +12107,14 @@ fn connect_peer_with_timeout(
         attempts += 1;
         let result_tx = tx.clone();
         let connector = connector.clone();
-        if let Err(err) = thread::Builder::new()
-            .name("utp-connect".to_string())
-            .spawn(move || {
+        if let Err(err) = spawn_worker(
+            "utp-connect".to_string(),
+            0,
+            Box::new(move || {
                 let result = connector.connect(addr).map(PeerStream::utp);
                 let _ = result_tx.send(result);
-            })
-        {
+            }),
+        ) {
             let _ = tx.send(Err(format!("uTP connect worker could not start: {err}")));
         }
     }
@@ -12694,9 +12542,10 @@ fn recheck_torrent(
             torrent.status = "checking".to_string();
         });
     });
-    let spawn_result = thread::Builder::new()
-        .name(format!("recheck-{torrent_id}"))
-        .spawn(move || {
+    let spawn_result = spawn_worker(
+        format!("recheck-{torrent_id}"),
+        0,
+        Box::new(move || {
             struct RecheckGuard(Arc<AtomicBool>);
             impl Drop for RecheckGuard {
                 fn drop(&mut self) {
@@ -12752,7 +12601,8 @@ fn recheck_torrent(
                     });
                 }
             }
-        });
+        }),
+    );
     if let Err(err) = spawn_result {
         context.rechecking.store(false, Ordering::Release);
         let message = format!("recheck worker could not start: {err}");
@@ -13055,9 +12905,10 @@ fn start_utp_listener(
     registry: SessionRegistry,
     inbound: InboundConfig,
 ) -> Result<thread::JoinHandle<()>, String> {
-    thread::Builder::new()
-        .name("utp-listener".to_string())
-        .spawn(move || loop {
+    spawn_worker(
+        "utp-listener".to_string(),
+        0,
+        Box::new(move || loop {
             if shutdown_requested() {
                 break;
             }
@@ -13065,14 +12916,14 @@ fn start_utp_listener(
                 if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
                     let registry = Arc::clone(&registry);
                     let inbound = inbound.clone();
-                    if let Err(err) = thread::Builder::new()
-                        .name("inbound-utp-peer".to_string())
-                        .stack_size(PEER_THREAD_STACK)
-                        .spawn(move || {
+                    if let Err(err) = spawn_worker(
+                        "inbound-utp-peer".to_string(),
+                        PEER_THREAD_STACK,
+                        Box::new(move || {
                             let _slot_guard = slot_guard;
                             handle_incoming_peer(PeerStream::utp(stream), registry, inbound);
-                        })
-                    {
+                        }),
+                    ) {
                         log_warn!("inbound uTP peer worker could not start: {err}");
                     }
                 } else {
@@ -13081,8 +12932,9 @@ fn start_utp_listener(
             } else {
                 sleep_with_shutdown(Duration::from_millis(20));
             }
-        })
-        .map_err(|err| format!("listener worker could not start: {err}"))
+        }),
+    )
+    .map_err(|err| format!("listener worker could not start: {err}"))
 }
 
 fn start_inbound_listener(
@@ -13096,9 +12948,10 @@ fn start_inbound_listener(
             .set_nonblocking(true)
             .map_err(|err| format!("set listener nonblocking: {err}"))?;
     }
-    thread::Builder::new()
-        .name("tcp-listener".to_string())
-        .spawn(move || loop {
+    spawn_worker(
+        "tcp-listener".to_string(),
+        0,
+        Box::new(move || loop {
             if shutdown_requested() {
                 break;
             }
@@ -13117,18 +12970,18 @@ fn start_inbound_listener(
                         if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
                             let registry = Arc::clone(&registry);
                             let inbound = inbound.clone();
-                            if let Err(err) = thread::Builder::new()
-                                .name("inbound-tcp-peer".to_string())
-                                .stack_size(PEER_THREAD_STACK)
-                                .spawn(move || {
+                            if let Err(err) = spawn_worker(
+                                "inbound-tcp-peer".to_string(),
+                                PEER_THREAD_STACK,
+                                Box::new(move || {
                                     let _slot_guard = slot_guard;
                                     handle_incoming_peer(
                                         PeerStream::tcp(stream),
                                         registry,
                                         inbound,
                                     );
-                                })
-                            {
+                                }),
+                            ) {
                                 log_warn!("inbound TCP peer worker could not start: {err}");
                             }
                         } else {
@@ -13148,8 +13001,9 @@ fn start_inbound_listener(
             } else if !accepted_connection {
                 sleep_with_shutdown(Duration::from_millis(20));
             }
-        })
-        .map_err(|err| format!("listener worker could not start: {err}"))
+        }),
+    )
+    .map_err(|err| format!("listener worker could not start: {err}"))
 }
 
 fn handle_incoming_peer(mut stream: PeerStream, registry: SessionRegistry, inbound: InboundConfig) {
@@ -13529,16 +13383,17 @@ fn schedule_rss_polls(
     for url in due_urls {
         let tx = poll_tx.clone();
         let failed_url = url.clone();
-        if let Err(err) = thread::Builder::new()
-            .name("rss-poll".to_string())
-            .spawn(move || {
+        if let Err(err) = spawn_worker(
+            "rss-poll".to_string(),
+            0,
+            Box::new(move || {
                 let parsed = match http::get_public(&url, 2 * 1024 * 1024) {
                     Ok(bytes) => rss::parse_feed(&bytes),
                     Err(err) => Err(err.to_string()),
                 };
                 let _ = tx.send(RssPollResult { url, parsed });
-            })
-        {
+            }),
+        ) {
             inflight.remove(&failed_url);
             if let Ok(mut state) = rss_lock.lock() {
                 if let Some(feed) = state.feeds.iter_mut().find(|feed| feed.url == failed_url) {
@@ -13665,9 +13520,10 @@ fn drain_rss_poll_results(
             }
             let tx = download_tx.clone();
             let failed_key = seen_key.clone();
-            if let Err(err) = thread::Builder::new()
-                .name("rss-download".to_string())
-                .spawn(move || {
+            if let Err(err) = spawn_worker(
+                "rss-download".to_string(),
+                0,
+                Box::new(move || {
                     let data =
                         http::get_public(&url, MAX_TORRENT_BYTES).map_err(|err| err.to_string());
                     let _ = tx.send(RssDownloadResult {
@@ -13676,8 +13532,8 @@ fn drain_rss_poll_results(
                         title,
                         data,
                     });
-                })
-            {
+                }),
+            ) {
                 download_inflight.remove(&failed_key);
                 log_warn!("RSS download worker could not start: {err}");
             }
@@ -13918,30 +13774,39 @@ fn set_peer_interest(
     }
 }
 
+/// Country counts stay ordered by descending count (ties keep their order).
 fn add_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
-    if let Some(entry) = torrent
-        .peer_country_counts
-        .iter_mut()
-        .find(|(c, _)| c == cc)
-    {
-        entry.1 += 1;
-    } else {
-        torrent.peer_country_counts.push((cc.to_string(), 1));
+    let counts = &mut torrent.peer_country_counts;
+    let mut index = match counts.iter().position(|(c, _)| c == cc) {
+        Some(index) => {
+            counts[index].1 = counts[index].1.saturating_add(1);
+            index
+        }
+        None => {
+            counts.push((cc.to_string(), 1));
+            counts.len() - 1
+        }
+    };
+    while index > 0 && counts[index - 1].1 < counts[index].1 {
+        counts.swap(index - 1, index);
+        index -= 1;
     }
-    torrent
-        .peer_country_counts
-        .sort_by_key(|entry| std::cmp::Reverse(entry.1));
 }
 
 fn remove_peer_country(torrent: &mut ui::UiTorrent, cc: &str) {
-    if let Some(entry) = torrent
-        .peer_country_counts
-        .iter_mut()
-        .find(|(c, _)| c == cc)
-    {
-        entry.1 = entry.1.saturating_sub(1);
+    let counts = &mut torrent.peer_country_counts;
+    let Some(mut index) = counts.iter().position(|(c, _)| c == cc) else {
+        return;
+    };
+    counts[index].1 = counts[index].1.saturating_sub(1);
+    if counts[index].1 == 0 {
+        counts.remove(index);
+        return;
     }
-    torrent.peer_country_counts.retain(|(_, count)| *count > 0);
+    while index + 1 < counts.len() && counts[index + 1].1 > counts[index].1 {
+        counts.swap(index, index + 1);
+        index += 1;
+    }
 }
 
 enum PeerCountryDelta<'a> {
@@ -20970,7 +20835,7 @@ fn create_torrent(
     let mut files_data = Vec::new();
     if multi_file {
         collect_files(&source_path, &[], &mut files_data)?;
-        files_data.sort_by(|a, b| a.path_segments.cmp(&b.path_segments));
+        files_data.sort_unstable_by(|a, b| a.path_segments.cmp(&b.path_segments));
     } else {
         files_data.push(CreateFile {
             source_path: source_path.clone(),
@@ -21023,19 +20888,18 @@ fn create_torrent(
         info_items.push((b"length".to_vec(), bencode::Value::Int(total_length as i64)));
     }
 
-    info_items.sort_by(|a, b| a.0.cmp(&b.0));
+    // bencode::encode writes dictionary keys in sorted order.
     let info = bencode::Value::Dict(info_items);
     let info_encoded = bencode::encode(&info);
     let info_hash = sha1::sha1(&info_encoded);
 
-    let mut torrent_items = vec![
+    let torrent_items = vec![
         (
             b"announce".to_vec(),
             bencode::Value::Bytes(tracker_url.as_bytes().to_vec()),
         ),
         (b"info".to_vec(), info),
     ];
-    torrent_items.sort_by(|a, b| a.0.cmp(&b.0));
     let torrent = bencode::Value::Dict(torrent_items);
     let encoded = bencode::encode(&torrent);
 
@@ -21144,7 +21008,7 @@ fn collect_files(dir: &Path, prefix: &[Vec<u8>], out: &mut Vec<CreateFile>) -> R
     let mut entries: Vec<_> = entries
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("read_dir {}: {err}", dir.display()))?;
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_unstable_by_key(|e| e.file_name());
     for entry in entries {
         let ft = entry.file_type().map_err(|e| e.to_string())?;
         if ft.is_symlink() {
