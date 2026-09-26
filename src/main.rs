@@ -3083,7 +3083,7 @@ fn run() -> Result<(), String> {
 
     let (requeue_tx, requeue_rx) = mpsc::channel::<TorrentRequest>();
     let runtime = Arc::new(TorrentRuntime {
-        args: args.clone(),
+        args,
         ui_state: ui_state.clone(),
         registry: registry.clone(),
         session_store: session_store.clone(),
@@ -3098,6 +3098,7 @@ fn run() -> Result<(), String> {
         global_piece_buffer_budget: Arc::clone(&global_piece_buffer_budget),
         requeue: requeue_tx,
     });
+    let args = &runtime.args;
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut last_watch_scan = Instant::now();
 
@@ -3127,7 +3128,7 @@ fn run() -> Result<(), String> {
             &cmd_rx,
             &mut queue,
             &ui_state,
-            &args,
+            args,
             &mut next_id,
             &registry,
             &session_store,
@@ -3157,9 +3158,9 @@ fn run() -> Result<(), String> {
         }
 
         // RSS feed polling
-        schedule_rss_polls(&args, &rss_poll_tx, &mut rss_poll_inflight);
+        schedule_rss_polls(args, &rss_poll_tx, &mut rss_poll_inflight);
         drain_rss_poll_results(
-            &args,
+            args,
             &rss_poll_rx,
             &rss_download_tx,
             &mut queue,
@@ -3172,7 +3173,7 @@ fn run() -> Result<(), String> {
             &in_flight,
         );
         drain_rss_download_results(
-            &args,
+            args,
             &rss_download_rx,
             &mut queue,
             &ui_state,
@@ -3203,7 +3204,7 @@ fn run() -> Result<(), String> {
             break;
         }
 
-        update_idle_state(&ui_state, &args, queue.len());
+        update_idle_state(&ui_state, args, queue.len());
         sleep_with_shutdown(Duration::from_millis(200));
     }
 
