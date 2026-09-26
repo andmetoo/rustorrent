@@ -310,7 +310,7 @@ impl RoutingTable {
             .filter(|node| node.last_seen.elapsed() >= QUESTIONABLE_NODE_AGE)
             .copied()
             .collect();
-        questionable.sort_unstable_by_key(|node| node.last_seen);
+        crate::util::sort_by_key(&mut questionable, |node| node.last_seen);
         questionable
     }
 
@@ -1871,7 +1871,7 @@ fn deliver_peer_values(
         })
         .filter(|peer| dht_address_scope_allowed(responder, *peer))
         .collect();
-    peers.sort_unstable();
+    crate::util::sort(&mut peers);
     peers.dedup();
     peers.truncate(MAX_PEERS_PER_TORRENT);
     if let (false, Some(entry)) = (peers.is_empty(), torrents.get(&info_hash)) {
@@ -2771,9 +2771,9 @@ fn complete_refresh_query(
         }
         lookup.candidates.push(candidate);
     }
-    lookup
-        .candidates
-        .sort_unstable_by_key(|candidate| xor_distance(&candidate.id, &lookup.target));
+    crate::util::sort_by_key(&mut lookup.candidates, |candidate| {
+        xor_distance(&candidate.id, &lookup.target)
+    });
     lookup.candidates.truncate(MAX_REFRESH_LOOKUP_CANDIDATES);
     advance_refresh_lookup(lookup_id, rt, pending, socket, node_id, refresh_lookups);
 }

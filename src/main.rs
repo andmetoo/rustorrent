@@ -30,6 +30,7 @@ mod udp_tracker;
 mod ui;
 #[cfg(feature = "upnp")]
 mod upnp;
+mod util;
 #[cfg(feature = "utp")]
 mod utp;
 #[cfg(windows)]

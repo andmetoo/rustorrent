@@ -67,7 +67,7 @@ pub fn claims_for_torrent(
             *current = target.to_string();
         } else {
             prospective.push((index, target.to_string()));
-            prospective.sort_unstable_by_key(|(current_index, _)| *current_index);
+            crate::util::sort_by_key(&mut prospective, |(current_index, _)| *current_index);
         }
         prospective
     });

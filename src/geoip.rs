@@ -33,7 +33,7 @@ impl GeoIpDb {
                 }
             }
         }
-        entries.sort_unstable_by_key(|(start, _, _)| *start);
+        crate::util::sort_by_key(&mut entries, |(start, _, _)| *start);
         for pair in entries.windows(2) {
             if pair[1].0 <= pair[0].1 {
                 return Err("geoip load: overlapping address ranges".to_string());

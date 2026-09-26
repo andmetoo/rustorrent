@@ -1212,7 +1212,7 @@ fn installed_plugins(root: &Path) -> Result<Vec<SearchPlugin>, String> {
             broken_reason: String::new(),
         });
     }
-    plugins.sort_unstable_by(|left, right| left.module.cmp(&right.module));
+    crate::util::sort_by(&mut plugins, |left, right| left.module < right.module);
     Ok(plugins)
 }
 
@@ -1451,12 +1451,13 @@ fn parse_search_results(stdout: &[u8], plugins: &[SearchPlugin]) -> Vec<SearchRe
 /// Most seeds first, then by name. The result id makes the order total, so
 /// an unstable sort is deterministic across incremental merges.
 fn sort_results(results: &mut [SearchResult]) {
-    results.sort_unstable_by(|left, right| {
+    crate::util::sort_by(results, |left, right| {
         right
             .seeds
             .cmp(&left.seeds)
             .then_with(|| left.name.cmp(&right.name))
             .then(left.result_id.cmp(&right.result_id))
+            .is_lt()
     });
 }
 

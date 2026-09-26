@@ -69,8 +69,8 @@ impl IpFilter {
     }
 
     fn normalize(&mut self) {
-        self.v4.sort_unstable_by_key(|range| range.0);
-        self.v6.sort_unstable_by_key(|range| range.0);
+        crate::util::sort_by_key(&mut self.v4, |range| range.0);
+        crate::util::sort_by_key(&mut self.v6, |range| range.0);
         merge_v4_ranges(&mut self.v4);
         merge_v6_ranges(&mut self.v6);
     }

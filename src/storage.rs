@@ -1141,7 +1141,7 @@ fn build_layout(meta: &TorrentMeta, download_dir: &Path) -> Result<Vec<FileLayou
 
 fn validate_layout_paths(layouts: &[FileLayout]) -> Result<(), Error> {
     let mut paths: Vec<&Path> = layouts.iter().map(|layout| layout.path.as_path()).collect();
-    paths.sort_unstable();
+    crate::util::sort(&mut paths);
     for pair in paths.windows(2) {
         if pair[0] == pair[1] || pair[1].starts_with(pair[0]) {
             return Err(Error::InvalidFiles);

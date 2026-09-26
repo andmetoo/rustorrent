@@ -81,7 +81,7 @@ pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
                 items
             } else {
                 sorted_storage = items.clone();
-                sorted_storage.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                crate::util::sort_by(&mut sorted_storage, |a, b| a.0 < b.0);
                 &sorted_storage
             };
             for (key, value) in ordered {

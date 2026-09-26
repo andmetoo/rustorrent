@@ -134,7 +134,7 @@ fn add_options(form: &[(String, String)]) -> Result<AddOptions, String> {
                     .map_err(|_| "invalid file selection".to_string())?,
             );
         }
-        skip_files.sort_unstable();
+        crate::util::sort(&mut skip_files);
         skip_files.dedup();
     }
     Ok(AddOptions {
