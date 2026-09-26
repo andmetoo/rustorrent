@@ -10523,6 +10523,9 @@ fn generate_peer_id() -> [u8; 20] {
 /// How often per-connection housekeeping (choke decisions, timeouts, HAVE
 /// broadcasts, piece-state refresh) runs. Message handling itself is not
 /// throttled by this interval.
+/// How long a peer lacking our pieces may stay uninterested before they are
+/// announced again (see `PeerConn::maintain`).
+const HAVE_REPEAT_AFTER: Duration = Duration::from_secs(10);
 const PEER_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 /// Socket read size for the peer loop. One read can deliver several blocks,
 /// which are then handled without re-running the housekeeping pass.
@@ -10655,6 +10658,8 @@ struct PeerConn<'a> {
     hash_request_budget: HashRequestBudget,
     last_served_chunk: Option<(u32, u32, u32)>,
     out: Vec<u8>,
+    opened_at: Instant,
+    haves_repeated: bool,
 }
 
 /// Outcome of a step of the peer loop.
@@ -10744,6 +10749,8 @@ impl<'a> PeerConn<'a> {
             hash_request_budget: HashRequestBudget::new(),
             last_served_chunk: None,
             out: Vec::new(),
+            opened_at: now,
+            haves_repeated: false,
         }
     }
 
@@ -10902,6 +10909,19 @@ impl<'a> PeerConn<'a> {
         let ctx = self.ctx;
         self.flush_download_record();
 
+        // Transmission occasionally loses a bitfield that arrives right after
+        // an encrypted handshake and then never becomes interested. Repeating
+        // our pieces once as HAVE messages (always legal) recovers it.
+        if self.seed_mode
+            && !self.haves_repeated
+            && !self.peer_interested
+            && self.super_seed_piece.is_none()
+            && now.saturating_duration_since(self.opened_at) >= HAVE_REPEAT_AFTER
+        {
+            self.haves_repeated = true;
+            self.repeat_missing_haves(stream)?;
+        }
+
         // Pieces completed elsewhere (endgame) or deselected are dropped.
         if !self.active_pieces.is_empty() {
             let obsolete = {
@@ -11042,6 +11062,25 @@ impl<'a> PeerConn<'a> {
             });
         });
         Ok(())
+    }
+
+    fn repeat_missing_haves(&mut self, stream: &mut PeerStream) -> Result<(), String> {
+        self.out.clear();
+        {
+            let pieces = lock_or_recover(&self.ctx.pieces);
+            let peer_bits = self.bitfield.as_deref().unwrap_or(&[]);
+            for index in 0..pieces.piece_count() {
+                if pieces.is_piece_complete(index as u32) && !bitfield_has(peer_bits, index) {
+                    self.out.extend_from_slice(&5u32.to_be_bytes());
+                    self.out.push(4);
+                    self.out.extend_from_slice(&(index as u32).to_be_bytes());
+                }
+            }
+        }
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        write_all_or(stream, &self.out, "have")
     }
 
     fn send_completed_haves(&mut self, stream: &mut PeerStream) -> Result<(), String> {
@@ -15707,6 +15746,42 @@ mod core_helpers_tests {
             conn.fill_requests(&mut stream).unwrap(),
             PeerStep::Close
         ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seeding_peer_repeats_haves_once_to_an_uninterested_peer() {
+        let root = temp_path("repeat-haves");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(39, &root);
+        let piece_count = {
+            let mut pieces = lock_or_recover(&context.pieces);
+            for index in 0..pieces.piece_count() {
+                pieces.mark_piece_complete(index as u32).unwrap();
+            }
+            pieces.piece_count()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut stream = PeerStream::tcp(client);
+        let addr: SocketAddr = "203.0.113.9:6881".parse().unwrap();
+        let mut conn = PeerConn::new(&context, addr, 1);
+        conn.seed_mode = true;
+        let later = conn.opened_at + HAVE_REPEAT_AFTER;
+        conn.maintain(&mut stream, conn.opened_at).unwrap();
+        conn.maintain(&mut stream, later).unwrap();
+        conn.maintain(&mut stream, later + HAVE_REPEAT_AFTER)
+            .unwrap();
+        drop(stream);
+        let mut sent = Vec::new();
+        server.read_to_end(&mut sent).unwrap();
+        let haves: Vec<u32> = sent
+            .chunks(9)
+            .filter(|frame| frame.len() == 9 && frame[4] == 4)
+            .map(|frame| u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]))
+            .collect();
+        assert_eq!(haves, (0..piece_count as u32).collect::<Vec<_>>());
         let _ = fs::remove_dir_all(&root);
     }
 
