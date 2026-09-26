@@ -3,6 +3,10 @@
 
 use libfuzzer_sys::fuzz_target;
 
+mod util {
+    include!("../../src/util.rs");
+}
+
 mod bencode {
     include!("../../src/bencode.rs");
 }

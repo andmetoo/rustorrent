@@ -1,14 +1,11 @@
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bencode::{self, Value};
 use crate::xml;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FeedItem {
     pub title: String,
     pub link: String,
@@ -16,7 +13,7 @@ pub struct FeedItem {
     pub guid: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RssFeed {
     pub url: String,
     pub title: String,
@@ -25,7 +22,7 @@ pub struct RssFeed {
     pub poll_interval_secs: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RssRule {
     pub name: String,
     pub feed_url: String,
@@ -45,7 +42,6 @@ pub(crate) const MAX_RSS_RULES: usize = 1_024;
 pub(crate) const MAX_RSS_TEXT_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RSS_PATTERN_BYTES: usize = 512;
 const MAX_FEED_ITEMS: usize = 2_000;
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 impl RssState {
     pub fn new() -> Self {
@@ -69,135 +65,110 @@ pub fn parse_feed(data: &[u8]) -> Result<(String, Vec<FeedItem>), String> {
 
 fn parse_rss(root: &xml::XmlNode) -> Result<(String, Vec<FeedItem>), String> {
     let channel = root.child("channel").ok_or("missing <channel>")?;
-    let title = channel
-        .child("title")
-        .map(|node| node.text.trim().to_string())
-        .unwrap_or_default();
-    Ok((title, parse_rss_items(channel.children_by_tag("item"))))
+    Ok((
+        text(channel, "title").to_string(),
+        parse_rss_items(channel.children_by_tag("item")),
+    ))
 }
 
 fn parse_rdf(root: &xml::XmlNode) -> Result<(String, Vec<FeedItem>), String> {
     let title = root
         .child("channel")
-        .and_then(|channel| channel.child("title"))
-        .map(|node| node.text.trim().to_string())
-        .unwrap_or_default();
-    Ok((title, parse_rss_items(root.children_by_tag("item"))))
+        .map_or("", |channel| text(channel, "title"));
+    Ok((
+        title.to_string(),
+        parse_rss_items(root.children_by_tag("item")),
+    ))
+}
+
+/// Trimmed text of the first `tag` child, or "".
+fn text<'a>(node: &'a xml::XmlNode, tag: &str) -> &'a str {
+    node.child(tag).map_or("", |child| child.text.trim())
+}
+
+/// Build an item, using the link as GUID when none is given. Items without
+/// a link or with oversized fields are dropped.
+fn feed_item(title: &str, link: &str, is_torrent: bool, guid: &str) -> Option<FeedItem> {
+    let guid = if guid.is_empty() { link } else { guid };
+    if link.is_empty()
+        || [title, link, guid]
+            .iter()
+            .any(|v| v.len() > MAX_RSS_TEXT_BYTES)
+    {
+        return None;
+    }
+    Some(FeedItem {
+        title: title.to_string(),
+        link: link.to_string(),
+        is_torrent,
+        guid: guid.to_string(),
+    })
 }
 
 fn parse_rss_items(item_nodes: Vec<&xml::XmlNode>) -> Vec<FeedItem> {
-    let mut items = Vec::new();
-    for item_node in item_nodes.into_iter().take(MAX_FEED_ITEMS) {
-        let item_title = item_node
-            .child("title")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let link = item_node
-            .child("link")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let guid = item_node
-            .child("guid")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let enclosure = item_node
-            .children_by_tag("enclosure")
-            .into_iter()
-            .find_map(|node| {
-                let url = node.attr("url")?.trim();
-                let content_type = node.attr("type").unwrap_or("");
-                (!url.is_empty() && (is_torrent_url(url) || is_torrent_content_type(content_type)))
-                    .then(|| (url.to_string(), true))
-            });
-        let magnet = item_node
-            .child("magnetURI")
-            .map(|node| node.text.trim())
-            .filter(|value| is_torrent_url(value))
-            .map(|value| (value.to_string(), true));
-        let link_is_torrent = is_torrent_url(&link);
-        let (final_link, is_torrent) = enclosure.or(magnet).unwrap_or((link, link_is_torrent));
-        let final_guid = if guid.is_empty() {
-            final_link.clone()
-        } else {
-            guid
-        };
-        if final_link.trim().is_empty()
-            || item_title.len() > MAX_RSS_TEXT_BYTES
-            || final_link.len() > MAX_RSS_TEXT_BYTES
-            || final_guid.len() > MAX_RSS_TEXT_BYTES
-        {
-            continue;
-        }
-        items.push(FeedItem {
-            title: item_title,
-            link: final_link,
-            is_torrent,
-            guid: final_guid,
-        });
-    }
-    items
+    item_nodes
+        .into_iter()
+        .take(MAX_FEED_ITEMS)
+        .filter_map(|item| {
+            let enclosure = item
+                .children_by_tag("enclosure")
+                .into_iter()
+                .find_map(|node| {
+                    let url = node.attr("url")?.trim();
+                    let content_type = node.attr("type").unwrap_or("");
+                    (!url.is_empty()
+                        && (is_torrent_url(url) || is_torrent_content_type(content_type)))
+                    .then_some(url)
+                });
+            let magnet = Some(text(item, "magnetURI")).filter(|value| is_torrent_url(value));
+            let link = text(item, "link");
+            let (link, is_torrent) = match enclosure.or(magnet) {
+                Some(url) => (url, true),
+                None => (link, is_torrent_url(link)),
+            };
+            feed_item(text(item, "title"), link, is_torrent, text(item, "guid"))
+        })
+        .collect()
 }
 
 fn parse_atom(root: &xml::XmlNode) -> Result<(String, Vec<FeedItem>), String> {
-    let title = root
-        .child("title")
-        .map(|node| node.text.trim().to_string())
-        .unwrap_or_default();
-    let mut items = Vec::new();
-    for entry in root
+    let items = root
         .children_by_tag("entry")
         .into_iter()
         .take(MAX_FEED_ITEMS)
-    {
-        let entry_title = entry
-            .child("title")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let id = entry
-            .child("id")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let links = entry.children_by_tag("link");
-        let preferred = links.iter().find_map(|node| {
-            let href = node.attr("href")?.trim();
-            let rel = node.attr("rel").unwrap_or("");
-            let content_type = node.attr("type").unwrap_or("");
-            (!href.is_empty()
-                && rel.eq_ignore_ascii_case("enclosure")
-                && (is_torrent_url(href) || is_torrent_content_type(content_type)))
-            .then(|| (href.to_string(), true))
-        });
-        let torrent_link = links.iter().find_map(|node| {
-            let href = node.attr("href")?.trim();
-            is_torrent_url(href).then(|| (href.to_string(), true))
-        });
-        let fallback = links.iter().find_map(|node| {
-            let href = node.attr("href")?.trim();
-            let rel = node.attr("rel").unwrap_or("alternate");
-            (!href.is_empty() && rel.eq_ignore_ascii_case("alternate"))
-                .then(|| (href.to_string(), is_torrent_url(href)))
-        });
-        let (link, is_torrent) = preferred.or(torrent_link).or(fallback).unwrap_or_default();
-        let guid = if id.is_empty() { link.clone() } else { id };
-        if link.is_empty()
-            || entry_title.len() > MAX_RSS_TEXT_BYTES
-            || link.len() > MAX_RSS_TEXT_BYTES
-            || guid.len() > MAX_RSS_TEXT_BYTES
-        {
-            continue;
-        }
-        items.push(FeedItem {
-            title: entry_title,
-            link,
-            is_torrent,
-            guid,
-        });
-    }
-    Ok((title, items))
+        .filter_map(|entry| {
+            let links = entry.children_by_tag("link");
+            let preferred = links.iter().find_map(|node| {
+                let href = node.attr("href")?.trim();
+                let rel = node.attr("rel").unwrap_or("");
+                let content_type = node.attr("type").unwrap_or("");
+                (!href.is_empty()
+                    && rel.eq_ignore_ascii_case("enclosure")
+                    && (is_torrent_url(href) || is_torrent_content_type(content_type)))
+                .then_some((href, true))
+            });
+            let torrent_link = links.iter().find_map(|node| {
+                let href = node.attr("href")?.trim();
+                is_torrent_url(href).then_some((href, true))
+            });
+            let fallback = links.iter().find_map(|node| {
+                let href = node.attr("href")?.trim();
+                let rel = node.attr("rel").unwrap_or("alternate");
+                (!href.is_empty() && rel.eq_ignore_ascii_case("alternate"))
+                    .then(|| (href, is_torrent_url(href)))
+            });
+            let (link, is_torrent) = preferred.or(torrent_link).or(fallback).unwrap_or_default();
+            feed_item(text(entry, "title"), link, is_torrent, text(entry, "id"))
+        })
+        .collect();
+    Ok((text(root, "title").to_string(), items))
 }
 
 fn is_torrent_content_type(value: &str) -> bool {
-    value.trim().to_ascii_lowercase().contains("bittorrent")
+    value
+        .as_bytes()
+        .windows(10)
+        .any(|window| window.eq_ignore_ascii_case(b"bittorrent"))
 }
 
 fn is_torrent_url(value: &str) -> bool {
@@ -205,12 +176,8 @@ fn is_torrent_url(value: &str) -> bool {
     if is_magnet_link(value) {
         return true;
     }
-    let without_fragment = value.split('#').next().unwrap_or(value);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    without_query.to_ascii_lowercase().ends_with(".torrent")
+    let path = value.split(['#', '?']).next().unwrap_or(value).as_bytes();
+    path.len() >= 8 && path[path.len() - 8..].eq_ignore_ascii_case(b".torrent")
 }
 
 pub fn is_magnet_link(value: &str) -> bool {
@@ -226,11 +193,11 @@ pub fn seen_key(feed_url: &str, guid: &str) -> String {
     digest.update(&(feed_url.len() as u64).to_be_bytes());
     digest.update(feed_url.as_bytes());
     digest.update(guid.as_bytes());
-    let digest = digest.finalize();
-    let mut key = String::with_capacity(3 + digest.len() * 2);
-    key.push_str("v3:");
-    for byte in digest {
-        key.push_str(&format!("{byte:02x}"));
+    let mut key = String::from("v3:");
+    for byte in digest.finalize() {
+        for nibble in [byte >> 4, byte & 15] {
+            key.push(char::from(b"0123456789abcdef"[usize::from(nibble)]));
+        }
     }
     key
 }
@@ -350,61 +317,43 @@ pub fn save_rss_state(path: &Path, state: &RssState) -> Result<(), String> {
     {
         return Err("rss save: feed or rule text is too large".to_string());
     }
-    let feeds_list: Vec<Value> = state
-        .feeds
-        .iter()
-        .map(|feed| {
-            Value::Dict(vec![
-                (b"url".to_vec(), Value::Bytes(feed.url.as_bytes().to_vec())),
-                (
-                    b"title".to_vec(),
-                    Value::Bytes(feed.title.as_bytes().to_vec()),
-                ),
-                (
-                    b"last_poll".to_vec(),
-                    Value::Int(feed.last_poll.min(i64::MAX as u64) as i64),
-                ),
-                (
-                    b"poll_interval".to_vec(),
-                    Value::Int(feed.poll_interval_secs.min(i64::MAX as u64) as i64),
-                ),
-            ])
-        })
-        .collect();
-    let rules_list: Vec<Value> = state
-        .rules
-        .iter()
-        .map(|rule| {
-            Value::Dict(vec![
-                (
-                    b"name".to_vec(),
-                    Value::Bytes(rule.name.as_bytes().to_vec()),
-                ),
-                (
-                    b"feed_url".to_vec(),
-                    Value::Bytes(rule.feed_url.as_bytes().to_vec()),
-                ),
-                (
-                    b"pattern".to_vec(),
-                    Value::Bytes(rule.pattern.as_bytes().to_vec()),
-                ),
-            ])
-        })
-        .collect();
-    let seen_list: Vec<Value> = state
-        .seen_guids
-        .iter()
-        .map(|guid| Value::Bytes(guid.as_bytes().to_vec()))
-        .collect();
-    let dict = Value::Dict(vec![
-        (b"feeds".to_vec(), Value::List(feeds_list)),
-        (b"rules".to_vec(), Value::List(rules_list)),
-        (b"seen".to_vec(), Value::List(seen_list)),
-    ]);
-    bencode::validate_structure(&dict)
-        .map_err(|err| format!("rss save: state structure exceeds parser limits: {err}"))?;
-    let data = bencode::encode(&dict);
-    write_atomic(path, &data)
+    if state.seen_guids.len() > MAX_SEEN_GUIDS {
+        return Err("rss save: too many seen entries".to_string());
+    }
+    // Encode directly; keys are written in bencode (sorted) order. The
+    // bounds above keep the value count far below the parser's limits.
+    let mut data = Vec::with_capacity(4096 + state.seen_guids.len() * 72);
+    data.extend_from_slice(b"d5:feedsl");
+    for feed in &state.feeds {
+        data.extend_from_slice(b"d9:last_poll");
+        put_int(&mut data, feed.last_poll);
+        data.extend_from_slice(b"13:poll_interval");
+        put_int(&mut data, feed.poll_interval_secs);
+        put_bytes(&mut data, b"title");
+        put_bytes(&mut data, feed.title.as_bytes());
+        put_bytes(&mut data, b"url");
+        put_bytes(&mut data, feed.url.as_bytes());
+        data.push(b'e');
+    }
+    data.extend_from_slice(b"e5:rulesl");
+    for rule in &state.rules {
+        data.push(b'd');
+        for (key, value) in [
+            ("feed_url", &rule.feed_url),
+            ("name", &rule.name),
+            ("pattern", &rule.pattern),
+        ] {
+            put_bytes(&mut data, key.as_bytes());
+            put_bytes(&mut data, value.as_bytes());
+        }
+        data.push(b'e');
+    }
+    data.extend_from_slice(b"e4:seenl");
+    for guid in &state.seen_guids {
+        put_bytes(&mut data, guid.as_bytes());
+    }
+    data.extend_from_slice(b"ee");
+    write_atomic(path, &data, true)
 }
 
 pub fn load_rss_state(path: &Path) -> Result<RssState, String> {
@@ -429,7 +378,7 @@ pub fn load_rss_state(path: &Path) -> Result<RssState, String> {
     };
     let state = parse_rss_state(&backup_data)
         .map_err(|backup_error| format!("rss parse: {primary_error}; backup: {backup_error}"))?;
-    if let Err(err) = write_atomic_inner(path, &backup_data, false) {
+    if let Err(err) = write_atomic(path, &backup_data, false) {
         eprintln!("warning: RSS backup loaded but primary restore failed: {err}");
     }
     Ok(state)
@@ -523,165 +472,31 @@ fn parse_rss_state(data: &[u8]) -> Result<RssState, String> {
     Ok(state)
 }
 
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    use std::io::Write;
+    let _ = write!(out, "{}:", bytes.len());
+    out.extend_from_slice(bytes);
+}
+
+fn put_int(out: &mut Vec<u8>, value: u64) {
+    use std::io::Write;
+    let _ = write!(out, "i{}e", value.min(i64::MAX as u64));
+}
+
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
     value.push(suffix);
     PathBuf::from(value)
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
-    write_atomic_inner(path, data, true)
-}
-
-fn write_atomic_inner(path: &Path, data: &[u8], rotate_backup: bool) -> Result<(), String> {
+/// Atomically replace the state file, optionally keeping the previous
+/// version as `.bak`. Uses the crate-wide writer: descriptor-pinned state
+/// directory writes on Unix/Windows, and a no-follow temp+rename elsewhere.
+fn write_atomic(path: &Path, data: &[u8], rotate_backup: bool) -> Result<(), String> {
     if data.len() > MAX_RSS_STATE_BYTES {
         return Err("rss save: state file is too large".to_string());
     }
-    #[cfg(any(unix, windows))]
-    if crate::state_dir::is_state_file_path(path) {
-        return crate::state_dir::write_atomic(
-            path,
-            data,
-            rotate_backup,
-            0o600,
-            MAX_RSS_STATE_BYTES,
-        )
-        .map_err(|err| format!("rss save state: {err}"));
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if parent != Path::new(".") {
-        if crate::state_dir::is_state_file_path(path) {
-            let download_dir = parent
-                .parent()
-                .ok_or_else(|| "rss state directory has no parent".to_string())?;
-            crate::ensure_private_state_directory(download_dir)?;
-        } else {
-            fs::create_dir_all(parent).map_err(|err| format!("rss save dir: {err}"))?;
-        }
-    }
-    let suffix = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temp = sidecar_path(path, &format!(".tmp-{}-{suffix}", std::process::id()));
-    let result = (|| -> Result<(), String> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp)
-            .map_err(|err| format!("rss save temp: {err}"))?;
-        file.write_all(data)
-            .map_err(|err| format!("rss save: {err}"))?;
-        file.sync_all()
-            .map_err(|err| format!("rss save sync: {err}"))?;
-        drop(file);
-        if rotate_backup {
-            match fs::symlink_metadata(path) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink() || !metadata.is_file() {
-                        return Err("rss save target is not a regular file".to_string());
-                    }
-                    rotate_backup_file(path, parent)?;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(format!("rss save target: {err}")),
-            }
-        }
-        fs::rename(&temp, path).map_err(|err| format!("rss save rename: {err}"))?;
-        sync_rss_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-fn rotate_backup_file(path: &Path, parent: &Path) -> Result<(), String> {
-    let backup = sidecar_path(path, ".bak");
-    match fs::symlink_metadata(&backup) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err("rss save backup is not a regular file".to_string());
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("rss save backup target: {err}")),
-    }
-
-    let mut source_options = OpenOptions::new();
-    source_options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        source_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        source_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut source = source_options
-        .open(path)
-        .map_err(|err| format!("rss save backup source: {err}"))?;
-    let metadata = source
-        .metadata()
-        .map_err(|err| format!("rss save backup source metadata: {err}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("rss save backup source is not a regular file".to_string());
-    }
-
-    let suffix = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temp = sidecar_path(&backup, &format!(".tmp-{}-{suffix}", std::process::id()));
-    let result = (|| -> Result<(), String> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut output = options
-            .open(&temp)
-            .map_err(|err| format!("rss save backup temp: {err}"))?;
-        let copied = std::io::copy(
-            &mut Read::by_ref(&mut source).take((MAX_RSS_STATE_BYTES + 1) as u64),
-            &mut output,
-        )
-        .map_err(|err| format!("rss save backup copy: {err}"))?;
-        if copied > MAX_RSS_STATE_BYTES as u64 {
-            return Err("rss save backup source is too large".to_string());
-        }
-        output
-            .sync_all()
-            .map_err(|err| format!("rss save backup sync: {err}"))?;
-        drop(output);
-
-        // Renaming a sibling temporary file replaces the directory entry
-        // itself; unlike `fs::copy`, it never follows an existing link.
-        fs::rename(&temp, &backup).map_err(|err| format!("rss save backup rename: {err}"))?;
-        sync_rss_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-#[cfg(unix)]
-fn sync_rss_directory(parent: &Path) -> Result<(), String> {
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|err| format!("rss save directory sync: {err}"))
-}
-
-#[cfg(not(unix))]
-fn sync_rss_directory(_parent: &Path) -> Result<(), String> {
-    Ok(())
+    crate::write_atomic_file(path, data, "rss", rotate_backup, true)
 }
 
 fn dict_get<'a>(dict: &'a [(Vec<u8>, Value)], key: &[u8]) -> Option<&'a Value> {
@@ -880,6 +695,61 @@ mod tests {
     }
 
     #[test]
+    fn direct_state_encoding_matches_the_generic_encoder() {
+        let path = temp_file("encoding");
+        let mut state = RssState::new();
+        state.feeds.push(RssFeed {
+            url: "https://example.com/rss".to_string(),
+            title: "Tïtle".to_string(),
+            items: Vec::new(),
+            last_poll: u64::MAX,
+            poll_interval_secs: 900,
+        });
+        state.rules.push(RssRule {
+            name: "r".to_string(),
+            feed_url: String::new(),
+            pattern: "*x*".to_string(),
+        });
+        state.seen_guids = vec!["a".to_string(), "bb".to_string()];
+        save_rss_state(&path, &state).unwrap();
+        let text = |value: &str| Value::Bytes(value.as_bytes().to_vec());
+        let expected = bencode::encode(&Value::Dict(vec![
+            (
+                b"feeds".to_vec(),
+                Value::List(vec![Value::Dict(vec![
+                    (b"url".to_vec(), text("https://example.com/rss")),
+                    (b"title".to_vec(), text("Tïtle")),
+                    (b"last_poll".to_vec(), Value::Int(i64::MAX)),
+                    (b"poll_interval".to_vec(), Value::Int(900)),
+                ])]),
+            ),
+            (
+                b"rules".to_vec(),
+                Value::List(vec![Value::Dict(vec![
+                    (b"name".to_vec(), text("r")),
+                    (b"feed_url".to_vec(), text("")),
+                    (b"pattern".to_vec(), text("*x*")),
+                ])]),
+            ),
+            (b"seen".to_vec(), Value::List(vec![text("a"), text("bb")])),
+        ]));
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        let loaded = load_rss_state(&path).unwrap();
+        assert_eq!(loaded.feeds[0].title, "Tïtle");
+        assert_eq!(loaded.seen_guids, ["a", "bb"]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seen_key_format_is_stable() {
+        // Persisted in rss state; the encoding must never change.
+        assert_eq!(
+            seen_key("a", "b"),
+            "v3:bfd8d48c5ab028a9c554ccc9d65ed6fc15a987f4f98cdd8bbfd5f17860493bac"
+        );
+    }
+
+    #[test]
     fn failed_downloads_remain_eligible_until_success_is_recorded() {
         let item = FeedItem {
             title: "Release".to_string(),
@@ -1031,7 +901,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rss_state_backup_rotation_rejects_symlinks_without_following_them() {
+    fn rss_state_backup_rotation_replaces_symlinks_without_following_them() {
         use std::os::unix::fs::symlink;
 
         let path = temp_file("backup-symlink");
@@ -1046,10 +916,15 @@ mod tests {
         symlink(&outside, &backup).unwrap();
         state.seen_guids.push("second".to_string());
 
-        let error = save_rss_state(&path, &state).unwrap_err();
-        assert!(error.contains("backup is not a regular file"));
+        // The backup is published by rename, which replaces the link itself
+        // rather than writing through it.
+        save_rss_state(&path, &state).unwrap();
         assert_eq!(fs::read(&outside).unwrap(), b"must not be overwritten");
-        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!fs::symlink_metadata(&backup)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&backup).unwrap(), original);
 
         let _ = fs::remove_file(&backup);
         let _ = fs::remove_file(&outside);

@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -7,21 +7,24 @@ use std::time::{Duration, Instant};
 
 use native_tls::{HandshakeError, TlsConnector, TlsStream};
 
+use crate::proxy::ProxyConfig;
+
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TLS_HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_REDIRECTS: usize = 5;
 const MAX_RESOLVED_ADDRESSES: usize = 16;
-const MAX_HTTP_RESOLVER_WORKERS: usize = 16;
-static ACTIVE_HTTP_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
+const MAX_RESOLVER_WORKERS: usize = 32;
+static ACTIVE_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
 
-struct HttpResolverGuard;
+struct ResolverGuard;
 
-impl Drop for HttpResolverGuard {
+impl Drop for ResolverGuard {
     fn drop(&mut self) {
-        ACTIVE_HTTP_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
+        ACTIVE_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -50,10 +53,9 @@ impl<'a> RequestBudget<'a> {
     }
 
     fn io_timeout(self, idle_deadline: Instant) -> Result<Duration, String> {
-        let now = Instant::now();
         let request_remaining = self.remaining()?;
         let idle_remaining = idle_deadline
-            .checked_duration_since(now)
+            .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| "http I/O timed out".to_string())?;
         Ok(request_remaining
@@ -111,9 +113,32 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
+/// One logical request: every redirect hop shares these limits.
+struct Request<'a> {
+    headers: &'a [(&'a str, String)],
+    max_bytes: usize,
+    budget: RequestBudget<'a>,
+    policy: AddressPolicy,
+    same_origin: bool,
+    proxy: Option<&'a ProxyConfig>,
+}
+
+impl<'a> Request<'a> {
+    fn public(max_bytes: usize, budget: RequestBudget<'a>) -> Self {
+        Self {
+            headers: &[],
+            max_bytes,
+            budget,
+            policy: AddressPolicy::PublicOnly,
+            same_origin: false,
+            proxy: None,
+        }
+    }
+}
+
 enum HttpStream {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 trait DeadlineStream: Read + Write {
@@ -121,19 +146,22 @@ trait DeadlineStream: Read + Write {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
 }
 
+impl HttpStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            HttpStream::Plain(stream) => stream,
+            HttpStream::Tls(stream) => stream.get_ref(),
+        }
+    }
+}
+
 impl DeadlineStream for HttpStream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        match self {
-            HttpStream::Plain(stream) => stream.set_read_timeout(timeout),
-            HttpStream::Tls(stream) => stream.get_ref().set_read_timeout(timeout),
-        }
+        self.tcp().set_read_timeout(timeout)
     }
 
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        match self {
-            HttpStream::Plain(stream) => stream.set_write_timeout(timeout),
-            HttpStream::Tls(stream) => stream.get_ref().set_write_timeout(timeout),
-        }
+        self.tcp().set_write_timeout(timeout)
     }
 }
 
@@ -162,16 +190,12 @@ impl Write for HttpStream {
     }
 }
 
+fn default_budget() -> RequestBudget<'static> {
+    RequestBudget::new(Instant::now() + HTTP_REQUEST_TIMEOUT, None)
+}
+
 pub fn get_public(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-    get_with_headers_budget(
-        url,
-        &[],
-        max_bytes,
-        5,
-        RequestBudget::new(Instant::now() + HTTP_REQUEST_TIMEOUT, None),
-        AddressPolicy::PublicOnly,
-        None,
-    )
+    get(url, &Request::public(max_bytes, default_budget()))
 }
 
 /// Conservative logical heap allowance for one response while the bounded
@@ -185,17 +209,12 @@ pub(crate) fn response_memory_budget(max_body: usize) -> Option<usize> {
 
 #[cfg(feature = "upnp")]
 pub fn get_same_origin(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let parsed = parse_url(url)?;
-    let origin = Origin::from(&parsed);
-    get_with_headers_budget(
-        url,
-        &[],
-        max_bytes,
-        5,
-        RequestBudget::new(Instant::now() + HTTP_REQUEST_TIMEOUT, None),
-        AddressPolicy::Any,
-        Some(&origin),
-    )
+    let request = Request {
+        policy: AddressPolicy::Any,
+        same_origin: true,
+        ..Request::public(max_bytes, default_budget())
+    };
+    get(url, &request)
 }
 
 pub(crate) fn get_public_until(
@@ -204,15 +223,31 @@ pub(crate) fn get_public_until(
     deadline: Instant,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, String> {
-    get_with_headers_budget(
+    get(
         url,
-        &[],
-        max_bytes,
-        5,
-        RequestBudget::new(deadline, cancel),
-        AddressPolicy::PublicOnly,
-        None,
+        &Request::public(max_bytes, RequestBudget::new(deadline, cancel)),
     )
+}
+
+/// Tracker announce: optionally tunnelled through a proxy, which then
+/// resolves the tracker's name itself.
+pub(crate) fn get_tracker(
+    url: &str,
+    max_bytes: usize,
+    deadline: Instant,
+    proxy: Option<&ProxyConfig>,
+    public_only: bool,
+) -> Result<Vec<u8>, String> {
+    let request = Request {
+        policy: if public_only {
+            AddressPolicy::PublicOnly
+        } else {
+            AddressPolicy::Any
+        },
+        proxy,
+        ..Request::public(max_bytes, RequestBudget::new(deadline, None))
+    };
+    get(url, &request)
 }
 
 #[cfg(feature = "webseed")]
@@ -222,56 +257,42 @@ pub fn get_range_public(
     end: u64,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    let header = format!("bytes={start}-{end}");
-    get_with_headers_budget(
-        url,
-        &[("Range", header)],
-        max_bytes,
-        5,
-        RequestBudget::new(Instant::now() + HTTP_REQUEST_TIMEOUT, None),
-        AddressPolicy::PublicOnly,
-        None,
-    )
+    let headers = [("Range", format!("bytes={start}-{end}"))];
+    let request = Request {
+        headers: &headers,
+        ..Request::public(max_bytes, default_budget())
+    };
+    get(url, &request)
 }
 
-fn get_with_headers_budget(
-    url: &str,
-    headers: &[(&str, String)],
-    max_bytes: usize,
-    redirects_left: usize,
-    budget: RequestBudget<'_>,
-    policy: AddressPolicy,
-    redirect_origin: Option<&Origin>,
-) -> Result<Vec<u8>, String> {
-    budget.remaining()?;
-    if redirects_left == 0 {
-        return Err("http redirect limit reached".to_string());
-    }
-    let parsed = parse_url(url)?;
-    let response = request_once(&parsed, headers, max_bytes, budget, policy)?;
-    if is_redirect(response.status) {
+fn get(url: &str, request: &Request<'_>) -> Result<Vec<u8>, String> {
+    let mut url = url.to_string();
+    let origin = if request.same_origin {
+        Some(Origin::from(&parse_url(&url)?))
+    } else {
+        None
+    };
+    for _ in 0..MAX_REDIRECTS {
+        request.budget.remaining()?;
+        let parsed = parse_url(&url)?;
+        let response = request_once(&parsed, "GET", &[], request)?;
+        if !is_redirect(response.status) {
+            return success_body(response, request.max_bytes);
+        }
         let location = header_value(&response.headers, "location")
             .ok_or_else(|| "http redirect missing location".to_string())?;
-        let next_url = resolve_location(&parsed, &location)?;
+        let next_url = resolve_location(&parsed, location)?;
         let next = parse_url(&next_url)?;
         validate_redirect_transport(parsed.scheme, next.scheme)?;
-        if redirect_origin.is_some_and(|origin| !origin.matches(&next)) {
+        if origin.as_ref().is_some_and(|origin| !origin.matches(&next)) {
             return Err("cross-origin http redirect refused".to_string());
         }
-        // Do not retain a redirect response body while recursively fetching
-        // the next hop. Redirect bodies are untrusted and may be near the
-        // caller's limit on every hop.
-        drop(response);
-        return get_with_headers_budget(
-            &next_url,
-            headers,
-            max_bytes,
-            redirects_left - 1,
-            budget,
-            policy,
-            redirect_origin,
-        );
+        url = next_url;
     }
+    Err("http redirect limit reached".to_string())
+}
+
+fn success_body(response: HttpResponse, max_bytes: usize) -> Result<Vec<u8>, String> {
     if response.status != 200 && response.status != 206 {
         return Err(format!("http status {}", response.status));
     }
@@ -290,32 +311,34 @@ fn validate_redirect_transport(current: Scheme, next: Scheme) -> Result<(), Stri
 
 fn request_once(
     parsed: &ParsedUrl,
-    headers: &[(&str, String)],
-    max_bytes: usize,
-    budget: RequestBudget<'_>,
-    policy: AddressPolicy,
+    method: &str,
+    body: &[u8],
+    request: &Request<'_>,
 ) -> Result<HttpResponse, String> {
-    let mut stream = connect_stream(parsed, budget, policy)?;
-    validate_headers(headers)?;
-    let mut request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: rustorrent/0.1\r\nConnection: close\r\n",
+    validate_headers(request.headers)?;
+    let budget = request.budget;
+    let mut stream = connect_stream(parsed, request)?;
+    let mut head = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: rustorrent/0.1\r\nConnection: close\r\n",
         parsed.path,
         format_authority(parsed)
     );
-    for (key, value) in headers {
-        request.push_str(key);
-        request.push_str(": ");
-        request.push_str(value);
-        request.push_str("\r\n");
+    if method != "GET" {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
-    request.push_str("\r\n");
-    write_all_bounded(&mut stream, request.as_bytes(), budget)?;
+    for (key, value) in request.headers {
+        head.push_str(key);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    write_all_bounded(&mut stream, head.as_bytes(), budget)?;
+    write_all_bounded(&mut stream, body, budget)?;
 
-    let response = read_response_limited(&mut stream, max_bytes, budget)?;
+    let response = read_response_limited(&mut stream, request.max_bytes, budget)?;
     budget.remaining()?;
-    let response = parse_http_response(&response)?;
-    budget.remaining()?;
-    Ok(response)
+    parse_http_response(&response)
 }
 
 fn validate_headers(headers: &[(&str, String)]) -> Result<(), String> {
@@ -375,8 +398,7 @@ fn read_response_limited<S: DeadlineStream>(
     let wire_limit = max_body
         .saturating_mul(2)
         .saturating_add(MAX_HTTP_HEADER_BYTES);
-    let read_limit = wire_limit.saturating_add(1);
-    let mut response = Vec::with_capacity(read_limit.min(8 * 1024));
+    let mut response = Vec::with_capacity(wire_limit.min(8 * 1024));
     let mut chunk = [0u8; 8 * 1024];
     let mut idle_deadline = Instant::now() + HTTP_IO_TIMEOUT;
     loop {
@@ -384,13 +406,12 @@ fn read_response_limited<S: DeadlineStream>(
         reader
             .set_read_timeout(Some(timeout))
             .map_err(|err| format!("http read failed: {err}"))?;
-        let remaining = read_limit.saturating_sub(response.len());
-        if remaining == 0 {
-            return Err("http response too large".to_string());
-        }
-        let read_len = remaining.min(chunk.len());
+        // `response.len() <= wire_limit` holds here: longer responses fail below.
+        let read_len = (wire_limit - response.len())
+            .saturating_add(1)
+            .min(chunk.len());
         match reader.read(&mut chunk[..read_len]) {
-            Ok(0) => break,
+            Ok(0) => return Ok(response),
             Ok(read) => {
                 response.extend_from_slice(&chunk[..read]);
                 if response.len() > wire_limit {
@@ -402,22 +423,17 @@ fn read_response_limited<S: DeadlineStream>(
             Err(err) => return Err(format!("http read failed: {err}")),
         }
     }
-    Ok(response)
 }
 
 fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
-    let name = name.to_ascii_lowercase();
-    headers.iter().find_map(|(key, value)| {
-        if *key == name {
-            Some(value.clone())
-        } else {
-            None
-        }
-    })
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 fn resolve_location(parsed: &ParsedUrl, location: &str) -> Result<String, String> {
@@ -435,20 +451,15 @@ fn resolve_location(parsed: &ParsedUrl, location: &str) -> Result<String, String
     if let Some(rest) = location.strip_prefix("//") {
         return Ok(format!("{scheme}://{rest}"));
     }
-    let base = format_base(parsed, scheme);
+    let base = format!("{scheme}://{}", format_authority(parsed));
     if location.starts_with('/') {
         return Ok(format!("{base}{location}"));
     }
     let base_dir = match parsed.path.rsplit_once('/') {
-        Some((dir, _)) if !dir.is_empty() => dir,
-        _ => "/",
+        Some((dir, _)) => dir.trim_end_matches('/'),
+        None => "",
     };
-    let mut path = base_dir.to_string();
-    if !path.ends_with('/') {
-        path.push('/');
-    }
-    path.push_str(location);
-    Ok(format!("{base}{path}"))
+    Ok(format!("{base}{base_dir}/{location}"))
 }
 
 #[cfg_attr(not(feature = "upnp"), allow(dead_code))]
@@ -469,24 +480,17 @@ pub(crate) fn same_origin(first: &str, second: &str) -> bool {
     Origin::from(&first).matches(&second)
 }
 
-fn format_base(parsed: &ParsedUrl, scheme: &str) -> String {
-    format!("{scheme}://{}", format_authority(parsed))
-}
-
 fn format_authority(parsed: &ParsedUrl) -> String {
-    let host = if parsed.host.parse::<Ipv6Addr>().is_ok() {
-        format!("[{}]", parsed.host)
-    } else {
-        parsed.host.clone()
-    };
     let default_port = match parsed.scheme {
         Scheme::Http => 80,
         Scheme::Https => 443,
     };
-    if parsed.port == default_port {
-        host
-    } else {
-        format!("{host}:{}", parsed.port)
+    let bracketed = parsed.host.contains(':');
+    match (bracketed, parsed.port == default_port) {
+        (false, true) => parsed.host.clone(),
+        (false, false) => format!("{}:{}", parsed.host, parsed.port),
+        (true, true) => format!("[{}]", parsed.host),
+        (true, false) => format!("[{}]:{}", parsed.host, parsed.port),
     }
 }
 
@@ -497,40 +501,17 @@ pub fn post(
     body: &[u8],
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    let budget = RequestBudget::new(Instant::now() + HTTP_REQUEST_TIMEOUT, None);
-    let parsed = parse_url(url)?;
-    let mut stream = connect_stream(&parsed, budget, AddressPolicy::Any)?;
-    validate_headers(headers)?;
-    let mut request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: rustorrent/0.1\r\nConnection: close\r\nContent-Length: {}\r\n",
-        parsed.path,
-        format_authority(&parsed),
-        body.len()
-    );
-    for (key, value) in headers {
-        request.push_str(key);
-        request.push_str(": ");
-        request.push_str(value);
-        request.push_str("\r\n");
-    }
-    request.push_str("\r\n");
-    write_all_bounded(&mut stream, request.as_bytes(), budget)?;
-    write_all_bounded(&mut stream, body, budget)?;
-
-    let response = read_response_limited(&mut stream, max_bytes, budget)?;
-    budget.remaining()?;
-    let response = parse_http_response(&response)?;
-    budget.remaining()?;
-    if response.status != 200 && response.status != 206 {
-        return Err(format!("http status {}", response.status));
-    }
-    if response.body.len() > max_bytes {
-        return Err("http response too large".to_string());
-    }
-    Ok(response.body)
+    let request = Request {
+        headers,
+        policy: AddressPolicy::Any,
+        ..Request::public(max_bytes, default_budget())
+    };
+    let response = request_once(&parse_url(url)?, "POST", body, &request)?;
+    success_body(response, max_bytes)
 }
 
 fn parse_url(url: &str) -> Result<ParsedUrl, String> {
+    let invalid = || "invalid url".to_string();
     let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
         (Scheme::Http, rest)
     } else if let Some(rest) = url.strip_prefix("https://") {
@@ -539,9 +520,8 @@ fn parse_url(url: &str) -> Result<ParsedUrl, String> {
         return Err("unsupported scheme".to_string());
     };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host_port = &rest[..authority_end];
-    let suffix = &rest[authority_end..];
-    let suffix = suffix.split_once('#').map(|(s, _)| s).unwrap_or(suffix);
+    let (host_port, suffix) = rest.split_at(authority_end);
+    let suffix = suffix.split_once('#').map_or(suffix, |(s, _)| s);
     let path = if suffix.is_empty() {
         "/".to_string()
     } else if suffix.starts_with('?') {
@@ -549,102 +529,109 @@ fn parse_url(url: &str) -> Result<ParsedUrl, String> {
     } else {
         suffix.to_string()
     };
-    if host_port.is_empty() {
-        return Err("invalid url".to_string());
-    }
-    if host_port
-        .bytes()
-        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
-        || host_port.contains(['@', '/', '\\', '?', '#'])
+    if host_port.is_empty()
+        || host_port
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        || host_port.contains(['@', '\\'])
         || path.bytes().any(|b| b.is_ascii_control() || b == b' ')
     {
-        return Err("invalid url".to_string());
+        return Err(invalid());
     }
     let default_port = match scheme {
         Scheme::Http => 80,
         Scheme::Https => 443,
     };
     let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| "invalid url".to_string())?;
-        if host.parse::<Ipv6Addr>().is_err() {
-            return Err("invalid url".to_string());
-        }
-        let port = if tail.is_empty() {
-            default_port
-        } else {
-            tail.strip_prefix(':')
-                .ok_or_else(|| "invalid url".to_string())?
-                .parse::<u16>()
-                .map_err(|_| "invalid port".to_string())?
+        let (host, tail) = rest.split_once(']').ok_or_else(invalid)?;
+        host.parse::<Ipv6Addr>().map_err(|_| invalid())?;
+        let port = match tail {
+            "" => Some(default_port),
+            tail => tail.strip_prefix(':').and_then(|port| port.parse().ok()),
         };
-        (host.to_string(), port)
+        (host, port)
     } else {
         if host_port.contains(['[', ']']) || host_port.matches(':').count() > 1 {
-            return Err("invalid url".to_string());
+            return Err(invalid());
         }
         match host_port.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() => {
-                let port = port
-                    .parse::<u16>()
-                    .map_err(|_| "invalid port".to_string())?;
-                (host.to_string(), port)
-            }
-            _ => (host_port.to_string(), default_port),
+            Some((host, port)) => (host, port.parse().ok()),
+            None => (host_port, Some(default_port)),
         }
     };
-    if host.is_empty() || port == 0 {
-        return Err("invalid url".to_string());
+    match port {
+        Some(port) if port != 0 && !host.is_empty() => Ok(ParsedUrl {
+            scheme,
+            host: host.to_string(),
+            port,
+            path,
+        }),
+        _ => Err(invalid()),
     }
-    Ok(ParsedUrl {
-        scheme,
-        host,
-        port,
-        path,
-    })
 }
 
-fn connect_stream(
-    parsed: &ParsedUrl,
-    budget: RequestBudget<'_>,
-    policy: AddressPolicy,
-) -> Result<HttpStream, String> {
-    let connect_deadline = Instant::now() + HTTP_CONNECT_TIMEOUT;
-    let addrs = resolve_http_addrs(&parsed.host, parsed.port, budget, policy)?;
-    let mut stream = None;
-    let mut last_err = None;
-    for addr in addrs {
-        let now = Instant::now();
-        let Some(connect_remaining) = connect_deadline
-            .checked_duration_since(now)
-            .filter(|remaining| !remaining.is_zero())
-        else {
-            break;
-        };
-        let remaining = budget.remaining()?.min(connect_remaining);
-        match TcpStream::connect_timeout(&addr, remaining) {
-            Ok(candidate) => {
-                stream = Some(candidate);
-                break;
-            }
-            Err(err) => last_err = Some(err),
+fn connect_stream(parsed: &ParsedUrl, request: &Request<'_>) -> Result<HttpStream, String> {
+    let budget = request.budget;
+    let stream = if let Some(proxy) = request.proxy {
+        if request.policy == AddressPolicy::PublicOnly {
+            validate_proxy_target_host(&parsed.host)?;
         }
-    }
-    let stream = stream.ok_or_else(|| {
-        last_err
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "http host resolved to no addresses".to_string())
-    })?;
+        let timeout = budget.remaining()?.min(HTTP_CONNECT_TIMEOUT);
+        crate::proxy::connect_through_proxy_host(proxy, &parsed.host, parsed.port, timeout)?
+    } else {
+        let connect_deadline = Instant::now() + HTTP_CONNECT_TIMEOUT;
+        let mut last_err = "http host resolved to no addresses".to_string();
+        let mut connected = None;
+        for addr in resolve_http_addrs(&parsed.host, parsed.port, budget, request.policy)? {
+            let Some(connect_remaining) = connect_deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                break;
+            };
+            let remaining = budget.remaining()?.min(connect_remaining);
+            match TcpStream::connect_timeout(&addr, remaining) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(err) => last_err = err.to_string(),
+            }
+        }
+        connected.ok_or(last_err)?
+    };
     budget.remaining()?;
     match parsed.scheme {
         Scheme::Http => Ok(HttpStream::Plain(stream)),
         Scheme::Https => {
             let connector = TlsConnector::new().map_err(|err| err.to_string())?;
             let stream = connect_tls(&connector, &parsed.host, stream, budget)?;
-            Ok(HttpStream::Tls(stream))
+            Ok(HttpStream::Tls(Box::new(stream)))
         }
     }
+}
+
+/// With a proxy the target name is resolved by the proxy, so refuse names
+/// that obviously denote local services when only public targets are allowed.
+fn validate_proxy_target_host(host: &str) -> Result<(), String> {
+    let refused = || Err("http target is not publicly routable".to_string());
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_public_http_ip(ip) {
+            Ok(())
+        } else {
+            refused()
+        };
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host == "home.arpa"
+        || host.ends_with(".home.arpa")
+    {
+        return refused();
+    }
+    Ok(())
 }
 
 fn resolve_http_addrs(
@@ -653,70 +640,81 @@ fn resolve_http_addrs(
     budget: RequestBudget<'_>,
     policy: AddressPolicy,
 ) -> Result<Vec<SocketAddr>, String> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        if policy == AddressPolicy::PublicOnly && !is_public_http_ip(IpAddr::V4(ip)) {
-            return Err("http target is not publicly routable".to_string());
-        }
-        return Ok(vec![SocketAddr::from((ip, port))]);
+    let addrs: Vec<SocketAddr> = resolve_host_budget(host, port, budget)?
+        .into_iter()
+        .filter(|addr| policy == AddressPolicy::Any || is_public_http_ip(addr.ip()))
+        .collect();
+    if addrs.is_empty() {
+        return Err("http target is not publicly routable".to_string());
     }
-    if let Ok(ip) = host.parse::<Ipv6Addr>() {
-        if policy == AddressPolicy::PublicOnly && !is_public_http_ip(IpAddr::V6(ip)) {
-            return Err("http target is not publicly routable".to_string());
-        }
-        return Ok(vec![SocketAddr::from((ip, port))]);
+    Ok(addrs)
+}
+
+/// Resolves `host:port` with a deadline. Name lookups run on a bounded pool
+/// of detached threads because the system resolver cannot be interrupted.
+pub(crate) fn resolve_host(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, String> {
+    resolve_host_budget(host, port, RequestBudget::new(deadline, None))
+}
+
+fn resolve_host_budget(
+    host: &str,
+    port: u16,
+    budget: RequestBudget<'_>,
+) -> Result<Vec<SocketAddr>, String> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    if ACTIVE_HTTP_RESOLVERS
+    if ACTIVE_RESOLVERS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_HTTP_RESOLVER_WORKERS).then_some(active + 1)
+            (active < MAX_RESOLVER_WORKERS).then_some(active + 1)
         })
         .is_err()
     {
-        return Err("http resolver limit reached".to_string());
+        return Err("resolver limit reached".to_string());
     }
-    let host_port = format!("{host}:{port}");
+    let query = (host.to_string(), port);
     let (tx, rx) = mpsc::sync_channel(1);
-    if let Err(err) = thread::Builder::new()
-        .name("http-resolver".to_string())
+    let spawned = thread::Builder::new()
+        .name("resolver".to_string())
         .spawn(move || {
-            let _guard = HttpResolverGuard;
-            let resolved = host_port
+            let _guard = ResolverGuard;
+            let resolved = query
                 .to_socket_addrs()
                 .map(|addrs| {
-                    let mut candidates = Vec::new();
+                    let mut unique = Vec::new();
                     for addr in addrs.take(MAX_RESOLVED_ADDRESSES) {
-                        if !candidates.contains(&addr) {
-                            candidates.push(addr);
+                        if !unique.contains(&addr) {
+                            unique.push(addr);
                         }
                     }
-                    candidates
+                    unique
                 })
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("resolve {}: {err}", query.0));
             let _ = tx.try_send(resolved);
-        })
-    {
-        ACTIVE_HTTP_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
-        return Err(format!("http resolver thread failed: {err}"));
+        });
+    if let Err(err) = spawned {
+        ACTIVE_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
+        return Err(format!("resolver thread failed: {err}"));
     }
     loop {
+        // Poll so a cancellation flag is observed while the lookup runs.
         let wait = budget.remaining()?.min(HTTP_IO_POLL_INTERVAL);
         match rx.recv_timeout(wait) {
             Ok(Ok(addrs)) if addrs.is_empty() => {
-                return Err("http host resolved to no addresses".to_string());
+                return Err("host resolved to no addresses".to_string());
             }
-            Ok(Ok(addrs)) => {
-                let addrs: Vec<_> = addrs
-                    .into_iter()
-                    .filter(|addr| policy == AddressPolicy::Any || is_public_http_ip(addr.ip()))
-                    .collect();
-                if addrs.is_empty() {
-                    return Err("http target is not publicly routable".to_string());
-                }
-                return Ok(addrs);
-            }
-            Ok(Err(err)) => return Err(err),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("http resolver disconnected".to_string());
+                return Err("resolver disconnected".to_string());
             }
         }
     }
@@ -746,6 +744,9 @@ pub(crate) fn is_public_http_ip(ip: IpAddr) -> bool {
                 return is_public_http_ip(IpAddr::V4(ipv4));
             }
             let segments = ip.segments();
+            // Public IPv6 unicast is currently allocated from 2000::/3.
+            // Explicitly reject special-purpose subranges that can embed or
+            // route to local IPv4, benchmarking, or documentation targets.
             (segments[0] & 0xe000) == 0x2000
                 && !(segments[0] == 0x2001 && (segments[1] & 0xfe00) == 0)
                 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
@@ -761,50 +762,39 @@ fn connect_tls(
     stream: TcpStream,
     budget: RequestBudget<'_>,
 ) -> Result<TlsStream<TcpStream>, String> {
-    stream
-        .set_nonblocking(true)
-        .map_err(|err| format!("tls setup failed: {err}"))?;
-    let mut mid = match connector.connect(host, stream) {
-        Ok(stream) => {
-            stream
-                .get_ref()
-                .set_nonblocking(false)
-                .map_err(|err| format!("tls setup failed: {err}"))?;
-            return Ok(stream);
-        }
-        Err(HandshakeError::Failure(err)) => return Err(err.to_string()),
-        Err(HandshakeError::WouldBlock(mid)) => mid,
-    };
+    let setup_err = |err: std::io::Error| format!("tls setup failed: {err}");
+    stream.set_nonblocking(true).map_err(setup_err)?;
+    let mut attempt = connector.connect(host, stream);
     loop {
-        let remaining = budget.remaining()?;
-        thread::sleep(remaining.min(TLS_HANDSHAKE_POLL_INTERVAL));
-        budget.remaining()?;
-        mid = match mid.handshake() {
+        match attempt {
             Ok(stream) => {
-                stream
-                    .get_ref()
-                    .set_nonblocking(false)
-                    .map_err(|err| format!("tls setup failed: {err}"))?;
+                stream.get_ref().set_nonblocking(false).map_err(setup_err)?;
                 return Ok(stream);
             }
             Err(HandshakeError::Failure(err)) => return Err(err.to_string()),
-            Err(HandshakeError::WouldBlock(next)) => next,
-        };
+            Err(HandshakeError::WouldBlock(mid)) => {
+                let remaining = budget.remaining()?;
+                thread::sleep(remaining.min(TLS_HANDSHAKE_POLL_INTERVAL));
+                budget.remaining()?;
+                attempt = mid.handshake();
+            }
+        }
     }
 }
 
 fn parse_http_response(data: &[u8]) -> Result<HttpResponse, String> {
-    let header_end = find_header_end(data).ok_or_else(|| "http parse error".to_string())?;
+    let parse_err = || "http parse error".to_string();
+    let header_end = data
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(parse_err)?;
     if header_end > MAX_HTTP_HEADER_BYTES {
         return Err("http response headers too large".to_string());
     }
-    let header_bytes = &data[..header_end];
     let body = &data[header_end + 4..];
-    let header_str =
-        std::str::from_utf8(header_bytes).map_err(|_| "http parse error".to_string())?;
+    let header_str = std::str::from_utf8(&data[..header_end]).map_err(|_| parse_err())?;
     let mut lines = header_str.split("\r\n");
-    let status_line = lines.next().ok_or_else(|| "http parse error".to_string())?;
-    let status = parse_status(status_line)?;
+    let status = lines.next().and_then(parse_status).ok_or_else(parse_err)?;
 
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
@@ -813,24 +803,19 @@ fn parse_http_response(data: &[u8]) -> Result<HttpResponse, String> {
         if line.is_empty() {
             continue;
         }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "http parse error".to_string())?;
+        let (name, value) = line.split_once(':').ok_or_else(parse_err)?;
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim();
         if name.is_empty() || value.bytes().any(|b| b.is_ascii_control() && b != b'\t') {
-            return Err("http parse error".to_string());
+            return Err(parse_err());
         }
-        headers.push((name.clone(), value.to_string()));
         if name == "content-length" {
-            let parsed = value
-                .parse::<usize>()
-                .map_err(|_| "http parse error".to_string())?;
+            let parsed = value.parse::<usize>().map_err(|_| parse_err())?;
             if content_length
                 .replace(parsed)
                 .is_some_and(|old| old != parsed)
             {
-                return Err("http parse error".to_string());
+                return Err(parse_err());
             }
         } else if name == "transfer-encoding"
             && value
@@ -839,15 +824,13 @@ fn parse_http_response(data: &[u8]) -> Result<HttpResponse, String> {
         {
             chunked = true;
         }
+        headers.push((name, value.to_string()));
     }
 
     let body = if chunked {
-        decode_chunked(body)?
+        decode_chunked(body).ok_or_else(parse_err)?
     } else if let Some(len) = content_length {
-        if body.len() < len {
-            return Err("http parse error".to_string());
-        }
-        body[..len].to_vec()
+        body.get(..len).ok_or_else(parse_err)?.to_vec()
     } else {
         body.to_vec()
     };
@@ -858,67 +841,46 @@ fn parse_http_response(data: &[u8]) -> Result<HttpResponse, String> {
     })
 }
 
-fn parse_status(line: &str) -> Result<u16, String> {
+fn parse_status(line: &str) -> Option<u16> {
     let mut parts = line.split_whitespace();
-    let http = parts.next().ok_or_else(|| "http parse error".to_string())?;
-    if !matches!(http, "HTTP/1.0" | "HTTP/1.1") {
-        return Err("http parse error".to_string());
+    if !matches!(parts.next()?, "HTTP/1.0" | "HTTP/1.1") {
+        return None;
     }
-    let status = parts.next().ok_or_else(|| "http parse error".to_string())?;
-    if status.len() != 3 {
-        return Err("http parse error".to_string());
+    let status = parts.next()?;
+    if status.len() != 3 || !status.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    status
-        .parse::<u16>()
-        .map_err(|_| "http parse error".to_string())
+    status.parse().ok()
 }
 
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, String> {
+fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0;
     let mut out = Vec::new();
     loop {
-        let line_end = find_crlf(body, pos).ok_or_else(|| "http parse error".to_string())?;
-        let line = &body[pos..line_end];
-        let line_str = std::str::from_utf8(line).map_err(|_| "http parse error".to_string())?;
-        let size_text = line_str.split(';').next().unwrap_or("").trim();
-        let size =
-            usize::from_str_radix(size_text, 16).map_err(|_| "http parse error".to_string())?;
-        pos = line_end + 2;
+        let line_len = body
+            .get(pos..)?
+            .windows(2)
+            .position(|window| window == b"\r\n")?;
+        let line = std::str::from_utf8(&body[pos..pos + line_len]).ok()?;
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        if size_text.is_empty() || !size_text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let size = usize::from_str_radix(size_text, 16).ok()?;
+        pos += line_len + 2;
         if size == 0 {
-            if body.get(pos..pos + 2) == Some(b"\r\n")
-                || body
-                    .get(pos..)
-                    .is_some_and(|rest| rest.windows(4).any(|w| w == b"\r\n\r\n"))
-            {
-                break;
-            }
-            return Err("http parse error".to_string());
+            // Accept an empty trailer section or header-style trailers.
+            let rest = &body[pos..];
+            return (rest.starts_with(b"\r\n") || rest.windows(4).any(|w| w == b"\r\n\r\n"))
+                .then_some(out);
         }
-        let end = pos
-            .checked_add(size)
-            .ok_or_else(|| "http parse error".to_string())?;
-        if end > body.len() {
-            return Err("http parse error".to_string());
+        let end = pos.checked_add(size)?;
+        out.extend_from_slice(body.get(pos..end)?);
+        if body.get(end..end.checked_add(2)?)? != b"\r\n" {
+            return None;
         }
-        out.extend_from_slice(&body[pos..end]);
-        pos = end;
-        if body.get(pos) != Some(&b'\r') || body.get(pos + 1) != Some(&b'\n') {
-            return Err("http parse error".to_string());
-        }
-        pos += 2;
+        pos = end + 2;
     }
-    Ok(out)
-}
-
-fn find_crlf(data: &[u8], start: usize) -> Option<usize> {
-    data[start..]
-        .windows(2)
-        .position(|window| window == b"\r\n")
-        .map(|pos| start + pos)
 }
 
 #[cfg(test)]
@@ -1148,10 +1110,7 @@ mod tests {
         let parsed = parse_http_response(response).unwrap();
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body, b"hello");
-        assert_eq!(
-            header_value(&parsed.headers, "x-test"),
-            Some("one".to_string())
-        );
+        assert_eq!(header_value(&parsed.headers, "x-test"), Some("one"));
     }
 
     #[test]
@@ -1173,8 +1132,8 @@ mod tests {
 
     #[test]
     fn decode_chunked_rejects_invalid_chunk_layout() {
-        assert!(decode_chunked(b"4\r\nabc\r\n0\r\n\r\n").is_err());
-        assert!(decode_chunked(b"ZZ\r\nabc\r\n0\r\n\r\n").is_err());
-        assert!(decode_chunked(b"FFFFFFFFFFFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n").is_err());
+        assert!(decode_chunked(b"4\r\nabc\r\n0\r\n\r\n").is_none());
+        assert!(decode_chunked(b"ZZ\r\nabc\r\n0\r\n\r\n").is_none());
+        assert!(decode_chunked(b"FFFFFFFFFFFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n").is_none());
     }
 }

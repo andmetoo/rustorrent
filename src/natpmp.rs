@@ -64,7 +64,7 @@ fn map_port_proto(
                     if response_internal_port != port || response_external_port != port {
                         return Err("natpmp gateway assigned an unexpected port".to_string());
                     }
-                    let lease = u32::from_be_bytes(resp[12..16].try_into().unwrap());
+                    let lease = u32::from_be_bytes([resp[12], resp[13], resp[14], resp[15]]);
                     if lease == 0 {
                         return Err("gateway returned an expired mapping".to_string());
                     }

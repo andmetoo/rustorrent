@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fmt;
 use std::io::{Read, Write};
 
@@ -5,6 +6,9 @@ const PSTR: &str = "BitTorrent protocol";
 const PSTR_LEN: usize = 19;
 const HANDSHAKE_LEN: usize = 49 + PSTR_LEN;
 const MAX_MESSAGE_LEN: usize = 2 * 1024 * 1024;
+const MIN_READ: usize = 4 * 1024;
+const MAX_READ: usize = 64 * 1024;
+const REUSED_ENCODE_BUFFER_LIMIT: usize = 64 * 1024;
 const EXTENSION_PROTOCOL_BIT: u8 = 0x10;
 const HYBRID_V2_UPGRADE_BIT: u8 = 0x10;
 const HASH_REQUEST_PAYLOAD_LEN: usize = 48;
@@ -213,9 +217,19 @@ pub fn write_message<W: Write>(writer: &mut W, message: &Message) -> Result<(), 
     if encoded_payload_len(message).ok_or(Error::InvalidLength)? > MAX_MESSAGE_LEN {
         return Err(Error::InvalidLength);
     }
-    let data = encode_message(message);
-    writer.write_all(&data)?;
-    Ok(())
+    // Peer threads send many small messages; reuse one encode buffer per
+    // thread instead of allocating for every frame.
+    thread_local! {
+        static ENCODE_BUFFER: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+    }
+    let mut buffer = ENCODE_BUFFER.take();
+    buffer.clear();
+    encode_into(message, &mut buffer);
+    let result = writer.write_all(&buffer);
+    if buffer.capacity() <= REUSED_ENCODE_BUFFER_LIMIT {
+        ENCODE_BUFFER.set(buffer);
+    }
+    result.map_err(Error::Io)
 }
 
 fn encoded_payload_len(message: &Message) -> Option<usize> {
@@ -284,17 +298,20 @@ impl MessageReader {
         // Perform at most one socket read per call. A peer that supplies a
         // partial frame one byte at a time must not keep this function inside
         // an unbounded progress loop and prevent its caller from observing a
-        // stop request or an absolute operation deadline.
-        let mut tmp = [0u8; 4096];
-        match reader.read(&mut tmp) {
+        // stop request or an absolute operation deadline. Read directly into
+        // the frame buffer, sized to finish a partially received frame (such
+        // as a 16 KiB piece) in one call where possible.
+        let filled = self.buf.len();
+        let want = self.missing_frame_bytes().clamp(MIN_READ, MAX_READ);
+        self.buf.resize(filled + want, 0);
+        let result = reader.read(&mut self.buf[filled..]);
+        self.buf.truncate(filled + *result.as_ref().unwrap_or(&0));
+        match result {
             Ok(0) => Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "peer closed connection",
             ))),
-            Ok(n) => {
-                self.buf.extend_from_slice(&tmp[..n]);
-                self.try_parse()
-            }
+            Ok(_) => self.try_parse(),
             Err(err)
                 if matches!(
                     err.kind(),
@@ -307,208 +324,191 @@ impl MessageReader {
         }
     }
 
-    fn try_parse(&mut self) -> Result<Option<Message>, Error> {
-        if self.available() < 4 {
-            return Ok(None);
+    /// Bytes still needed to complete the frame at the head of the buffer.
+    fn missing_frame_bytes(&self) -> usize {
+        let pending = &self.buf[self.start..];
+        match pending.first_chunk::<4>() {
+            Some(header) => (u32::from_be_bytes(*header) as usize)
+                .min(MAX_MESSAGE_LEN)
+                .saturating_add(4)
+                .saturating_sub(pending.len()),
+            None => 0,
         }
-        let header = &self.buf[self.start..self.start + 4];
-        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    }
+
+    fn try_parse(&mut self) -> Result<Option<Message>, Error> {
+        let pending = &self.buf[self.start..];
+        let Some(header) = pending.first_chunk::<4>() else {
+            return Ok(None);
+        };
+        let len = u32::from_be_bytes(*header) as usize;
         if len > MAX_MESSAGE_LEN {
             return Err(Error::InvalidLength);
         }
         let total = 4 + len;
-        if self.available() < total {
+        if pending.len() < total {
             return Ok(None);
         }
-        if len == 0 {
-            self.consume(4);
-            return Ok(Some(Message::KeepAlive));
-        }
-        let payload_start = self.start + 4;
-        let payload_end = payload_start + len;
-        let payload = self.buf[payload_start..payload_end].to_vec();
+        let message = if len == 0 {
+            Ok(Message::KeepAlive)
+        } else {
+            decode_message(&pending[4..total])
+        };
         self.consume(total);
-        Ok(Some(decode_message(&payload)?))
-    }
-
-    fn available(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
+        message.map(Some)
     }
 
     fn consume(&mut self, amount: usize) {
-        self.start = self.start.saturating_add(amount);
+        self.start += amount;
         if self.start == self.buf.len() {
             self.buf.clear();
             self.start = 0;
+            // Do not keep a multi-megabyte buffer per peer after one large
+            // frame (such as a big bitfield) has been processed.
+            if self.buf.capacity() > 4 * MAX_READ {
+                self.buf = Vec::with_capacity(MAX_READ);
+            }
         } else if self.start >= 64 * 1024 {
-            let remaining = self.buf.len() - self.start;
-            self.buf.copy_within(self.start.., 0);
-            self.buf.truncate(remaining);
+            self.buf.drain(..self.start);
             self.start = 0;
         }
     }
 }
 
+#[cfg(test)]
 pub fn encode_message(message: &Message) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_into(message, &mut out);
+    out
+}
+
+fn encode_into(message: &Message, out: &mut Vec<u8>) {
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
     match message {
-        Message::KeepAlive => vec![0, 0, 0, 0],
-        Message::Choke => encode_simple(0),
-        Message::Unchoke => encode_simple(1),
-        Message::Interested => encode_simple(2),
-        Message::NotInterested => encode_simple(3),
-        Message::Have(index) => {
-            let mut payload = Vec::with_capacity(5);
-            payload.push(4);
-            payload.extend_from_slice(&index.to_be_bytes());
-            with_len_prefix(payload)
-        }
+        Message::KeepAlive => {}
+        Message::Choke => out.push(0),
+        Message::Unchoke => out.push(1),
+        Message::Interested => out.push(2),
+        Message::NotInterested => out.push(3),
+        Message::Have(index) => put_u32s(out, 4, &[*index]),
         Message::Bitfield(bits) => {
-            let mut payload = Vec::with_capacity(1 + bits.len());
-            payload.push(5);
-            payload.extend_from_slice(bits);
-            with_len_prefix(payload)
+            out.push(5);
+            out.extend_from_slice(bits);
         }
         Message::Request {
             index,
             begin,
             length,
-        } => encode_triple(6, *index, *begin, *length),
+        } => put_u32s(out, 6, &[*index, *begin, *length]),
         Message::Piece {
             index,
             begin,
             block,
         } => {
-            let mut payload = Vec::with_capacity(9 + block.len());
-            payload.push(7);
-            payload.extend_from_slice(&index.to_be_bytes());
-            payload.extend_from_slice(&begin.to_be_bytes());
-            payload.extend_from_slice(block);
-            with_len_prefix(payload)
+            put_u32s(out, 7, &[*index, *begin]);
+            out.extend_from_slice(block);
         }
         Message::Cancel {
             index,
             begin,
             length,
-        } => encode_triple(8, *index, *begin, *length),
+        } => put_u32s(out, 8, &[*index, *begin, *length]),
         Message::Port(port) => {
-            let mut payload = Vec::with_capacity(3);
-            payload.push(9);
-            payload.extend_from_slice(&port.to_be_bytes());
-            with_len_prefix(payload)
+            out.push(9);
+            out.extend_from_slice(&port.to_be_bytes());
         }
         Message::Extended { ext_id, payload } => {
-            let mut buf = Vec::with_capacity(2 + payload.len());
-            buf.push(20);
-            buf.push(*ext_id);
-            buf.extend_from_slice(payload);
-            with_len_prefix(buf)
+            out.extend_from_slice(&[20, *ext_id]);
+            out.extend_from_slice(payload);
         }
         // BEP 6 - Fast Extension
-        Message::SuggestPiece(index) => {
-            let mut payload = Vec::with_capacity(5);
-            payload.push(13);
-            payload.extend_from_slice(&index.to_be_bytes());
-            with_len_prefix(payload)
-        }
-        Message::HaveAll => encode_simple(14),
-        Message::HaveNone => encode_simple(15),
+        Message::SuggestPiece(index) => put_u32s(out, 13, &[*index]),
+        Message::HaveAll => out.push(14),
+        Message::HaveNone => out.push(15),
         Message::RejectRequest {
             index,
             begin,
             length,
-        } => encode_triple(16, *index, *begin, *length),
-        Message::AllowedFast(index) => {
-            let mut payload = Vec::with_capacity(5);
-            payload.push(17);
-            payload.extend_from_slice(&index.to_be_bytes());
-            with_len_prefix(payload)
-        }
-        Message::HashRequest(request) => encode_hash_request(21, request),
+        } => put_u32s(out, 16, &[*index, *begin, *length]),
+        Message::AllowedFast(index) => put_u32s(out, 17, &[*index]),
+        Message::HashRequest(request) => encode_hash_request(out, 21, request),
         Message::Hashes { request, hashes } => {
-            let mut payload = encode_hash_request_payload(22, request);
-            for hash in hashes {
-                payload.extend_from_slice(hash);
-            }
-            with_len_prefix(payload)
+            encode_hash_request(out, 22, request);
+            out.extend_from_slice(hashes.as_flattened());
         }
-        Message::HashReject(request) => encode_hash_request(23, request),
+        Message::HashReject(request) => encode_hash_request(out, 23, request),
+    }
+    let len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+}
+
+fn put_u32s(out: &mut Vec<u8>, id: u8, values: &[u32]) {
+    out.push(id);
+    for value in values {
+        out.extend_from_slice(&value.to_be_bytes());
     }
 }
 
 pub fn decode_message(payload: &[u8]) -> Result<Message, Error> {
-    if payload.is_empty() {
-        return Err(Error::InvalidMessage);
-    }
-    let id = payload[0];
-    let data = &payload[1..];
-    match id {
-        0 => expect_empty(data, Message::Choke),
-        1 => expect_empty(data, Message::Unchoke),
-        2 => expect_empty(data, Message::Interested),
-        3 => expect_empty(data, Message::NotInterested),
-        4 => {
-            if data.len() != 4 {
-                return Err(Error::InvalidMessage);
-            }
-            Ok(Message::Have(read_u32(data)?))
+    let (&id, data) = payload.split_first().ok_or(Error::InvalidMessage)?;
+    // Fixed-size messages must match their length exactly.
+    let exact = |len: usize| {
+        if data.len() == len {
+            Ok(())
+        } else {
+            Err(Error::InvalidMessage)
         }
+    };
+    match id {
+        0 => exact(0).map(|_| Message::Choke),
+        1 => exact(0).map(|_| Message::Unchoke),
+        2 => exact(0).map(|_| Message::Interested),
+        3 => exact(0).map(|_| Message::NotInterested),
+        4 => exact(4).map(|_| Message::Have(read_u32(data, 0))),
         5 => Ok(Message::Bitfield(data.to_vec())),
-        6 => decode_triple(data, |index, begin, length| Message::Request {
-            index,
-            begin,
-            length,
-        }),
+        6 | 8 | 16 => {
+            exact(12)?;
+            let (index, begin, length) = (read_u32(data, 0), read_u32(data, 4), read_u32(data, 8));
+            Ok(match id {
+                6 => Message::Request {
+                    index,
+                    begin,
+                    length,
+                },
+                8 => Message::Cancel {
+                    index,
+                    begin,
+                    length,
+                },
+                _ => Message::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                },
+            })
+        }
         7 => {
             if data.len() < 8 {
                 return Err(Error::InvalidMessage);
             }
-            let index = read_u32(&data[0..4])?;
-            let begin = read_u32(&data[4..8])?;
-            let block = data[8..].to_vec();
             Ok(Message::Piece {
-                index,
-                begin,
-                block,
+                index: read_u32(data, 0),
+                begin: read_u32(data, 4),
+                block: data[8..].to_vec(),
             })
         }
-        8 => decode_triple(data, |index, begin, length| Message::Cancel {
-            index,
-            begin,
-            length,
-        }),
-        9 => {
-            if data.len() != 2 {
-                return Err(Error::InvalidMessage);
-            }
-            Ok(Message::Port(u16::from_be_bytes([data[0], data[1]])))
-        }
+        9 => exact(2).map(|_| Message::Port(u16::from_be_bytes([data[0], data[1]]))),
         // BEP 6 - Fast Extension
-        13 => {
-            if data.len() != 4 {
-                return Err(Error::InvalidMessage);
-            }
-            Ok(Message::SuggestPiece(read_u32(data)?))
-        }
-        14 => expect_empty(data, Message::HaveAll),
-        15 => expect_empty(data, Message::HaveNone),
-        16 => decode_triple(data, |index, begin, length| Message::RejectRequest {
-            index,
-            begin,
-            length,
-        }),
-        17 => {
-            if data.len() != 4 {
-                return Err(Error::InvalidMessage);
-            }
-            Ok(Message::AllowedFast(read_u32(data)?))
-        }
+        13 => exact(4).map(|_| Message::SuggestPiece(read_u32(data, 0))),
+        14 => exact(0).map(|_| Message::HaveAll),
+        15 => exact(0).map(|_| Message::HaveNone),
+        17 => exact(4).map(|_| Message::AllowedFast(read_u32(data, 0))),
         20 => {
-            if data.is_empty() {
-                return Err(Error::InvalidMessage);
-            }
+            let (&ext_id, payload) = data.split_first().ok_or(Error::InvalidMessage)?;
             Ok(Message::Extended {
-                ext_id: data[0],
-                payload: data[1..].to_vec(),
+                ext_id,
+                payload: payload.to_vec(),
             })
         }
         21 => Ok(Message::HashRequest(decode_hash_request(data)?)),
@@ -518,19 +518,17 @@ pub fn decode_message(payload: &[u8]) -> Result<Message, Error> {
     }
 }
 
-fn encode_hash_request(id: u8, request: &HashRequest) -> Vec<u8> {
-    with_len_prefix(encode_hash_request_payload(id, request))
-}
-
-fn encode_hash_request_payload(id: u8, request: &HashRequest) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + HASH_REQUEST_PAYLOAD_LEN);
-    payload.push(id);
-    payload.extend_from_slice(&request.pieces_root);
-    payload.extend_from_slice(&request.base_layer.to_be_bytes());
-    payload.extend_from_slice(&request.index.to_be_bytes());
-    payload.extend_from_slice(&request.length.to_be_bytes());
-    payload.extend_from_slice(&request.proof_layers.to_be_bytes());
-    payload
+fn encode_hash_request(out: &mut Vec<u8>, id: u8, request: &HashRequest) {
+    out.push(id);
+    out.extend_from_slice(&request.pieces_root);
+    for value in [
+        request.base_layer,
+        request.index,
+        request.length,
+        request.proof_layers,
+    ] {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
 }
 
 fn decode_hash_request(data: &[u8]) -> Result<HashRequest, Error> {
@@ -541,10 +539,10 @@ fn decode_hash_request(data: &[u8]) -> Result<HashRequest, Error> {
     pieces_root.copy_from_slice(&data[..32]);
     let request = HashRequest {
         pieces_root,
-        base_layer: read_u32(&data[32..36])?,
-        index: read_u32(&data[36..40])?,
-        length: read_u32(&data[40..44])?,
-        proof_layers: read_u32(&data[44..48])?,
+        base_layer: read_u32(data, 32),
+        index: read_u32(data, 36),
+        length: read_u32(data, 40),
+        proof_layers: read_u32(data, 44),
     };
     if !validate_hash_request(&request) {
         return Err(Error::InvalidMessage);
@@ -553,22 +551,22 @@ fn decode_hash_request(data: &[u8]) -> Result<HashRequest, Error> {
 }
 
 fn decode_hashes(data: &[u8]) -> Result<Message, Error> {
-    if data.len() < HASH_REQUEST_PAYLOAD_LEN
-        || !(data.len() - HASH_REQUEST_PAYLOAD_LEN).is_multiple_of(32)
-    {
+    if data.len() < HASH_REQUEST_PAYLOAD_LEN {
         return Err(Error::InvalidMessage);
     }
-    let request = decode_hash_request(&data[..HASH_REQUEST_PAYLOAD_LEN])?;
-    let mut hashes = Vec::with_capacity((data.len() - HASH_REQUEST_PAYLOAD_LEN) / 32);
-    for chunk in data[HASH_REQUEST_PAYLOAD_LEN..].as_chunks::<32>().0 {
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(chunk);
-        hashes.push(hash);
-    }
-    if !validate_hashes(&request, &hashes) {
+    let (header, body) = data.split_at(HASH_REQUEST_PAYLOAD_LEN);
+    let (hashes, rest) = body.as_chunks::<32>();
+    if !rest.is_empty() {
         return Err(Error::InvalidMessage);
     }
-    Ok(Message::Hashes { request, hashes })
+    let request = decode_hash_request(header)?;
+    if !validate_hashes(&request, hashes) {
+        return Err(Error::InvalidMessage);
+    }
+    Ok(Message::Hashes {
+        request,
+        hashes: hashes.to_vec(),
+    })
 }
 
 fn validate_hash_request(request: &HashRequest) -> bool {
@@ -582,66 +580,19 @@ fn validate_hash_request(request: &HashRequest) -> bool {
 }
 
 fn validate_hashes(request: &HashRequest, hashes: &[[u8; 32]]) -> bool {
-    if !validate_hash_request(request) {
-        return false;
-    }
-    let Ok(base_hashes) = usize::try_from(request.length) else {
-        return false;
-    };
-    let Ok(max_proofs) = usize::try_from(request.proof_layers) else {
-        return false;
-    };
-    hashes.len() >= base_hashes && hashes.len() <= base_hashes.saturating_add(max_proofs)
+    // Both counts are bounded by validate_hash_request (<= 512 and <= 64).
+    let base_hashes = request.length as usize;
+    validate_hash_request(request)
+        && hashes.len() >= base_hashes
+        && hashes.len() <= base_hashes + request.proof_layers as usize
 }
 
-fn encode_simple(id: u8) -> Vec<u8> {
-    with_len_prefix(vec![id])
+/// Reads a big-endian u32 at `offset`; callers have checked the length.
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_be_bytes(word)
 }
-
-fn encode_triple(id: u8, first: u32, second: u32, third: u32) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(13);
-    payload.push(id);
-    payload.extend_from_slice(&first.to_be_bytes());
-    payload.extend_from_slice(&second.to_be_bytes());
-    payload.extend_from_slice(&third.to_be_bytes());
-    with_len_prefix(payload)
-}
-
-fn with_len_prefix(mut payload: Vec<u8>) -> Vec<u8> {
-    let len = payload.len() as u32;
-    let mut out = Vec::with_capacity(payload.len() + 4);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.append(&mut payload);
-    out
-}
-
-fn expect_empty(data: &[u8], msg: Message) -> Result<Message, Error> {
-    if !data.is_empty() {
-        return Err(Error::InvalidMessage);
-    }
-    Ok(msg)
-}
-
-fn decode_triple<F>(data: &[u8], build: F) -> Result<Message, Error>
-where
-    F: Fn(u32, u32, u32) -> Message,
-{
-    if data.len() != 12 {
-        return Err(Error::InvalidMessage);
-    }
-    let first = read_u32(&data[0..4])?;
-    let second = read_u32(&data[4..8])?;
-    let third = read_u32(&data[8..12])?;
-    Ok(build(first, second, third))
-}
-
-fn read_u32(bytes: &[u8]) -> Result<u32, Error> {
-    if bytes.len() != 4 {
-        return Err(Error::InvalidMessage);
-    }
-    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +631,81 @@ mod tests {
             buf[..bytes.len()].copy_from_slice(&bytes);
             Ok(bytes.len())
         }
+    }
+
+    fn hash_request_payload(id: u8, request: &HashRequest) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_hash_request(&mut out, id, request);
+        out
+    }
+
+    #[test]
+    fn message_reader_completes_a_piece_frame_in_one_read() {
+        let piece = Message::Piece {
+            index: 3,
+            begin: 16384,
+            block: vec![0xAB; 16 * 1024],
+        };
+        let mut bytes = encode_message(&piece);
+        let tail = bytes.split_off(100);
+        let mut reader = MessageReader::new();
+        let mut head = SingleChunkReader {
+            bytes: Some(bytes),
+            reads: 0,
+        };
+        assert_eq!(reader.read_message(&mut head).unwrap(), None);
+        let mut rest = SingleChunkReader {
+            bytes: Some(tail),
+            reads: 0,
+        };
+        assert_eq!(reader.read_message(&mut rest).unwrap(), Some(piece));
+        assert_eq!(rest.reads, 1);
+    }
+
+    #[test]
+    fn write_message_matches_encoding_and_reuses_buffer_safely() {
+        let messages = [
+            Message::Have(9),
+            Message::Piece {
+                index: 1,
+                begin: 2,
+                block: vec![7; 100_000],
+            },
+            Message::Request {
+                index: 1,
+                begin: 2,
+                length: 3,
+            },
+        ];
+        for message in &messages {
+            let mut out = Vec::new();
+            write_message(&mut out, message).unwrap();
+            assert_eq!(out, encode_message(message));
+            assert_eq!(decode_message(&out[4..]).unwrap(), *message);
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_wrong_fixed_lengths_and_empty_extended() {
+        for payload in [
+            &[4u8, 0, 0, 0][..],
+            &[6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[7, 0, 0, 0, 0, 0, 0, 0],
+            &[9, 0],
+            &[20],
+            &[0, 1],
+            &[],
+        ] {
+            assert!(decode_message(payload).is_err(), "{payload:?}");
+        }
+        assert_eq!(
+            decode_message(&[16, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]).unwrap(),
+            Message::RejectRequest {
+                index: 1,
+                begin: 2,
+                length: 3
+            }
+        );
     }
 
     #[test]
@@ -821,21 +847,21 @@ mod tests {
             proof_layers: 1,
         };
 
-        let mut invalid_length = encode_hash_request_payload(21, &request);
+        let mut invalid_length = hash_request_payload(21, &request);
         invalid_length[41..45].copy_from_slice(&513u32.to_be_bytes());
         assert!(matches!(
             decode_message(&invalid_length),
             Err(Error::InvalidMessage)
         ));
 
-        let mut misaligned = encode_hash_request_payload(21, &request);
+        let mut misaligned = hash_request_payload(21, &request);
         misaligned[37..41].copy_from_slice(&1u32.to_be_bytes());
         assert!(matches!(
             decode_message(&misaligned),
             Err(Error::InvalidMessage)
         ));
 
-        let too_few_hashes = encode_hash_request_payload(22, &request);
+        let too_few_hashes = hash_request_payload(22, &request);
         assert!(matches!(
             decode_message(&too_few_hashes),
             Err(Error::InvalidMessage)

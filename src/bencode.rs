@@ -59,14 +59,13 @@ pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
     match value {
         Value::Int(num) => {
             out.push(b'i');
-            out.extend_from_slice(num.to_string().as_bytes());
+            if *num < 0 {
+                out.push(b'-');
+            }
+            put_decimal(out, num.unsigned_abs());
             out.push(b'e');
         }
-        Value::Bytes(bytes) => {
-            out.extend_from_slice(bytes.len().to_string().as_bytes());
-            out.push(b':');
-            out.extend_from_slice(bytes);
-        }
+        Value::Bytes(bytes) => put_bytes(out, bytes),
         Value::List(items) => {
             out.push(b'l');
             for item in items {
@@ -82,18 +81,37 @@ pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
                 items
             } else {
                 sorted_storage = items.clone();
-                sorted_storage.sort_by(|a, b| a.0.cmp(&b.0));
+                crate::util::sort_by(&mut sorted_storage, |a, b| a.0 < b.0);
                 &sorted_storage
             };
             for (key, value) in ordered {
-                out.extend_from_slice(key.len().to_string().as_bytes());
-                out.push(b':');
-                out.extend_from_slice(key);
+                put_bytes(out, key);
                 encode_into(value, out);
             }
             out.push(b'e');
         }
     }
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_decimal(out, bytes.len() as u64);
+    out.push(b':');
+    out.extend_from_slice(bytes);
+}
+
+/// Appends `value` in decimal without a temporary `String`.
+fn put_decimal(out: &mut Vec<u8>, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[start..]);
 }
 
 /// Verifies that an in-memory value fits the same depth and value-count
@@ -141,7 +159,17 @@ fn consume_structure_slot(depth: usize, remaining: &mut usize) -> Result<(), Err
 
 pub fn parse_value(data: &[u8], pos: usize) -> Result<(Value, usize), Error> {
     let mut remaining = MAX_VALUES;
-    parse_value_with_depth(data, pos, 0, &mut remaining)
+    parse_value_with_budget(data, pos, &mut remaining)
+}
+
+/// Like `parse_value`, but charges a caller-owned value budget so several
+/// consecutive values together stay within `MAX_VALUES`.
+pub fn parse_value_with_budget(
+    data: &[u8],
+    pos: usize,
+    remaining: &mut usize,
+) -> Result<(Value, usize), Error> {
+    parse_value_with_depth(data, pos, 0, remaining)
 }
 
 // A malicious metainfo or tracker response can otherwise exhaust the call stack
@@ -188,23 +216,17 @@ fn parse_value_with_depth(
             Ok((Value::List(items), i + 1))
         }
         b'd' => {
-            let mut items = Vec::new();
+            let mut items: Vec<(Vec<u8>, Value)> = Vec::new();
             let mut i = pos + 1;
-            let mut previous_key: Option<Vec<u8>> = None;
             while i < data.len() && data[i] != b'e' {
                 let (key_value, next) = parse_value_with_depth(data, i, depth + 1, remaining)?;
-                let key = match key_value {
-                    Value::Bytes(bytes) => bytes,
-                    _ => return Err(Error::InvalidDictKey),
+                let Value::Bytes(key) = key_value else {
+                    return Err(Error::InvalidDictKey);
                 };
-                if previous_key
-                    .as_ref()
-                    .is_some_and(|previous| previous.as_slice() >= key.as_slice())
-                {
+                if items.last().is_some_and(|(previous, _)| *previous >= key) {
                     return Err(Error::InvalidDictOrder);
                 }
                 let (value, next) = parse_value_with_depth(data, next, depth + 1, remaining)?;
-                previous_key = Some(key.clone());
                 items.push((key, value));
                 i = next;
             }
@@ -242,8 +264,21 @@ fn parse_int(data: &[u8], pos: usize) -> Result<(i64, usize), Error> {
     if !valid_syntax {
         return Err(Error::InvalidInt);
     }
-    let s = std::str::from_utf8(slice).map_err(|_| Error::InvalidInt)?;
-    let value = s.parse::<i64>().map_err(|_| Error::InvalidInt)?;
+    let (negative, digits) = match slice {
+        [b'-', rest @ ..] => (true, rest),
+        _ => (false, slice),
+    };
+    // Accumulate negatively so i64::MIN is representable.
+    let mut value = 0i64;
+    for digit in digits {
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_sub(i64::from(digit - b'0')))
+            .ok_or(Error::InvalidInt)?;
+    }
+    if !negative {
+        value = value.checked_neg().ok_or(Error::InvalidInt)?;
+    }
     Ok((value, i + 1))
 }
 
@@ -259,8 +294,13 @@ fn parse_bytes(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), Error> {
     if slice.len() > 1 && slice[0] == b'0' {
         return Err(Error::InvalidLen);
     }
-    let s = std::str::from_utf8(slice).map_err(|_| Error::InvalidLen)?;
-    let len = s.parse::<usize>().map_err(|_| Error::InvalidLen)?;
+    let mut len = 0usize;
+    for digit in slice {
+        len = len
+            .checked_mul(10)
+            .and_then(|len| len.checked_add(usize::from(digit - b'0')))
+            .ok_or(Error::InvalidLen)?;
+    }
     let start = i + 1;
     let end = start.checked_add(len).ok_or(Error::InvalidLen)?;
     if end > data.len() {
@@ -384,6 +424,32 @@ mod tests {
             parse(&encode(&too_deep)),
             Err(Error::DepthLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn integers_cover_the_full_i64_range() {
+        for value in [0, 1, -1, 42, i64::MAX, i64::MIN] {
+            let encoded = encode(&Value::Int(value));
+            assert_eq!(encoded, format!("i{value}e").into_bytes());
+            assert_eq!(parse(&encoded), Ok(Value::Int(value)));
+        }
+        assert_eq!(parse(b"i9223372036854775808e"), Err(Error::InvalidInt));
+        assert_eq!(parse(b"i-9223372036854775809e"), Err(Error::InvalidInt));
+        assert_eq!(
+            encode(&Value::Bytes(vec![b'x'; 12])),
+            b"12:xxxxxxxxxxxx".to_vec()
+        );
+    }
+
+    #[test]
+    fn shared_budget_limits_consecutive_values() {
+        let mut remaining = 3;
+        assert!(parse_value_with_budget(b"li1ee", 0, &mut remaining).is_ok());
+        assert_eq!(remaining, 1);
+        assert_eq!(
+            parse_value_with_budget(b"li1ee", 0, &mut remaining),
+            Err(Error::ValueLimitExceeded)
+        );
     }
 
     #[test]

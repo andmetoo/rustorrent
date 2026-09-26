@@ -33,7 +33,7 @@ impl GeoIpDb {
                 }
             }
         }
-        entries.sort_by_key(|(start, _, _)| *start);
+        crate::util::sort_by_key(&mut entries, |(start, _, _)| *start);
         for pair in entries.windows(2) {
             if pair[1].0 <= pair[0].1 {
                 return Err("geoip load: overlapping address ranges".to_string());
@@ -43,22 +43,10 @@ impl GeoIpDb {
     }
 
     pub fn lookup(&self, addr: IpAddr) -> Option<&str> {
-        let ip_u32 = match addr {
-            IpAddr::V4(ip) => u32::from(ip),
-            IpAddr::V6(ip) => {
-                let segments = ip.segments();
-                if segments[0..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
-                    u32::from(Ipv4Addr::new(
-                        (segments[6] >> 8) as u8,
-                        segments[6] as u8,
-                        (segments[7] >> 8) as u8,
-                        segments[7] as u8,
-                    ))
-                } else {
-                    return None;
-                }
-            }
-        };
+        let ip_u32 = u32::from(match addr {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(ip) => ip.to_ipv4_mapped()?,
+        });
         let idx = self
             .entries
             .partition_point(|(start, _, _)| *start <= ip_u32);
@@ -66,11 +54,8 @@ impl GeoIpDb {
             return None;
         }
         let (_, end, cc) = &self.entries[idx - 1];
-        if ip_u32 <= *end {
-            Some(std::str::from_utf8(cc).unwrap_or("??"))
-        } else {
-            None
-        }
+        // Country codes are validated as ASCII when loaded.
+        (ip_u32 <= *end).then(|| std::str::from_utf8(cc).unwrap_or("??"))
     }
 
     pub fn len(&self) -> usize {
@@ -78,50 +63,32 @@ impl GeoIpDb {
     }
 }
 
+/// `start,end,CC` or `a.b.c.d/prefix,<ignored>,CC`.
 fn parse_entry(line: &str) -> Option<(u32, u32, [u8; 2])> {
-    let parts: Vec<&str> = line.splitn(3, ',').collect();
-    if parts.len() < 3 {
-        return None;
-    }
-    let cc_str = parts[2].trim();
-    if cc_str.len() != 2
-        || !cc_str
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    let mut parts = line.splitn(3, ',');
+    let (first, second, cc) = (
+        parts.next()?.trim(),
+        parts.next()?.trim(),
+        parts.next()?.trim(),
+    );
+    let cc: [u8; 2] = cc.as_bytes().try_into().ok()?;
+    if !cc
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
     {
         return None;
     }
-    let cc = [cc_str.as_bytes()[0], cc_str.as_bytes()[1]];
-
-    let first = parts[0].trim();
-    let second = parts[1].trim();
-
-    if let Some(slash) = first.find('/') {
-        let ip_str = &first[..slash];
-        let prefix: u8 = first[slash + 1..].parse().ok()?;
-        let ip: Ipv4Addr = ip_str.parse().ok()?;
-        if prefix > 32 {
-            return None;
-        }
-        let value = u32::from(ip);
-        let mask = if prefix == 0 {
-            0u32
-        } else {
-            (!0u32) << (32 - prefix)
-        };
-        let start = value & mask;
-        let end = start | (!mask);
-        Some((start, end, cc))
+    let (start, end) = if let Some((ip, prefix)) = first.split_once('/') {
+        let value = u32::from(ip.parse::<Ipv4Addr>().ok()?);
+        let prefix = prefix.parse::<u32>().ok().filter(|prefix| *prefix <= 32)?;
+        let host = u32::MAX.checked_shr(prefix).unwrap_or(0);
+        (value & !host, value | host)
     } else {
-        let start_ip: Ipv4Addr = first.parse().ok()?;
-        let end_ip: Ipv4Addr = second.parse().ok()?;
-        let start = u32::from(start_ip);
-        let end = u32::from(end_ip);
-        if end < start {
-            return None;
-        }
-        Some((start, end, cc))
-    }
+        let start = u32::from(first.parse::<Ipv4Addr>().ok()?);
+        let end = u32::from(second.parse::<Ipv4Addr>().ok()?);
+        (start <= end).then_some((start, end))?
+    };
+    Some((start, end, cc))
 }
 
 pub fn country_flag(cc: &str) -> String {
@@ -200,6 +167,19 @@ mod tests {
         let _ = fs::remove_file(&path);
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
         assert_eq!(db.lookup(v6), None);
+    }
+
+    #[test]
+    fn parse_entry_handles_cidr_edges_and_rejects_garbage() {
+        assert_eq!(parse_entry("0.0.0.0/0,,ZZ"), Some((0, u32::MAX, *b"ZZ")));
+        assert_eq!(
+            parse_entry("10.1.2.3/32,,JP"),
+            Some((0x0a01_0203, 0x0a01_0203, *b"JP"))
+        );
+        assert_eq!(parse_entry("10.0.0.0/33,,JP"), None);
+        assert_eq!(parse_entry("10.0.0.0/8,,JPN"), None);
+        assert_eq!(parse_entry("10.0.0.0/8,,é"), None);
+        assert_eq!(parse_entry("1.2.3.4,1.2.3.4"), None);
     }
 
     #[test]
