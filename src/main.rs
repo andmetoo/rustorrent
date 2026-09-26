@@ -9514,13 +9514,23 @@ struct ConfigOverrides {
     geoip_db: Option<PathBuf>,
 }
 
+fn parse_flag<T: std::str::FromStr>(value: &str, flag: &str) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid value for {flag}"))
+}
+
+/// Returns the value following a command-line flag.
+fn flag_value<'a>(args: &'a [String], idx: usize, flag: &str) -> Result<&'a String, String> {
+    args.get(idx + 1)
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
 fn parse_args() -> Result<Args, String> {
     let args_list = env::args().skip(1).collect::<Vec<_>>();
     let mut config_path = env::var("RUSTORRENT_CONFIG").ok();
     if let Some(idx) = args_list.iter().position(|arg| arg == "--config") {
-        let value = args_list
-            .get(idx + 1)
-            .ok_or_else(|| "missing value for --config".to_string())?;
+        let value = flag_value(&args_list, idx, "--config")?;
         config_path = Some(value.clone());
     }
     let config_overrides = match config_path {
@@ -9635,17 +9645,13 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--download-dir" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --download-dir".to_string())?;
+            let value = flag_value(&args_list, idx, "--download-dir")?;
             download_dir = value.into();
             idx += 2;
             continue;
         }
         if arg == "--magnet" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --magnet".to_string())?;
+            let value = flag_value(&args_list, idx, "--magnet")?;
             magnet = Some(value.clone());
             idx += 2;
             continue;
@@ -9671,17 +9677,13 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--ui-addr" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --ui-addr".to_string())?;
+            let value = flag_value(&args_list, idx, "--ui-addr")?;
             ui_addr = value.clone();
             idx += 2;
             continue;
         }
         if arg == "--peer-profile" || arg == "--network-profile" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --peer-profile".to_string())?;
+            let value = flag_value(&args_list, idx, "--peer-profile")?;
             peer_profile = parse_peer_profile(value)?;
             let tuning = peer_profile.tuning();
             if !cli_numwant_set {
@@ -9698,12 +9700,8 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--retry-interval" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --retry-interval".to_string())?;
-            retry_interval = value
-                .parse::<u64>()
-                .map_err(|_| "invalid value for --retry-interval".to_string())?;
+            let value = flag_value(&args_list, idx, "--retry-interval")?;
+            retry_interval = parse_flag::<u64>(value, "--retry-interval")?;
             if retry_interval == 0 {
                 return Err("retry interval must be > 0".to_string());
             }
@@ -9711,30 +9709,20 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--numwant" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --numwant".to_string())?;
-            numwant = value
-                .parse::<u32>()
-                .map_err(|_| "invalid value for --numwant".to_string())?;
+            let value = flag_value(&args_list, idx, "--numwant")?;
+            numwant = parse_flag::<u32>(value, "--numwant")?;
             cli_numwant_set = true;
             idx += 2;
             continue;
         }
         if arg == "--port" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --port".to_string())?;
-            port = value
-                .parse::<u16>()
-                .map_err(|_| "invalid value for --port".to_string())?;
+            let value = flag_value(&args_list, idx, "--port")?;
+            port = parse_flag::<u16>(value, "--port")?;
             idx += 2;
             continue;
         }
         if arg == "--encryption" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --encryption".to_string())?;
+            let value = flag_value(&args_list, idx, "--encryption")?;
             encryption = parse_encryption_mode(value)?;
             idx += 2;
             continue;
@@ -9755,81 +9743,57 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--blocklist" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --blocklist".to_string())?;
+            let value = flag_value(&args_list, idx, "--blocklist")?;
             blocklist_path = Some(PathBuf::from(value));
             idx += 2;
             continue;
         }
         if arg == "--max-active" || arg == "--max-active-torrents" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --max-active".to_string())?;
-            max_active_torrents = value
-                .parse::<usize>()
-                .map_err(|_| "invalid value for --max-active".to_string())?;
+            let value = flag_value(&args_list, idx, "--max-active")?;
+            max_active_torrents = parse_flag::<usize>(value, "--max-active")?;
             idx += 2;
             continue;
         }
         if arg == "--max-peers" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --max-peers".to_string())?;
-            max_peers_global = value
-                .parse::<usize>()
-                .map_err(|_| "invalid value for --max-peers".to_string())?;
+            let value = flag_value(&args_list, idx, "--max-peers")?;
+            max_peers_global = parse_flag::<usize>(value, "--max-peers")?;
             cli_max_peers_set = true;
             idx += 2;
             continue;
         }
         if arg == "--max-peers-torrent" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --max-peers-torrent".to_string())?;
-            max_peers_torrent = value
-                .parse::<usize>()
-                .map_err(|_| "invalid value for --max-peers-torrent".to_string())?;
+            let value = flag_value(&args_list, idx, "--max-peers-torrent")?;
+            max_peers_torrent = parse_flag::<usize>(value, "--max-peers-torrent")?;
             cli_max_peers_torrent_set = true;
             idx += 2;
             continue;
         }
         if arg == "--download-rate" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --download-rate".to_string())?;
+            let value = flag_value(&args_list, idx, "--download-rate")?;
             download_rate = parse_rate(value)?;
             idx += 2;
             continue;
         }
         if arg == "--upload-rate" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --upload-rate".to_string())?;
+            let value = flag_value(&args_list, idx, "--upload-rate")?;
             upload_rate = parse_rate(value)?;
             idx += 2;
             continue;
         }
         if arg == "--torrent-download-rate" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --torrent-download-rate".to_string())?;
+            let value = flag_value(&args_list, idx, "--torrent-download-rate")?;
             torrent_download_rate = parse_rate(value)?;
             idx += 2;
             continue;
         }
         if arg == "--torrent-upload-rate" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --torrent-upload-rate".to_string())?;
+            let value = flag_value(&args_list, idx, "--torrent-upload-rate")?;
             torrent_upload_rate = parse_rate(value)?;
             idx += 2;
             continue;
         }
         if arg == "--write-cache" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --write-cache".to_string())?;
+            let value = flag_value(&args_list, idx, "--write-cache")?;
             write_cache_bytes = parse_size(value)?;
             idx += 2;
             continue;
@@ -9840,9 +9804,7 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--log" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --log".to_string())?;
+            let value = flag_value(&args_list, idx, "--log")?;
             log_path = Some(PathBuf::from(value));
             idx += 2;
             continue;
@@ -9853,20 +9815,14 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--pid-file" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --pid-file".to_string())?;
+            let value = flag_value(&args_list, idx, "--pid-file")?;
             pid_file = Some(PathBuf::from(value));
             idx += 2;
             continue;
         }
         if arg == "--seed-ratio" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --seed-ratio".to_string())?;
-            seed_ratio = value
-                .parse::<f64>()
-                .map_err(|_| "invalid value for --seed-ratio".to_string())?;
+            let value = flag_value(&args_list, idx, "--seed-ratio")?;
+            seed_ratio = parse_flag::<f64>(value, "--seed-ratio")?;
             if !seed_ratio.is_finite() || seed_ratio < 0.0 {
                 return Err("seed ratio must be a finite value >= 0".to_string());
             }
@@ -9874,12 +9830,8 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--max-seed-time" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --max-seed-time".to_string())?;
-            max_seed_time = value
-                .parse::<u64>()
-                .map_err(|_| "invalid value for --max-seed-time".to_string())?;
+            let value = flag_value(&args_list, idx, "--max-seed-time")?;
+            max_seed_time = parse_flag::<u64>(value, "--max-seed-time")?;
             if max_seed_time.checked_mul(60).is_none() {
                 return Err("max seed time is too large".to_string());
             }
@@ -9887,9 +9839,7 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--on-complete" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --on-complete".to_string())?;
+            let value = flag_value(&args_list, idx, "--on-complete")?;
             on_complete = Some(PathBuf::from(value));
             idx += 2;
             continue;
@@ -9900,25 +9850,19 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--proxy" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --proxy".to_string())?;
+            let value = flag_value(&args_list, idx, "--proxy")?;
             proxy_config = Some(proxy::ProxyConfig::parse(value)?);
             idx += 2;
             continue;
         }
         if arg == "--geoip-db" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --geoip-db".to_string())?;
+            let value = flag_value(&args_list, idx, "--geoip-db")?;
             geoip_path = Some(PathBuf::from(value));
             idx += 2;
             continue;
         }
         if arg == "--rss" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --rss".to_string())?;
+            let value = flag_value(&args_list, idx, "--rss")?;
             if rss_feeds.len() >= rss::MAX_RSS_FEEDS {
                 return Err("too many RSS feeds".to_string());
             }
@@ -9933,9 +9877,7 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--rss-rule" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --rss-rule".to_string())?;
+            let value = flag_value(&args_list, idx, "--rss-rule")?;
             let (feed_url, pattern) = parse_rss_rule_arg(value)?;
             if rss_rules.len() >= rss::MAX_RSS_RULES {
                 return Err("too many RSS rules".to_string());
@@ -9953,12 +9895,8 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--rss-interval" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --rss-interval".to_string())?;
-            rss_interval = value
-                .parse::<u64>()
-                .map_err(|_| "invalid value for --rss-interval".to_string())?;
+            let value = flag_value(&args_list, idx, "--rss-interval")?;
+            rss_interval = parse_flag::<u64>(value, "--rss-interval")?;
             if rss_interval == 0 {
                 return Err("rss interval must be > 0".to_string());
             }
@@ -9971,9 +9909,7 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--throttle" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --throttle".to_string())?;
+            let value = flag_value(&args_list, idx, "--throttle")?;
             let parts: Vec<&str> = value.splitn(3, ':').collect();
             if parts.len() != 3 {
                 return Err("--throttle format: name:down_kbps:up_kbps".to_string());
@@ -9996,9 +9932,7 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--ratio-group" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --ratio-group".to_string())?;
+            let value = flag_value(&args_list, idx, "--ratio-group")?;
             let parts: Vec<&str> = value.splitn(3, ':').collect();
             if parts.len() != 3 {
                 return Err("--ratio-group format: name:ratio:action".to_string());
@@ -10021,40 +9955,27 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--schedule" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --schedule".to_string())?;
+            let value = flag_value(&args_list, idx, "--schedule")?;
             let (interval, command) = parse_schedule_arg(value)?;
             schedules.push((interval, command.to_string()));
             idx += 2;
             continue;
         }
         if arg == "--create" {
-            let source = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --create".to_string())?
-                .clone();
+            let source = flag_value(&args_list, idx, "--create")?.clone();
             let mut create_tracker = String::new();
             let mut create_output = String::new();
             let mut create_piece_length = 256 * 1024u64;
             let mut j = idx + 2;
             while j < args_list.len() {
                 if args_list[j] == "--tracker" {
-                    create_tracker = args_list
-                        .get(j + 1)
-                        .ok_or_else(|| "missing value for --tracker".to_string())?
-                        .clone();
+                    create_tracker = flag_value(&args_list, j, "--tracker")?.clone();
                     j += 2;
                 } else if args_list[j] == "--output" {
-                    create_output = args_list
-                        .get(j + 1)
-                        .ok_or_else(|| "missing value for --output".to_string())?
-                        .clone();
+                    create_output = flag_value(&args_list, j, "--output")?.clone();
                     j += 2;
                 } else if args_list[j] == "--piece-length" {
-                    create_piece_length = args_list
-                        .get(j + 1)
-                        .ok_or_else(|| "missing value for --piece-length".to_string())?
+                    create_piece_length = flag_value(&args_list, j, "--piece-length")?
                         .parse::<u64>()
                         .map_err(|_| "invalid --piece-length".to_string())?;
                     j += 2;
@@ -10079,17 +10000,13 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--move-completed" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --move-completed".to_string())?;
+            let value = flag_value(&args_list, idx, "--move-completed")?;
             move_completed = Some(PathBuf::from(value));
             idx += 2;
             continue;
         }
         if arg == "--watch" {
-            let value = args_list
-                .get(idx + 1)
-                .ok_or_else(|| "missing value for --watch".to_string())?;
+            let value = flag_value(&args_list, idx, "--watch")?;
             watch_dirs.push(PathBuf::from(value));
             idx += 2;
             continue;
