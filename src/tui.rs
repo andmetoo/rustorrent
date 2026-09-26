@@ -5,7 +5,7 @@
 //! profile, search and RSS.
 
 use crate::remote::{
-    clip, file_line, fmt_eta, fmt_rate, info_lines, priority_name, progress, search_line,
+    clip, file_line, fmt_eta, fmt_rate, info_lines, is_done, priority_name, progress, search_line,
     session_lines, state_label, Client, Json,
 };
 use std::fmt::Write as _;
@@ -167,7 +167,11 @@ impl Tui {
                 let keep = match FILTERS[self.filter] {
                     "all" => true,
                     "active" => t.n("download_rate_bps") >= 1.0 || t.n("upload_rate_bps") >= 1.0,
-                    "done" => state == "done" || state == "seeding",
+                    "downloading" => {
+                        matches!(state, "downloading" | "waiting" | "metadata" | "queued")
+                    }
+                    "paused" => matches!(state, "paused" | "stopped" | "stopping"),
+                    "done" => is_done(t),
                     other => state == other,
                 };
                 keep && (needle.is_empty()
@@ -856,9 +860,9 @@ fn ask_label(ask: Ask) -> &'static str {
 fn state_color(state: &str) -> &'static str {
     match state {
         "downloading" => "\x1b[34m",
-        "seeding" | "done" => "\x1b[32m",
+        "seeding" => "\x1b[32m",
         "error" => "\x1b[31m",
-        "paused" | "stopped" => "\x1b[2m",
+        "paused" | "stopped" | "stopping" => "\x1b[2m",
         _ => "\x1b[33m",
     }
 }

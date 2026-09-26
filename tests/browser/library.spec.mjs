@@ -90,7 +90,7 @@ test('shell loads cached assets and the stream sends JSON deltas', async () => {
     expect(first.status).toBe(200);
     expect(first.headers.get('cache-control')).toBe('no-cache');
     const etag = first.headers.get('etag');
-    expect(etag).toMatch(/^"[0-9a-f]{40}"$/);
+    expect(etag).toMatch(/^"[0-9a-f]{8}"$/);
     expect((await fetch(url + asset, {headers: {'If-None-Match': etag}})).status).toBe(304);
   }
   await add('Stream check.txt');

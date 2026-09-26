@@ -85,7 +85,9 @@ const DIST_EXTRA: [u32; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
-const CL_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+const CL_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
 
 fn bucket(table: &[usize], value: usize) -> usize {
     table.iter().rposition(|&base| base <= value).unwrap_or(0)
@@ -274,7 +276,10 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     let dist_len = code_lengths(&dist_freq, 15);
     let lit_code = canonical(&lit_len);
     let dist_code = canonical(&dist_len);
-    let hlit = lit_len.iter().rposition(|&l| l > 0).map_or(257, |p| (p + 1).max(257));
+    let hlit = lit_len
+        .iter()
+        .rposition(|&l| l > 0)
+        .map_or(257, |p| (p + 1).max(257));
     let hdist = dist_len.iter().rposition(|&l| l > 0).map_or(1, |p| p + 1);
     let all: Vec<u8> = lit_len[..hlit]
         .iter()

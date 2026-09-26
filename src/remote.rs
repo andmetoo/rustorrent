@@ -463,27 +463,32 @@ pub fn progress(t: &Json) -> f64 {
 /// One user-facing state per transfer, matching the browser interface.
 pub fn state_label(t: &Json) -> &'static str {
     let status = t.s("status");
-    if status == "error" || status.contains("failed") {
-        "error"
+    if status == "stopping" {
+        "stopping"
     } else if t.b("paused") || status == "paused" {
         "paused"
-    } else if status == "stopped" {
+    } else if status == "stopped" || status == "shutdown" {
         "stopped"
-    } else if status == "seeding" {
+    } else if status.contains("error") || status.contains("failed") {
+        "error"
+    } else if status == "queued" {
+        "queued"
+    } else if is_done(t) {
         "seeding"
-    } else if status == "complete" || status == "completed" {
-        "done"
-    } else if status == "downloading" {
-        "downloading"
-    } else if status.contains("metadata") {
+    } else if status == "fetching metadata" {
         "metadata"
-    } else if status == "checking" || status.contains("verif") || status == "loading" {
-        "checking"
-    } else if status.contains("waiting") || status == "announcing" || status == "ready" {
+    } else if status == "announcing" || status.contains("waiting") {
         "waiting"
     } else {
-        "queued"
+        "downloading"
     }
+}
+
+pub fn is_done(t: &Json) -> bool {
+    let pieces = t.u("total_pieces");
+    let bytes = t.u("total_bytes");
+    (pieces > 0 && t.u("completed_pieces") >= pieces)
+        || (bytes > 0 && t.u("completed_bytes") >= bytes)
 }
 
 pub fn priority_name(priority: u64) -> &'static str {
@@ -1282,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn state_labels_prioritize_errors_and_pause() {
+    fn state_labels_match_the_browser() {
         let t = |s: &str| Json::parse(s).unwrap();
         assert_eq!(
             state_label(&t(r#"{"status":"error","last_error":"x"}"#)),
@@ -1296,10 +1301,19 @@ mod tests {
             state_label(&t(r#"{"status":"downloading","paused":true}"#)),
             "paused"
         );
-        assert_eq!(state_label(&t(r#"{"status":"seeding"}"#)), "seeding");
+        assert_eq!(
+            state_label(&t(
+                r#"{"status":"complete","total_pieces":2,"completed_pieces":2}"#
+            )),
+            "seeding"
+        );
         assert_eq!(
             state_label(&t(r#"{"status":"fetching metadata"}"#)),
             "metadata"
+        );
+        assert_eq!(
+            state_label(&t(r#"{"status":"waiting for peers"}"#)),
+            "waiting"
         );
     }
 }

@@ -2410,24 +2410,24 @@ fn shell_html() -> String {
     )
 }
 
-/// Embedded UI assets as `(path, content type, body)`.
+/// Embedded UI assets as `(path, content type, gzip body)`. build.rs
+/// compresses them; every browser accepts gzip, so they are always sent
+/// compressed.
 const UI_ASSETS: [(&str, &str, &[u8]); 2] = [
     (
         "/app.css",
         "text/css; charset=utf-8",
-        include_bytes!("../assets/ui/app.css"),
+        include_bytes!(concat!(env!("OUT_DIR"), "/app.css.gz")),
     ),
     (
         "/app.js",
         "text/javascript; charset=utf-8",
-        include_bytes!("../assets/ui/app.js"),
+        include_bytes!(concat!(env!("OUT_DIR"), "/app.js.gz")),
     ),
 ];
-static UI_ASSET_ETAGS: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
 
-fn asset_etag(body: &[u8]) -> String {
-    format!("\"{}\"", hex_bytes(&crate::sha1::sha1(body)))
-}
+/// Strong validator derived at build time from the compressed assets.
+const UI_ASSET_ETAG: &str = concat!("\"", env!("UI_ASSET_TAG"), "\"");
 
 fn etag_matches(if_none_match: Option<&str>, etag: &str) -> bool {
     if_none_match.is_some_and(|value| {
@@ -2442,7 +2442,7 @@ fn etag_matches(if_none_match: Option<&str>, etag: &str) -> bool {
 /// and receive `304 Not Modified` while the strong ETag still matches.
 fn send_asset(mut stream: TcpStream, request: &HttpRequest, index: usize) -> std::io::Result<()> {
     let (_, content_type, body) = UI_ASSETS[index];
-    let etag = UI_ASSET_ETAGS[index].get_or_init(|| asset_etag(body));
+    let etag = UI_ASSET_ETAG;
     let fresh = etag_matches(request.header_value("if-none-match"), etag);
     let (status, length) = if fresh {
         ("304 Not Modified", String::new())
@@ -2450,7 +2450,7 @@ fn send_asset(mut stream: TcpStream, request: &HttpRequest, index: usize) -> std
         ("200 OK", format!("Content-Length: {}\r\n", body.len()))
     };
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nETag: {etag}\r\n{SECURITY_HEADERS}{length}Connection: close\r\n\r\n"
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nCache-Control: no-cache\r\nETag: {etag}\r\n{SECURITY_HEADERS}{length}Connection: close\r\n\r\n"
     );
     stream.write_all(head.as_bytes())?;
     if !fresh && request.method == "GET" {
@@ -3291,10 +3291,13 @@ mod tests {
             assert_eq!(header(&response, "content-type"), Some(content_type));
             assert_eq!(header(&response, "cache-control"), Some("no-cache"));
             assert_eq!(header(&response, "x-content-type-options"), Some("nosniff"));
+            assert_eq!(header(&response, "content-encoding"), Some("gzip"));
             let etag = header(&response, "etag").expect("etag").to_string();
-            assert_eq!(etag, asset_etag(asset));
-            assert!(etag.starts_with('"') && etag.len() == 42);
-            assert_eq!(body(&response).as_bytes(), asset);
+            assert_eq!(etag, UI_ASSET_ETAG);
+            assert!(etag.starts_with('"') && etag.len() == 10);
+            let length = asset.len().to_string();
+            assert_eq!(header(&response, "content-length"), Some(length.as_str()));
+            assert_eq!(&asset[..3], &[0x1f, 0x8b, 8]);
 
             let request = format!(
                 "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:9473\r\nIf-None-Match: \"stale\", {etag}\r\n\r\n"
