@@ -3364,9 +3364,10 @@ fn add_command_request(
             {
                 return Err("select at least one file".to_string());
             }
-            (meta.info_hash, "torrent upload")
+            let name = String::from_utf8_lossy(&meta.info.name).into_owned();
+            (meta.info_hash, name)
         }
-        TorrentSource::Magnet(magnet) => (parse_magnet(magnet)?.info_hash, "magnet link"),
+        TorrentSource::Magnet(magnet) => (parse_magnet(magnet)?.info_hash, "magnet link".into()),
         TorrentSource::Path(_) => return Err("unsupported torrent source".to_string()),
     };
     if is_duplicate_torrent(registry, queue, session_store, in_flight, info_hash) {
@@ -3385,7 +3386,12 @@ fn add_command_request(
         initial_options: options,
         held: false,
     };
-    enqueue_request_with_label(queue, ui_state, request, label.to_string());
+    let label = if label.trim().is_empty() {
+        "torrent upload".to_string()
+    } else {
+        label
+    };
+    enqueue_request_with_label(queue, ui_state, request, label);
     Ok(torrent_id)
 }
 
@@ -3850,7 +3856,11 @@ fn label_for_source(source: &TorrentSource) -> String {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "torrent".to_string()),
-        TorrentSource::Bytes(_) => "torrent upload".to_string(),
+        TorrentSource::Bytes(data) => torrent::parse_torrent(data)
+            .ok()
+            .map(|meta| String::from_utf8_lossy(&meta.info.name).into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "torrent upload".to_string()),
         TorrentSource::Magnet(link) => match parse_magnet(link) {
             Ok(meta) => {
                 let hash = hex(&meta.info_hash);

@@ -18,7 +18,7 @@ function encode(value) {
   if (Array.isArray(value)) return Buffer.concat([Buffer.from('l'), ...value.map(encode), Buffer.from('e')]);
   return Buffer.concat([Buffer.from('d'), ...Object.keys(value).sort().flatMap(key => [encode(key), encode(value[key])]), Buffer.from('e')]);
 }
-function makeTorrent(name, files, pieceLength = 4 * MiB) {
+export function makeTorrent(name, files, pieceLength = 4 * MiB) {
   const total = files.reduce((sum, file) => sum + file.length, 0);
   const full = createHash('sha1').update(Buffer.alloc(pieceLength)).digest();
   const count = Math.ceil(total / pieceLength), rest = total % pieceLength;
