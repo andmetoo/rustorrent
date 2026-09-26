@@ -65,135 +65,110 @@ pub fn parse_feed(data: &[u8]) -> Result<(String, Vec<FeedItem>), String> {
 
 fn parse_rss(root: &xml::XmlNode) -> Result<(String, Vec<FeedItem>), String> {
     let channel = root.child("channel").ok_or("missing <channel>")?;
-    let title = channel
-        .child("title")
-        .map(|node| node.text.trim().to_string())
-        .unwrap_or_default();
-    Ok((title, parse_rss_items(channel.children_by_tag("item"))))
+    Ok((
+        text(channel, "title").to_string(),
+        parse_rss_items(channel.children_by_tag("item")),
+    ))
 }
 
 fn parse_rdf(root: &xml::XmlNode) -> Result<(String, Vec<FeedItem>), String> {
     let title = root
         .child("channel")
-        .and_then(|channel| channel.child("title"))
-        .map(|node| node.text.trim().to_string())
-        .unwrap_or_default();
-    Ok((title, parse_rss_items(root.children_by_tag("item"))))
+        .map_or("", |channel| text(channel, "title"));
+    Ok((
+        title.to_string(),
+        parse_rss_items(root.children_by_tag("item")),
+    ))
+}
+
+/// Trimmed text of the first `tag` child, or "".
+fn text<'a>(node: &'a xml::XmlNode, tag: &str) -> &'a str {
+    node.child(tag).map_or("", |child| child.text.trim())
+}
+
+/// Build an item, using the link as GUID when none is given. Items without
+/// a link or with oversized fields are dropped.
+fn feed_item(title: &str, link: &str, is_torrent: bool, guid: &str) -> Option<FeedItem> {
+    let guid = if guid.is_empty() { link } else { guid };
+    if link.is_empty()
+        || [title, link, guid]
+            .iter()
+            .any(|v| v.len() > MAX_RSS_TEXT_BYTES)
+    {
+        return None;
+    }
+    Some(FeedItem {
+        title: title.to_string(),
+        link: link.to_string(),
+        is_torrent,
+        guid: guid.to_string(),
+    })
 }
 
 fn parse_rss_items(item_nodes: Vec<&xml::XmlNode>) -> Vec<FeedItem> {
-    let mut items = Vec::new();
-    for item_node in item_nodes.into_iter().take(MAX_FEED_ITEMS) {
-        let item_title = item_node
-            .child("title")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let link = item_node
-            .child("link")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let guid = item_node
-            .child("guid")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let enclosure = item_node
-            .children_by_tag("enclosure")
-            .into_iter()
-            .find_map(|node| {
-                let url = node.attr("url")?.trim();
-                let content_type = node.attr("type").unwrap_or("");
-                (!url.is_empty() && (is_torrent_url(url) || is_torrent_content_type(content_type)))
-                    .then(|| (url.to_string(), true))
-            });
-        let magnet = item_node
-            .child("magnetURI")
-            .map(|node| node.text.trim())
-            .filter(|value| is_torrent_url(value))
-            .map(|value| (value.to_string(), true));
-        let link_is_torrent = is_torrent_url(&link);
-        let (final_link, is_torrent) = enclosure.or(magnet).unwrap_or((link, link_is_torrent));
-        let final_guid = if guid.is_empty() {
-            final_link.clone()
-        } else {
-            guid
-        };
-        if final_link.trim().is_empty()
-            || item_title.len() > MAX_RSS_TEXT_BYTES
-            || final_link.len() > MAX_RSS_TEXT_BYTES
-            || final_guid.len() > MAX_RSS_TEXT_BYTES
-        {
-            continue;
-        }
-        items.push(FeedItem {
-            title: item_title,
-            link: final_link,
-            is_torrent,
-            guid: final_guid,
-        });
-    }
-    items
+    item_nodes
+        .into_iter()
+        .take(MAX_FEED_ITEMS)
+        .filter_map(|item| {
+            let enclosure = item
+                .children_by_tag("enclosure")
+                .into_iter()
+                .find_map(|node| {
+                    let url = node.attr("url")?.trim();
+                    let content_type = node.attr("type").unwrap_or("");
+                    (!url.is_empty()
+                        && (is_torrent_url(url) || is_torrent_content_type(content_type)))
+                    .then_some(url)
+                });
+            let magnet = Some(text(item, "magnetURI")).filter(|value| is_torrent_url(value));
+            let link = text(item, "link");
+            let (link, is_torrent) = match enclosure.or(magnet) {
+                Some(url) => (url, true),
+                None => (link, is_torrent_url(link)),
+            };
+            feed_item(text(item, "title"), link, is_torrent, text(item, "guid"))
+        })
+        .collect()
 }
 
 fn parse_atom(root: &xml::XmlNode) -> Result<(String, Vec<FeedItem>), String> {
-    let title = root
-        .child("title")
-        .map(|node| node.text.trim().to_string())
-        .unwrap_or_default();
-    let mut items = Vec::new();
-    for entry in root
+    let items = root
         .children_by_tag("entry")
         .into_iter()
         .take(MAX_FEED_ITEMS)
-    {
-        let entry_title = entry
-            .child("title")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let id = entry
-            .child("id")
-            .map(|node| node.text.trim().to_string())
-            .unwrap_or_default();
-        let links = entry.children_by_tag("link");
-        let preferred = links.iter().find_map(|node| {
-            let href = node.attr("href")?.trim();
-            let rel = node.attr("rel").unwrap_or("");
-            let content_type = node.attr("type").unwrap_or("");
-            (!href.is_empty()
-                && rel.eq_ignore_ascii_case("enclosure")
-                && (is_torrent_url(href) || is_torrent_content_type(content_type)))
-            .then(|| (href.to_string(), true))
-        });
-        let torrent_link = links.iter().find_map(|node| {
-            let href = node.attr("href")?.trim();
-            is_torrent_url(href).then(|| (href.to_string(), true))
-        });
-        let fallback = links.iter().find_map(|node| {
-            let href = node.attr("href")?.trim();
-            let rel = node.attr("rel").unwrap_or("alternate");
-            (!href.is_empty() && rel.eq_ignore_ascii_case("alternate"))
-                .then(|| (href.to_string(), is_torrent_url(href)))
-        });
-        let (link, is_torrent) = preferred.or(torrent_link).or(fallback).unwrap_or_default();
-        let guid = if id.is_empty() { link.clone() } else { id };
-        if link.is_empty()
-            || entry_title.len() > MAX_RSS_TEXT_BYTES
-            || link.len() > MAX_RSS_TEXT_BYTES
-            || guid.len() > MAX_RSS_TEXT_BYTES
-        {
-            continue;
-        }
-        items.push(FeedItem {
-            title: entry_title,
-            link,
-            is_torrent,
-            guid,
-        });
-    }
-    Ok((title, items))
+        .filter_map(|entry| {
+            let links = entry.children_by_tag("link");
+            let preferred = links.iter().find_map(|node| {
+                let href = node.attr("href")?.trim();
+                let rel = node.attr("rel").unwrap_or("");
+                let content_type = node.attr("type").unwrap_or("");
+                (!href.is_empty()
+                    && rel.eq_ignore_ascii_case("enclosure")
+                    && (is_torrent_url(href) || is_torrent_content_type(content_type)))
+                .then_some((href, true))
+            });
+            let torrent_link = links.iter().find_map(|node| {
+                let href = node.attr("href")?.trim();
+                is_torrent_url(href).then_some((href, true))
+            });
+            let fallback = links.iter().find_map(|node| {
+                let href = node.attr("href")?.trim();
+                let rel = node.attr("rel").unwrap_or("alternate");
+                (!href.is_empty() && rel.eq_ignore_ascii_case("alternate"))
+                    .then(|| (href, is_torrent_url(href)))
+            });
+            let (link, is_torrent) = preferred.or(torrent_link).or(fallback).unwrap_or_default();
+            feed_item(text(entry, "title"), link, is_torrent, text(entry, "id"))
+        })
+        .collect();
+    Ok((text(root, "title").to_string(), items))
 }
 
 fn is_torrent_content_type(value: &str) -> bool {
-    value.trim().to_ascii_lowercase().contains("bittorrent")
+    value
+        .as_bytes()
+        .windows(10)
+        .any(|window| window.eq_ignore_ascii_case(b"bittorrent"))
 }
 
 fn is_torrent_url(value: &str) -> bool {
@@ -201,12 +176,8 @@ fn is_torrent_url(value: &str) -> bool {
     if is_magnet_link(value) {
         return true;
     }
-    let without_fragment = value.split('#').next().unwrap_or(value);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    without_query.to_ascii_lowercase().ends_with(".torrent")
+    let path = value.split(['#', '?']).next().unwrap_or(value).as_bytes();
+    path.len() >= 8 && path[path.len() - 8..].eq_ignore_ascii_case(b".torrent")
 }
 
 pub fn is_magnet_link(value: &str) -> bool {
@@ -346,60 +317,42 @@ pub fn save_rss_state(path: &Path, state: &RssState) -> Result<(), String> {
     {
         return Err("rss save: feed or rule text is too large".to_string());
     }
-    let feeds_list: Vec<Value> = state
-        .feeds
-        .iter()
-        .map(|feed| {
-            Value::Dict(vec![
-                (b"url".to_vec(), Value::Bytes(feed.url.as_bytes().to_vec())),
-                (
-                    b"title".to_vec(),
-                    Value::Bytes(feed.title.as_bytes().to_vec()),
-                ),
-                (
-                    b"last_poll".to_vec(),
-                    Value::Int(feed.last_poll.min(i64::MAX as u64) as i64),
-                ),
-                (
-                    b"poll_interval".to_vec(),
-                    Value::Int(feed.poll_interval_secs.min(i64::MAX as u64) as i64),
-                ),
-            ])
-        })
-        .collect();
-    let rules_list: Vec<Value> = state
-        .rules
-        .iter()
-        .map(|rule| {
-            Value::Dict(vec![
-                (
-                    b"name".to_vec(),
-                    Value::Bytes(rule.name.as_bytes().to_vec()),
-                ),
-                (
-                    b"feed_url".to_vec(),
-                    Value::Bytes(rule.feed_url.as_bytes().to_vec()),
-                ),
-                (
-                    b"pattern".to_vec(),
-                    Value::Bytes(rule.pattern.as_bytes().to_vec()),
-                ),
-            ])
-        })
-        .collect();
-    let seen_list: Vec<Value> = state
-        .seen_guids
-        .iter()
-        .map(|guid| Value::Bytes(guid.as_bytes().to_vec()))
-        .collect();
-    let dict = Value::Dict(vec![
-        (b"feeds".to_vec(), Value::List(feeds_list)),
-        (b"rules".to_vec(), Value::List(rules_list)),
-        (b"seen".to_vec(), Value::List(seen_list)),
-    ]);
-    bencode::validate_structure(&dict)
-        .map_err(|err| format!("rss save: state structure exceeds parser limits: {err}"))?;
-    let data = bencode::encode(&dict);
+    if state.seen_guids.len() > MAX_SEEN_GUIDS {
+        return Err("rss save: too many seen entries".to_string());
+    }
+    // Encode directly; keys are written in bencode (sorted) order. The
+    // bounds above keep the value count far below the parser's limits.
+    let mut data = Vec::with_capacity(4096 + state.seen_guids.len() * 72);
+    data.extend_from_slice(b"d5:feedsl");
+    for feed in &state.feeds {
+        data.extend_from_slice(b"d9:last_poll");
+        put_int(&mut data, feed.last_poll);
+        data.extend_from_slice(b"13:poll_interval");
+        put_int(&mut data, feed.poll_interval_secs);
+        put_bytes(&mut data, b"title");
+        put_bytes(&mut data, feed.title.as_bytes());
+        put_bytes(&mut data, b"url");
+        put_bytes(&mut data, feed.url.as_bytes());
+        data.push(b'e');
+    }
+    data.extend_from_slice(b"e5:rulesl");
+    for rule in &state.rules {
+        data.push(b'd');
+        for (key, value) in [
+            ("feed_url", &rule.feed_url),
+            ("name", &rule.name),
+            ("pattern", &rule.pattern),
+        ] {
+            put_bytes(&mut data, key.as_bytes());
+            put_bytes(&mut data, value.as_bytes());
+        }
+        data.push(b'e');
+    }
+    data.extend_from_slice(b"e4:seenl");
+    for guid in &state.seen_guids {
+        put_bytes(&mut data, guid.as_bytes());
+    }
+    data.extend_from_slice(b"ee");
     write_atomic(path, &data, true)
 }
 
@@ -517,6 +470,17 @@ fn parse_rss_state(data: &[u8]) -> Result<RssState, String> {
         state.seen_guids.reverse();
     }
     Ok(state)
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    use std::io::Write;
+    let _ = write!(out, "{}:", bytes.len());
+    out.extend_from_slice(bytes);
+}
+
+fn put_int(out: &mut Vec<u8>, value: u64) {
+    use std::io::Write;
+    let _ = write!(out, "i{}e", value.min(i64::MAX as u64));
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -728,6 +692,52 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn direct_state_encoding_matches_the_generic_encoder() {
+        let path = temp_file("encoding");
+        let mut state = RssState::new();
+        state.feeds.push(RssFeed {
+            url: "https://example.com/rss".to_string(),
+            title: "Tïtle".to_string(),
+            items: Vec::new(),
+            last_poll: u64::MAX,
+            poll_interval_secs: 900,
+        });
+        state.rules.push(RssRule {
+            name: "r".to_string(),
+            feed_url: String::new(),
+            pattern: "*x*".to_string(),
+        });
+        state.seen_guids = vec!["a".to_string(), "bb".to_string()];
+        save_rss_state(&path, &state).unwrap();
+        let text = |value: &str| Value::Bytes(value.as_bytes().to_vec());
+        let expected = bencode::encode(&Value::Dict(vec![
+            (
+                b"feeds".to_vec(),
+                Value::List(vec![Value::Dict(vec![
+                    (b"url".to_vec(), text("https://example.com/rss")),
+                    (b"title".to_vec(), text("Tïtle")),
+                    (b"last_poll".to_vec(), Value::Int(i64::MAX)),
+                    (b"poll_interval".to_vec(), Value::Int(900)),
+                ])]),
+            ),
+            (
+                b"rules".to_vec(),
+                Value::List(vec![Value::Dict(vec![
+                    (b"name".to_vec(), text("r")),
+                    (b"feed_url".to_vec(), text("")),
+                    (b"pattern".to_vec(), text("*x*")),
+                ])]),
+            ),
+            (b"seen".to_vec(), Value::List(vec![text("a"), text("bb")])),
+        ]));
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        let loaded = load_rss_state(&path).unwrap();
+        assert_eq!(loaded.feeds[0].title, "Tïtle");
+        assert_eq!(loaded.seen_guids, ["a", "bb"]);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
