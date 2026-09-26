@@ -216,6 +216,8 @@ impl Storage {
         file_renames: &[(usize, String)],
     ) -> Result<Self, Error> {
         let mut layouts = build_layout(meta, download_dir)?;
+        #[cfg(unix)]
+        raise_open_file_limit();
         apply_saved_file_renames(&mut layouts, file_renames)?;
         validate_no_reserved_state_paths(download_dir, &layouts)?;
         fs::create_dir_all(download_dir)?;
@@ -300,6 +302,8 @@ impl Storage {
         file_renames: &[(usize, String)],
     ) -> Result<Self, Error> {
         let mut layouts = build_layout(meta, download_dir)?;
+        #[cfg(unix)]
+        raise_open_file_limit();
         apply_saved_file_renames(&mut layouts, file_renames)?;
         let total_length = layouts.iter().try_fold(0u64, |end, layout| {
             layout
@@ -570,6 +574,38 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+/// Every payload file stays open for the lifetime of `Storage` (pinned
+/// identity and exclusive lock), so a multi-file torrent needs one
+/// descriptor per file. Default soft limits (256 on macOS, often 1024 on
+/// Linux) fail larger torrents with EMFILE, so raise the soft limit once
+/// toward the hard limit.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // macOS rejects soft limits above OPEN_MAX (10240).
+        let cap: libc::rlim_t = if cfg!(target_os = "macos") {
+            10_240
+        } else {
+            65_536
+        };
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit/setrlimit only read or write the given struct.
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                let target = limit.rlim_max.min(cap);
+                if limit.rlim_cur < target {
+                    limit.rlim_cur = target;
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+                }
+            }
+        }
+    });
 }
 
 fn is_disk_full(err: &std::io::Error) -> bool {
@@ -1880,6 +1916,22 @@ mod tests {
         assert_eq!(out, [2, 2, 2, 1, 1, 1, 0, 0]);
         drop(storage);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_file_limit_is_raised_toward_the_hard_limit() {
+        raise_open_file_limit();
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the given struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert!(limit.rlim_cur >= limit.rlim_max.min(10_240));
     }
 
     #[test]
