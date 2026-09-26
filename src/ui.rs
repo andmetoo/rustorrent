@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{Read, Write};
@@ -689,10 +690,18 @@ fn handle_connection(
         return send_api_error_with_status(stream, 404, "unknown endpoint");
     }
 
+    if let Some(index) = UI_ASSETS.iter().position(|(asset, _, _)| *asset == path) {
+        if request.method == "GET" || request.method == "HEAD" {
+            return send_asset(stream, &request, index);
+        }
+    }
+
     if request.method == "HEAD" {
         let content_type = match path.as_str() {
             "/" | "/index.html" => "text/html; charset=utf-8",
-            "/status" | "/search/status" | "/search/catalog" | "/rss/status" => "application/json",
+            "/status" | "/search/status" | "/search/catalog" | "/rss/status" | "/torrent/files" => {
+                "application/json"
+            }
             _ => return send_api_error_with_status(stream, 404, "unknown endpoint"),
         };
         return send_head(stream, content_type);
@@ -717,16 +726,31 @@ fn handle_connection(
         return send_json_body(stream, 200, &body);
     }
 
-    if path != "/status" && path != "/" && path != "/index.html" {
-        return send_api_error_with_status(stream, 404, "unknown endpoint");
+    if path == "/torrent/files" {
+        let body = query_value(&query, "id")
+            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|id| {
+                let guard = lock_state(&state);
+                guard
+                    .torrents
+                    .iter()
+                    .find(|torrent| torrent.id == id)
+                    .map(torrent_files_json)
+            });
+        return match body {
+            Some(body) => send_json_body(stream, 200, &body),
+            None => send_api_error_with_status(stream, 404, "unknown torrent"),
+        };
     }
 
-    let mut guard = lock_state(&state);
-    guard.paused = is_paused();
-    let (content_type, body) = if path == "/status" {
-        ("application/json", status_json(&guard))
-    } else {
-        ("text/html; charset=utf-8", status_html(&guard))
+    let (content_type, body) = match path.as_str() {
+        "/status" => {
+            let mut guard = lock_state(&state);
+            guard.paused = is_paused();
+            ("application/json", status_json(&guard))
+        }
+        "/" | "/index.html" => ("text/html; charset=utf-8", shell_html()),
+        _ => return send_api_error_with_status(stream, 404, "unknown endpoint"),
     };
 
     let response = format!(
@@ -761,7 +785,7 @@ const SECURITY_HEADERS: &str = concat!(
     "Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n",
     "Content-Security-Policy: default-src 'self'; base-uri 'none'; object-src 'none'; ",
     "frame-ancestors 'none'; img-src 'self' data:; connect-src 'self'; ",
-    "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'\r\n",
+    "style-src 'self'; script-src 'self' 'sha256-zYHSzMDcF6ayyMRW5P7uibEVSRGbs8AikYgdvoLIdvo='\r\n",
 );
 
 fn post_body_limit(path: &str) -> Option<usize> {
@@ -2263,35 +2287,32 @@ fn api_token_json(token: &str, owner_secret: &str) -> String {
     )
 }
 
+const SSE_INTERVAL: Duration = Duration::from_millis(450);
+
+/// Streams `status` events whose JSON payload is a delta against the previous
+/// event: `g` holds session fields, `t` the torrents that changed (without file
+/// lists) and `ids` the library order whenever it changes. The first event of a
+/// connection carries all three.
 fn handle_sse(mut stream: TcpStream, state: Arc<Mutex<UiState>>) -> std::io::Result<()> {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{SECURITY_HEADERS}Connection: keep-alive\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{SECURITY_HEADERS}Connection: keep-alive\r\n\r\nretry: 1500\n\n"
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
 
-    let mut last_payload = String::new();
-    let mut last_ping = Instant::now();
+    let mut snapshot = SseSnapshot::default();
+    let mut last_write = Instant::now();
     loop {
-        let payload = {
-            let guard = lock_state(&state);
-            app_body_html(&guard)
-        };
-        if payload != last_payload {
-            if write_sse_event(&mut stream, "status", &payload).is_err() {
-                break;
-            }
-            last_payload = payload;
-            last_ping = Instant::now();
-        } else if last_ping.elapsed() > Duration::from_secs(15) {
-            if write_sse_comment(&mut stream, "ping").is_err() {
-                break;
-            }
-            last_ping = Instant::now();
+        let delta = sse_delta(&lock_state(&state), &mut snapshot);
+        if let Some(payload) = delta {
+            write_sse_event(&mut stream, "status", &payload)?;
+            last_write = Instant::now();
+        } else if last_write.elapsed() > Duration::from_secs(15) {
+            write_sse_comment(&mut stream, "ping")?;
+            last_write = Instant::now();
         }
-        thread::sleep(Duration::from_millis(450));
+        thread::sleep(SSE_INTERVAL);
     }
-    Ok(())
 }
 
 fn write_sse_event(stream: &mut TcpStream, event: &str, data: &str) -> std::io::Result<()> {
@@ -2310,979 +2331,389 @@ fn write_sse_comment(stream: &mut TcpStream, comment: &str) -> std::io::Result<(
     stream.flush()
 }
 
-fn status_html(state: &UiState) -> String {
-    let mut out = String::with_capacity(5200 + state.torrents.len() * 2200);
-    out.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"icon\" href=\"data:,\">");
-    out.push_str("<title>rustorrent</title>");
-    out.push_str(&format!(
-        "<meta name=\"rustorrent-api-token\" content=\"{}\">",
-        escape_html(api_token())
-    ));
-    out.push_str("<script>try{var t=localStorage.getItem('rustorrent-theme');if(t!=='light'&&t!=='dark'){t='light';}document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>");
-    out.push_str("<style>");
-    out.push_str(include_str!("../assets/ui/app.css"));
-    out.push_str(include_str!("../assets/ui/beta.css"));
-    out.push_str("</style></head><body>");
-    out.push_str(r##"<svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true"><defs><symbol id="i-add" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="i-archive" viewBox="0 0 24 24"><path d="M4 8.5h16V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/><path d="M3.5 4.5h17v4h-17z"/><path d="M10 12h4"/></symbol><symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2.5 4.5 13.5H11l-1 8 8.5-11.5H12z"/></symbol><symbol id="i-check" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></symbol><symbol id="i-check_circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.4 2.4L15.6 9"/></symbol><symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M6 18 18 6"/></symbol><symbol id="i-cloud_download" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.6-7.96 5.5 5.5 0 0 1 10.7-1.05A4 4 0 0 1 17.2 18"/><path d="M12 11.5v6.5m0 0-2.4-2.4M12 18l2.4-2.4"/></symbol><symbol id="i-cloud_upload" viewBox="0 0 24 24"><path d="M7 18a4 4 0 0 1-.6-7.96 5.5 5.5 0 0 1 10.7-1.05A4 4 0 0 1 17.2 18"/><path d="M12 18.5V12m0 0-2.4 2.4M12 12l2.4 2.4"/></symbol><symbol id="i-dark_mode" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4 7 7 0 1 0 20 14.5z"/></symbol><symbol id="i-delete" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 12.1a1 1 0 0 0 1 .9h8a1 1 0 0 0 1-.9L18 7"/><path d="M10 11v5M14 11v5"/></symbol><symbol id="i-description" viewBox="0 0 24 24"><path d="M14 3.5v5h5"/><path d="M14 3.5H6.5a1 1 0 0 0-1 1v15a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V8.5z"/><path d="M9 13h6M9 16.5h4"/></symbol><symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4-4m4 4 4-4"/><path d="M5 20h14"/></symbol><symbol id="i-downloading" viewBox="0 0 24 24"><path d="M12 3.5v8m0 0-3-3m3 3 3-3"/><path d="M5.2 14a7 7 0 0 0 13.6 0"/></symbol><symbol id="i-error" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5h.01"/></symbol><symbol id="i-extension" viewBox="0 0 24 24"><path d="M9 5.2a2 2 0 1 1 4 0V6h2.8a1 1 0 0 1 1 1v2.8h.7a2 2 0 1 1 0 4h-.7V17a1 1 0 0 1-1 1H13v-.8a2 2 0 1 0-4 0V18H6.2a1 1 0 0 1-1-1v-3h-.7a2 2 0 1 1 0-4h.7V7.2a1 1 0 0 1 1-1H9z"/></symbol><symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 6.5a1 1 0 0 1 1-1H10l2 2h7.5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/></symbol><symbol id="i-folder_open" viewBox="0 0 24 24"><path d="M3.5 7a1 1 0 0 1 1-1H10l2 2h7.5a1 1 0 0 1 1 1v1.5H7a1 1 0 0 0-.95.68"/><path d="m3.6 18.5 2.2-7a1 1 0 0 1 .95-.7H21l-2.2 7a1 1 0 0 1-.95.7H4.5a1 1 0 0 1-1-1z"/></symbol><symbol id="i-grid_view" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.4"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.4"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.4"/></symbol><symbol id="i-group" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 19a6 6 0 0 1 12 0"/><path d="M16 5.2a3 3 0 0 1 0 5.6"/><path d="M18 19a6 6 0 0 0-3-5.2"/></symbol><symbol id="i-hub" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.3"/><circle cx="12" cy="4.2" r="1.8"/><circle cx="12" cy="19.8" r="1.8"/><circle cx="5" cy="8" r="1.8"/><circle cx="19" cy="8" r="1.8"/><path d="M12 6v3.7M10.2 11 6.5 8.9M13.8 11l3.7-2.1M12 14.3v3.7"/></symbol><symbol id="i-label" viewBox="0 0 24 24"><path d="M4 6.5a1 1 0 0 1 1-1h9.3a1 1 0 0 1 .78.37l4.6 5.5a1 1 0 0 1 0 1.26l-4.6 5.5a1 1 0 0 1-.78.37H5a1 1 0 0 1-1-1z"/><circle cx="8" cy="12" r="1.1"/></symbol><symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12"/><path d="M3.6 6h.01M3.6 12h.01M3.6 18h.01"/></symbol><symbol id="i-manage_search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m20 20-5.2-5.2"/></symbol><symbol id="i-pause_circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/></symbol><symbol id="i-queue" viewBox="0 0 24 24"><path d="M4 7h11M4 12h11M4 17h7"/><path d="M18 13v6M15 16h6"/></symbol><symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 4v5h-5"/></symbol><symbol id="i-rss_feed" viewBox="0 0 24 24"><circle cx="6" cy="18" r="1.6"/><path d="M4.5 11a8.5 8.5 0 0 1 8.5 8.5"/><path d="M4.5 5a14.5 14.5 0 0 1 14.5 14.5"/></symbol><symbol id="i-schedule" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5l3.4 2"/></symbol><symbol id="i-stop" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="2.5"/></symbol><symbol id="i-swap_vert" viewBox="0 0 24 24"><path d="M7 4.5v15m0 0-3-3m3 3 3-3"/><path d="M17 19.5v-15m0 0-3 3m3-3 3 3"/></symbol><symbol id="i-system_update" viewBox="0 0 24 24"><rect x="7" y="3" width="10" height="18" rx="2"/><path d="M12 7v6m0 0-2.2-2.2M12 13l2.2-2.2"/></symbol><symbol id="i-travel_explore" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M4 10.5h13"/><path d="M10.5 4a12 12 0 0 1 0 13M10.5 4a12 12 0 0 0 0 13"/><path d="m19.5 19.5-2.4-2.4"/></symbol><symbol id="i-unfold_less" viewBox="0 0 24 24"><path d="m8 5.5 4 4 4-4"/><path d="m8 18.5 4-4 4 4"/></symbol><symbol id="i-unfold_more" viewBox="0 0 24 24"><path d="m8 9.5 4-4 4 4"/><path d="m8 14.5 4 4 4-4"/></symbol><symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 20V9m0 0-4 4m4-4 4 4"/><path d="M5 4.5h14"/></symbol><symbol id="i-upload_file" viewBox="0 0 24 24"><path d="M14 3.5v5h5"/><path d="M14 3.5H6.5a1 1 0 0 0-1 1v15a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V8.5z"/><path d="M12 18v-5m0 0-2 2m2-2 2 2"/></symbol><symbol id="i-verified" viewBox="0 0 24 24"><path d="M12 3.2 5 6v6c0 4 3 6.7 7 8 4-1.3 7-4 7-8V6z"/><path d="m9 12 2 2 4-4"/></symbol><symbol id="i-play_arrow" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M8 5.6v12.8a1 1 0 0 0 1.52.86l10.5-6.4a1 1 0 0 0 0-1.72L9.52 4.74A1 1 0 0 0 8 5.6z"/></symbol><symbol id="i-pause" viewBox="0 0 24 24"><rect x="7" y="5" width="3.4" height="14" rx="1.1" fill="currentColor" stroke="none"/><rect x="13.6" y="5" width="3.4" height="14" rx="1.1" fill="currentColor" stroke="none"/></symbol><symbol id="i-light_mode" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6"/></symbol><symbol id="i-arrow_upward" viewBox="0 0 24 24"><path d="M12 20V5m0 0-6 6m6-6 6 6"/></symbol><symbol id="i-arrow_downward" viewBox="0 0 24 24"><path d="M12 4v15m0 0-6-6m6 6 6-6"/></symbol></defs></svg>"##);
-    out.push_str("<div class=\"app\" id=\"appRoot\">");
-    out.push_str(&app_body_html(state));
-    out.push_str("</div>");
-    out.push_str("<script>");
-    out.push_str(include_str!("../assets/ui/app.js"));
-    out.push_str("</script>");
-    out.push_str("</body></html>");
-    out
+#[derive(Default)]
+struct SseSnapshot {
+    session: String,
+    torrents: HashMap<u64, String>,
+    ids: Option<Vec<u64>>,
 }
 
-fn render_search_panel(out: &mut String) {
-    out.push_str("<div class=\"panel\">");
-    out.push_str("<div class=\"panel-title\"><svg class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\"><use href=\"#i-travel_explore\"></use></svg>Torrent Search</div>");
-    out.push_str("<form class=\"search-form\" onsubmit=\"submitSearchQuery(event)\">");
-    out.push_str("<input id=\"searchQuery\" class=\"input\" type=\"search\" placeholder=\"Search public torrent plugins\" autocomplete=\"off\">");
-    out.push_str("<select id=\"searchCategory\" class=\"input\">");
-    out.push_str("<option value=\"all\">All categories</option>");
-    out.push_str("<option value=\"anime\">Anime</option>");
-    out.push_str("<option value=\"books\">Books</option>");
-    out.push_str("<option value=\"games\">Games</option>");
-    out.push_str("<option value=\"movies\">Movies</option>");
-    out.push_str("<option value=\"music\">Music</option>");
-    out.push_str("<option value=\"pictures\">Pictures</option>");
-    out.push_str("<option value=\"software\">Software</option>");
-    out.push_str("<option value=\"tv\">TV</option>");
-    out.push_str("</select>");
-    out.push_str(
-        "<div id=\"searchPluginError\" class=\"search-alert\" style=\"display:none\"></div>",
-    );
-    out.push_str("<div id=\"searchSelectionSummary\" class=\"search-selection-summary\">Loading plugin selection...</div>");
-    out.push_str(
-        "<div id=\"searchPluginWarning\" class=\"search-warning\" style=\"display:none\"></div>",
-    );
-    out.push_str("<div class=\"search-panel-actions\">");
-    out.push_str("<button type=\"submit\" class=\"btn primary\">Search</button>");
-    out.push_str("</div>");
-    out.push_str("</form>");
-    out.push_str(
-        "<div class=\"search-note\">Search uses your enabled plugins. Open Plugins from the results header when you want to manage sources.</div>",
-    );
-    out.push_str("</div>");
-}
+fn sse_delta(state: &UiState, previous: &mut SseSnapshot) -> Option<String> {
+    let mut session = String::new();
+    let mut fields = JsonObject::new(&mut session);
+    push_session_fields(&mut fields, state);
+    fields.finish();
 
-fn render_search_results_panel(out: &mut String) {
-    out.push_str("<div class=\"panel search-results-panel search-main-panel active\" data-search-view=\"results\">");
-    out.push_str("<div class=\"panel-head\">");
-    out.push_str("<div><div class=\"panel-title\"><svg class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\"><use href=\"#i-manage_search\"></use></svg>Search Results</div>");
-    out.push_str("<div class=\"small\" id=\"searchStatusText\">Install a plugin and run a search to populate results.</div></div>");
-    out.push_str("<div class=\"search-plugin-manager-tools\">");
-    out.push_str("<button class=\"btn ghost\" type=\"button\" data-search-view-target=\"plugins\"><svg class=\"material-symbols-rounded\"><use href=\"#i-extension\"></use></svg>Plugins</button>");
-    out.push_str("<button class=\"btn ghost panel-toggle\" type=\"button\" onclick=\"loadSearchStatus(true)\"><svg class=\"material-symbols-rounded\"><use href=\"#i-refresh\"></use></svg>Refresh</button>");
-    out.push_str("</div>");
-    out.push_str("</div>");
-    out.push_str("<div id=\"searchResults\" class=\"search-results-grid\"><div class=\"search-results-empty\">No search results yet.</div></div>");
-    out.push_str("</div>");
-}
-
-fn render_search_plugin_manager(out: &mut String) {
-    out.push_str("<div class=\"panel search-plugin-manager search-main-panel\" data-search-view=\"plugins\">");
-    out.push_str("<div class=\"search-plugin-manager-head\">");
-    out.push_str("<div class=\"panel-title\"><svg class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\"><use href=\"#i-extension\"></use></svg>Plugins</div>");
-    out.push_str("<div class=\"search-plugin-manager-tools\">");
-    out.push_str("<button type=\"button\" class=\"btn ghost\" onclick=\"updateInstalledCatalogPlugins()\"><svg class=\"material-symbols-rounded\"><use href=\"#i-system_update\"></use></svg>Update All</button>");
-    out.push_str("<button type=\"button\" class=\"btn ghost\" data-search-view-target=\"results\"><svg class=\"material-symbols-rounded\"><use href=\"#i-close\"></use></svg>Close</button>");
-    out.push_str("</div>");
-    out.push_str("</div>");
-    // Installed section
-    out.push_str("<div class=\"rss-section-label\">Installed</div>");
-    out.push_str("<div id=\"searchPluginList\" class=\"search-plugin-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading...</span></div></div>");
-    // Quick install
-    out.push_str("<div style=\"display:flex;gap:6px;margin-top:10px;align-items:center\">");
-    out.push_str("<form class=\"rss-form\" style=\"flex:1;margin:0\" onsubmit=\"installSearchPluginUrl(event)\">");
-    out.push_str("<input id=\"searchPluginUrl\" class=\"input\" placeholder=\"https://.../plugin.py\" style=\"height:30px;font-size:12px\">");
-    out.push_str("</form>");
-    out.push_str("<button type=\"button\" class=\"btn primary\" style=\"height:30px;font-size:12px;padding:0 10px\" onclick=\"document.getElementById('searchPluginUrl')&&installSearchPluginUrl()\">Install URL</button>");
-    out.push_str("<label class=\"btn ghost search-upload-label\" style=\"height:30px;font-size:12px;padding:0 10px\"><svg class=\"material-symbols-rounded\" style=\"font-size:14px\"><use href=\"#i-upload_file\"></use></svg>Upload .py<input id=\"searchPluginFile\" type=\"file\" accept=\".py\" onchange=\"installSearchPluginFile(event)\"></label>");
-    out.push_str("</div>");
-    // Community catalog
-    out.push_str("<div class=\"rss-section-label\" style=\"margin-top:12px\">Community Catalog <button type=\"button\" class=\"btn ghost\" title=\"Refresh catalog\" aria-label=\"Refresh catalog\" style=\"padding:0 6px;height:20px;font-size:11px;vertical-align:1px\" onclick=\"loadSearchCatalog(true)\"><svg class=\"material-symbols-rounded\" style=\"font-size:13px\" aria-hidden=\"true\"><use href=\"#i-refresh\"></use></svg></button></div>");
-    out.push_str(
-        "<div id=\"searchCatalogMeta\" class=\"small\">Loading community plugins...</div>",
-    );
-    out.push_str("<input id=\"searchCatalogFilter\" class=\"input\" type=\"search\" placeholder=\"Filter...\" autocomplete=\"off\" style=\"height:28px;padding:0 8px;font-size:12px;margin-top:4px\">");
-    out.push_str("<div id=\"searchCatalog\" class=\"search-catalog-list\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading...</span></div></div>");
-    // Recommended
-    out.push_str("<div class=\"rss-section-label\" style=\"margin-top:12px\">Quick Start</div>");
-    out.push_str("<div class=\"small\">Popular public plugins for general search.</div>");
-    out.push_str("<div id=\"searchRecommended\"><div class=\"rss-item\"><span class=\"rss-item-info\">Loading...</span></div></div>");
-    out.push_str("</div>");
-}
-
-fn app_body_html(state: &UiState) -> String {
-    let mut out = String::with_capacity(4200 + state.torrents.len() * 2000);
-    let _last_added = escape_html(&state.last_added);
-    let total_torrents = state.torrents.len();
-    let download_dir = escape_html(&state.download_dir);
-    let total_downloaded_bytes = state.session_downloaded_bytes;
-    let total_uploaded_bytes = state.session_uploaded_bytes;
-    let total_downloaded = human_bytes(total_downloaded_bytes);
-    let total_uploaded = human_bytes(total_uploaded_bytes);
-    let download_limit_kbps = state.global_download_limit_bps / 1024;
-    let upload_limit_kbps = state.global_upload_limit_bps / 1024;
-    let peer_profile = match state.peer_profile.as_str() {
-        "conservative" | "aggressive" => state.peer_profile.as_str(),
-        _ => "balanced",
-    };
-    let total_tracker_peers: usize = state.torrents.iter().map(|t| t.tracker_peers).sum();
-    let total_active_peers: usize = state.torrents.iter().map(|t| t.active_peers).sum();
-
-    let mut downloading = 0usize;
-    let mut complete = 0usize;
-    let mut paused = 0usize;
-    let mut errored = 0usize;
-    let mut queued = 0usize;
-    let is_complete_torrent = |torrent: &UiTorrent| -> bool {
-        (torrent.total_pieces > 0 && torrent.completed_pieces >= torrent.total_pieces)
-            || (torrent.total_bytes > 0 && torrent.completed_bytes >= torrent.total_bytes)
-    };
-    let bucket_for = |torrent: &UiTorrent| -> &'static str {
-        let status = torrent.status.as_str();
-        if torrent.paused || matches!(status, "paused" | "stopped" | "stopping") {
-            return "paused";
-        }
-        if status == "queued" {
-            return "queued";
-        }
-        if status.contains("error") || status.contains("failed") {
-            return "error";
-        }
-        if is_complete_torrent(torrent) {
-            return "complete";
-        }
-        "downloading"
-    };
+    let ids: Vec<u64> = state.torrents.iter().map(|torrent| torrent.id).collect();
+    let mut torrents = HashMap::with_capacity(ids.len());
+    let mut changed = String::new();
     for torrent in &state.torrents {
-        match bucket_for(torrent) {
-            "downloading" => downloading += 1,
-            "complete" => complete += 1,
-            "paused" => paused += 1,
-            "error" => errored += 1,
-            "queued" => queued += 1,
-            _ => {}
+        let mut json = String::new();
+        push_torrent_json(&mut json, torrent, false);
+        if previous.torrents.get(&torrent.id) != Some(&json) {
+            changed.push(if changed.is_empty() { '[' } else { ',' });
+            changed.push_str(&json);
         }
+        torrents.insert(torrent.id, json);
     }
-    let (fleet_state, fleet_signal, fleet_copy) = if errored > 0 {
-        (
-            "Needs attention",
-            "error",
-            "One or more torrents reported an error. Open the affected item for details.",
-        )
-    } else if state.download_rate_bps > 0.0 {
-        (
-            "Downloading",
-            "live",
-            "Receiving files from connected peers.",
-        )
-    } else if state.upload_rate_bps > 0.0 {
-        (
-            "Seeding now",
-            "live",
-            "Verified pieces are being served to peers. Upload rate reflects actual peer requests.",
-        )
-    } else if downloading > 0 {
-        (
-            "Waiting for peers",
-            "",
-            "Transfers will begin when a reachable peer has the requested pieces.",
-        )
-    } else if complete > 0 {
-        (
-            "Ready to seed",
-            "live",
-            "Completed torrents stay available. Uploads begin when interested peers request pieces.",
-        )
-    } else if queued > 0 {
-        (
-            "Queued",
-            "",
-            "Torrents are waiting for an active slot or metadata before transfer begins.",
-        )
-    } else if total_torrents == 0 {
-        ("Ready", "", "Your transfers will appear here.")
+
+    let mut payload = String::new();
+    let mut delta = JsonObject::new(&mut payload);
+    if previous.session != session {
+        delta.key("g").push_str(&session);
+    }
+    if !changed.is_empty() {
+        changed.push(']');
+        delta.key("t").push_str(&changed);
+    }
+    if previous.ids.as_ref() != Some(&ids) {
+        let out = delta.key("ids");
+        out.push('[');
+        for (index, id) in ids.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{id}");
+        }
+        out.push(']');
+    }
+    let unchanged = delta.empty;
+    delta.finish();
+    previous.session = session;
+    previous.torrents = torrents;
+    previous.ids = Some(ids);
+    (!unchanged).then_some(payload)
+}
+
+/// Runs before first paint so the saved or system appearance applies without a
+/// flash. Its SHA-256 is allowed by `script-src` in `SECURITY_HEADERS`; a unit
+/// test keeps the two in sync.
+const THEME_BOOTSTRAP: &str = "try{var t=localStorage.getItem('rustorrent-theme');if(t!=='light'&&t!=='dark')t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.dataset.theme=t}catch(e){}";
+
+/// The page is a small shell; `app.js` renders everything from `/events`.
+fn shell_html() -> String {
+    format!(
+        concat!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+            "<meta name=\"rustorrent-api-token\" content=\"{token}\">",
+            "<title>Rustorrent</title>",
+            "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>",
+            "<rect width='32' height='32' rx='8' fill='%232563d9'/><path d='M16 7v13m-5-5 5 5 5-5M10 25h12' ",
+            "fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/></svg>\">",
+            "<script>{boot}</script><link rel=\"stylesheet\" href=\"/app.css\">",
+            "<script src=\"/app.js\" defer></script></head>",
+            "<body><div id=\"app\"></div><noscript>Rustorrent needs JavaScript.</noscript></body></html>"
+        ),
+        token = api_token(),
+        boot = THEME_BOOTSTRAP
+    )
+}
+
+/// Embedded UI assets as `(path, content type, body)`.
+const UI_ASSETS: [(&str, &str, &[u8]); 2] = [
+    (
+        "/app.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../assets/ui/app.css"),
+    ),
+    (
+        "/app.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../assets/ui/app.js"),
+    ),
+];
+static UI_ASSET_ETAGS: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+
+fn asset_etag(body: &[u8]) -> String {
+    format!("\"{}\"", hex_bytes(&crate::sha1::sha1(body)))
+}
+
+fn etag_matches(if_none_match: Option<&str>, etag: &str) -> bool {
+    if_none_match.is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag)
+    })
+}
+
+/// Serves an embedded asset. Browsers revalidate on every load (`no-cache`)
+/// and receive `304 Not Modified` while the strong ETag still matches.
+fn send_asset(mut stream: TcpStream, request: &HttpRequest, index: usize) -> std::io::Result<()> {
+    let (_, content_type, body) = UI_ASSETS[index];
+    let etag = UI_ASSET_ETAGS[index].get_or_init(|| asset_etag(body));
+    let fresh = etag_matches(request.header_value("if-none-match"), etag);
+    let (status, length) = if fresh {
+        ("304 Not Modified", String::new())
     } else {
-        (
-            "Idle",
-            "warn",
-            "No active peer traffic right now. Trackers and DHT continue looking for peers.",
-        )
+        ("200 OK", format!("Content-Length: {}\r\n", body.len()))
     };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nETag: {etag}\r\n{SECURITY_HEADERS}{length}Connection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes())?;
+    if !fresh && request.method == "GET" {
+        stream.write_all(body)?;
+    }
+    Ok(())
+}
 
-    out.push_str("<header class=\"appbar\">");
-    out.push_str("<div class=\"appbar-main\">");
-    out.push_str("<div class=\"brand\">");
-    out.push_str(
-        "<div class=\"brand-icon\"><svg class=\"material-symbols-rounded\"><use href=\"#i-downloading\"></use></svg></div>",
-    );
-    out.push_str("<div><div class=\"title\">Rustorrent</div>");
-    out.push_str("<div class=\"sub\">Small app. Shared files.</div></div>");
-    out.push_str("</div>");
-    out.push_str("<div class=\"app-tabs\">");
-    out.push_str("<button class=\"tab-btn active\" type=\"button\" data-main-tab-target=\"library\"><svg class=\"material-symbols-rounded\"><use href=\"#i-folder\"></use></svg>Library</button>");
-    out.push_str("<button class=\"tab-btn\" type=\"button\" data-main-tab-target=\"search\"><svg class=\"material-symbols-rounded\"><use href=\"#i-travel_explore\"></use></svg>Search</button>");
-    out.push_str("</div>");
-    out.push_str("</div>");
-    out.push_str("<div class=\"app-actions\">");
-    out.push_str(&format!(
-        "<div class=\"header-rate\" aria-label=\"Download speed\"><span>Download</span><strong>↓ {}</strong></div>", human_rate(state.download_rate_bps)
-    ));
-    out.push_str(&format!("<div class=\"header-rate\" aria-label=\"Upload speed\"><span>Upload</span><strong>↑ {}</strong></div>", human_rate(state.upload_rate_bps)));
-    out.push_str("<div class=\"toolbar\">");
-    out.push_str(
-        "<button class=\"btn primary\" type=\"button\" onclick=\"openAdd()\"><svg class=\"material-symbols-rounded\"><use href=\"#i-add\"></use></svg>Add Torrent</button>",
-    );
-    out.push_str(
-        "<button class=\"btn icon-btn ghost\" id=\"themeToggle\" type=\"button\" title=\"Toggle theme\"><svg class=\"material-symbols-rounded\"><use href=\"#i-dark_mode\"></use></svg></button>",
-    );
-    out.push_str("</div>");
-    out.push_str("</div>");
-    out.push_str("</header>");
+/// Minimal JSON object writer that appends straight into a `String`.
+struct JsonObject<'a> {
+    out: &'a mut String,
+    empty: bool,
+}
 
-    out.push_str("<div class=\"layout workspace active\" data-main-tab=\"library\">");
+impl<'a> JsonObject<'a> {
+    fn new(out: &'a mut String) -> Self {
+        out.push('{');
+        Self { out, empty: true }
+    }
 
-    out.push_str("<aside class=\"sidebar\">");
-    out.push_str("<div class=\"panel\">");
-    out.push_str("<div class=\"panel-title\">Library</div>");
-    out.push_str(
-        "<input id=\"librarySearch\" class=\"input\" type=\"search\" placeholder=\"Search torrents\" autocomplete=\"off\" style=\"margin-top:8px\">",
-    );
-    out.push_str("<div class=\"nav\">");
-    out.push_str(&format!(
-        "<button class=\"nav-item active\" type=\"button\" data-filter=\"all\"><span class=\"nav-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-list\"></use></svg>All</span><span class=\"count\">{}</span></button>",
-        state.torrents.len()
-    ));
-    out.push_str(&format!(
-        "<button class=\"nav-item\" type=\"button\" data-filter=\"downloading\"><span class=\"nav-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-download\"></use></svg>Downloading</span><span class=\"count\">{downloading}</span></button>"
-    ));
-    out.push_str(&format!(
-        "<button class=\"nav-item\" type=\"button\" data-filter=\"complete\"><span class=\"nav-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-check_circle\"></use></svg>Complete</span><span class=\"count\">{complete}</span></button>"
-    ));
-    out.push_str(&format!(
-        "<button class=\"nav-item\" type=\"button\" data-filter=\"paused\"><span class=\"nav-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-pause_circle\"></use></svg>Paused</span><span class=\"count\">{paused}</span></button>"
-    ));
-    out.push_str(&format!(
-        "<button class=\"nav-item\" type=\"button\" data-filter=\"queued\"><span class=\"nav-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-schedule\"></use></svg>Queued</span><span class=\"count\">{queued}</span></button>"
-    ));
-    out.push_str(&format!(
-        "<button class=\"nav-item\" type=\"button\" data-filter=\"error\"><span class=\"nav-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-error\"></use></svg>Errors</span><span class=\"count\">{errored}</span></button>"
-    ));
-    // Label filter buttons
-    {
-        let mut labels: Vec<String> = state
-            .torrents
-            .iter()
-            .filter(|t| !t.label.is_empty())
-            .map(|t| t.label.clone())
-            .collect();
-        labels.sort();
-        labels.dedup();
-        for lbl in &labels {
-            let count = state.torrents.iter().filter(|t| t.label == *lbl).count();
-            out.push_str(&format!(
-                "<button class=\"nav-item\" type=\"button\" data-filter=\"label:{}\" style=\"margin-top:2px\"><span class=\"nav-label\"><svg class=\"material-symbols-rounded\"><use href=\"#i-label\"></use></svg>{}</span><span class=\"count\">{count}</span></button>",
-                escape_html(lbl),
-                escape_html(lbl)
-            ));
+    /// Writes `"key":` and returns the buffer for the value.
+    fn key(&mut self, key: &str) -> &mut String {
+        if !self.empty {
+            self.out.push(',');
         }
+        self.empty = false;
+        self.out.push('"');
+        self.out.push_str(key);
+        self.out.push_str("\":");
+        self.out
     }
-    out.push_str("</div></div>");
 
-    out.push_str(
-        "<div class=\"panel transfer-panel\" data-panel=\"transfer\" data-collapsed=\"true\">",
-    );
-    out.push_str("<div class=\"panel-head\">");
-    out.push_str("<div><div class=\"panel-title\">Transfer</div>");
-    out.push_str(&format!(
-        "<div class=\"small\" style=\"margin-top:6px\">Down {}  Up {}</div>",
-        human_rate(state.download_rate_bps),
-        human_rate(state.upload_rate_bps)
-    ));
-    out.push_str("</div>");
-    out.push_str("<button class=\"btn ghost panel-toggle\" type=\"button\" data-action=\"toggle-panel\" data-panel=\"transfer\"><svg class=\"material-symbols-rounded\"><use href=\"#i-unfold_more\"></use></svg>Expand</button>");
-    out.push_str("</div>");
-    out.push_str("<div class=\"transfer-panel-body\">");
-    out.push_str(&render_speed_chart(
-        &state.download_history_bps,
-        &state.upload_history_bps,
-    ));
-    out.push_str("<div class=\"limit-controls\">");
-    out.push_str("<div class=\"limit-row\">");
-    out.push_str("<div class=\"limit-label\">Max download</div>");
-    out.push_str(&format!(
-        "<div class=\"limit-value\" id=\"downloadLimitValue\">{}</div>",
-        human_rate(state.global_download_limit_bps as f64)
-    ));
-    out.push_str("</div>");
-    out.push_str(&format!(
-        "<input id=\"downloadLimit\" class=\"limit-slider\" type=\"range\" min=\"0\" max=\"102400\" step=\"128\" value=\"{download_limit_kbps}\">"
-    ));
-    out.push_str("<div class=\"limit-row\" style=\"margin-top:8px\">");
-    out.push_str("<div class=\"limit-label\">Max upload</div>");
-    out.push_str(&format!(
-        "<div class=\"limit-value\" id=\"uploadLimitValue\">{}</div>",
-        human_rate(state.global_upload_limit_bps as f64)
-    ));
-    out.push_str("</div>");
-    out.push_str(&format!(
-        "<input id=\"uploadLimit\" class=\"limit-slider\" type=\"range\" min=\"0\" max=\"102400\" step=\"64\" value=\"{upload_limit_kbps}\">"
-    ));
-    out.push_str("</div>");
-    out.push_str("<div class=\"limit-group\">");
-    out.push_str("<div class=\"limit-label\">Seed Ratio</div>");
-    out.push_str(&format!(
-        "<div class=\"limit-value\" id=\"seedRatioValue\">{}</div>",
-        if state.seed_ratio > 0.0 {
-            format!("{:.2}", state.seed_ratio)
-        } else {
-            "unlimited".to_string()
-        }
-    ));
-    out.push_str("</div>");
-    out.push_str(&format!(
-        "<input id=\"seedRatio\" class=\"limit-slider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"{}\" title=\"0 = unlimited\">",
-        (state.seed_ratio * 10.0).round() as u32
-    ));
-    out.push_str("<div class=\"limit-group\" style=\"margin-top:12px\">");
-    out.push_str("<div class=\"limit-label\">Peer Profile</div>");
-    out.push_str("<select id=\"peerProfile\" class=\"input\" style=\"margin-top:8px\">");
-    for (value, label) in [
-        ("conservative", "Conservative"),
-        ("balanced", "Balanced"),
-        ("aggressive", "Aggressive"),
-    ] {
-        let selected = if peer_profile == value {
-            " selected"
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "<option value=\"{value}\"{selected}>{label}</option>"
-        ));
+    fn num(&mut self, key: &str, value: impl std::fmt::Display) -> &mut Self {
+        let _ = write!(self.key(key), "{value}");
+        self
     }
-    out.push_str("</select>");
-    out.push_str(&format!(
-        "<div class=\"small\" id=\"peerProfileSummary\" style=\"margin-top:8px\">{} global / {} per torrent / numwant {}</div>",
-        state.peer_profile_global_limit,
-        state.peer_profile_torrent_limit,
-        state.peer_profile_numwant
-    ));
-    out.push_str("</div>");
-    out.push_str("</div>");
-    out.push_str("</div>");
 
-    out.push_str("<details class=\"panel secondary-panel\" id=\"sessionDetails\"><summary>Session &amp; connection</summary>");
-    out.push_str("<div class=\"session-stats\">");
-    out.push_str(&format!("<div class=\"session-row\"><span>Downloaded</span><span class=\"session-value\">{total_downloaded}</span></div>"));
-    out.push_str(&format!("<div class=\"session-row\"><span>Uploaded</span><span class=\"session-value\">{total_uploaded}</span></div>"));
-    out.push_str(&format!(
-        "<div class=\"session-row\"><span>Peers</span><span class=\"session-value\">{total_active_peers} / {total_tracker_peers}</span></div>"
-    ));
-    out.push_str(&format!(
-        "<div class=\"session-row\"><span>Connections</span><span class=\"session-value\">+{} / -{}</span></div>",
-        state.peer_connected, state.peer_disconnected
-    ));
-    if state.incoming_port > 0 {
-        out.push_str(&format!(
-            "<div class=\"session-row\"><span>Incoming Port</span><span class=\"session-value\">{}</span></div>",
-            state.incoming_port
-        ));
-        let all_mapping_statuses = [&state.natpmp_status, &state.upnp_status];
-        let successful_mapping_statuses = all_mapping_statuses
-            .iter()
-            .copied()
-            .filter(|status| status.starts_with("mapped "))
-            .collect::<Vec<_>>();
-        let visible_mapping_statuses = if successful_mapping_statuses.is_empty() {
-            all_mapping_statuses.as_slice()
-        } else {
-            successful_mapping_statuses.as_slice()
-        };
-        let mapping_html = visible_mapping_statuses
-            .iter()
-            .map(|status| format!("<span>{}</span>", escape_html(status)))
-            .collect::<String>();
-        out.push_str(&format!(
-            "<div class=\"session-row stack\"><span>Port Mapping</span><span class=\"session-value\">{mapping_html}</span></div>"
-        ));
+    fn float(&mut self, key: &str, value: f64, decimals: usize) -> &mut Self {
+        push_float(self.key(key), value, decimals);
+        self
     }
-    out.push_str(&format!(
-        "<div class=\"session-row\"><span>Disk I/O</span><span class=\"session-value\">{:.1}ms / {:.1}ms</span></div>",
-        state.disk_read_ms_avg, state.disk_write_ms_avg
-    ));
-    if !state.proxy_label.is_empty() {
-        out.push_str(&format!(
-            "<div class=\"session-row\"><span>Proxy</span><span class=\"session-value\">{}</span></div>",
-            escape_html(&state.proxy_label)
-        ));
-    }
-    out.push_str("</div>");
-    out.push_str("</details>");
 
-    // RSS panel
-    out.push_str("<details class=\"panel secondary-panel\" id=\"rssDetails\"><summary>RSS subscriptions</summary>");
-    out.push_str("<div class=\"panel-title\"><svg class=\"material-symbols-rounded\" style=\"font-size:16px;vertical-align:-3px;margin-right:4px\"><use href=\"#i-rss_feed\"></use></svg>RSS Feeds</div>");
-    out.push_str("<form class=\"rss-form\" onsubmit=\"addRssFeed(event)\">");
-    out.push_str("<input id=\"rssUrl\" class=\"input\" placeholder=\"Feed URL\">");
-    out.push_str("<button type=\"submit\" class=\"btn primary\">Add</button>");
-    out.push_str("</form>");
-    {
-        use crate::RSS_STATE;
-        if let Some(lock) = RSS_STATE.get() {
-            if let Ok(rss_state) = lock.lock() {
-                if !rss_state.feeds.is_empty() {
-                    out.push_str("<div class=\"rss-list\">");
-                    for feed in &rss_state.feeds {
-                        let title = if feed.title.is_empty() {
-                            &feed.url
-                        } else {
-                            &feed.title
-                        };
-                        out.push_str(&format!(
-                            "<div class=\"rss-item\"><span class=\"rss-item-info\" title=\"{}\">{}</span><span class=\"rss-item-meta\">{} items</span><button class=\"remove-btn\" onclick=\"removeRssFeed('{}')\" title=\"Remove\">\u{00d7}</button></div>",
-                            escape_html(&feed.url),
-                            escape_html(title),
-                            feed.items.len(),
-                            escape_html(&escape_js_single_quoted(&feed.url)),
-                        ));
-                    }
-                    out.push_str("</div>");
-                }
-                // Rules section
-                out.push_str("<div class=\"rss-section-label\">Rules</div>");
-                if !rss_state.rules.is_empty() {
-                    out.push_str("<div class=\"rss-list\">");
-                    for rule in &rss_state.rules {
-                        out.push_str(&format!(
-                            "<div class=\"rss-item\"><span class=\"rss-item-info\">{}: {}</span><button class=\"remove-btn\" onclick=\"removeRssRule('{}')\" title=\"Remove\">\u{00d7}</button></div>",
-                            escape_html(&rule.name),
-                            escape_html(&rule.pattern),
-                            escape_html(&escape_js_single_quoted(&rule.name)),
-                        ));
-                    }
-                    out.push_str("</div>");
-                }
-                // Add rule form
-                out.push_str("<form class=\"rss-form\" onsubmit=\"addRssRule(event)\">");
-                out.push_str(
-                    "<input id=\"rssRuleName\" class=\"input\" placeholder=\"Rule name\">",
-                );
-                out.push_str(
-                    "<input id=\"rssRulePattern\" class=\"input\" placeholder=\"Pattern\">",
-                );
-                out.push_str("<button type=\"submit\" class=\"btn primary\">Add</button>");
-                out.push_str("</form>");
-            }
-        }
+    fn str(&mut self, key: &str, value: &str) -> &mut Self {
+        push_json_string(self.key(key), value);
+        self
     }
-    out.push_str("</details>");
 
-    out.push_str("</aside>");
-
-    out.push_str("<main class=\"torrent-list\">");
-    out.push_str(&format!(
-        "<div class=\"library-heading\"><div><h1>Transfers</h1><p class=\"small\">Your files, from first piece to finished download.</p></div><span class=\"library-count\">{total_torrents} in library</span></div>"
-    ));
-    if !state.torrents.is_empty() {
-        out.push_str(&format!(
-            "<div class=\"library-summary\"><span class=\"signal-dot {fleet_signal}\"></span><strong>{fleet_state}</strong><span>{}</span></div>",
-            escape_html(fleet_copy)
-        ));
+    fn finish(self) {
+        self.out.push('}');
     }
-    out.push_str("<div class=\"filter-empty\" id=\"filterEmpty\" hidden><p>No transfers match this view.</p><button class=\"btn\" type=\"button\" onclick=\"clearLibraryFilters()\">Show all transfers</button></div>");
-    if state.torrents.is_empty() {
-        out.push_str("<div class=\"panel empty-state\">");
-        out.push_str(
-            "<svg class=\"material-symbols-rounded\"><use href=\"#i-cloud_download\"></use></svg>",
-        );
-        out.push_str("<h2>Ready when you are</h2><p>Add a .torrent file or paste a magnet link. Choose where to save it, and we'll take care of the pieces.</p><button class=\"btn primary\" type=\"button\" onclick=\"openAdd()\"><svg class=\"material-symbols-rounded\" aria-hidden=\"true\"><use href=\"#i-add\"></use></svg>Add your first torrent</button><span class=\"small\">You can also drop a .torrent file anywhere.</span>");
-        out.push_str("</div>");
+}
+
+fn push_float(out: &mut String, value: f64, decimals: usize) {
+    if value.is_finite() {
+        let _ = write!(out, "{value:.decimals$}");
     } else {
-        for (card_index, torrent) in state.torrents.iter().enumerate() {
-            let name = if torrent.name.is_empty() {
-                "(unknown)"
-            } else {
-                &torrent.name
-            };
-            let name = escape_html(name);
-            let status_raw = torrent.status.as_str();
-            let bucket = bucket_for(torrent);
-            let status_display = if torrent.paused {
-                "paused"
-            } else if bucket == "complete" {
-                "seeding"
-            } else if matches!(status_raw, "complete" | "seeding") {
-                "downloading"
-            } else {
-                status_raw
-            };
-            let status = escape_html(status_display);
-            let status_class = format!("status-{bucket}");
-            let info_hash = escape_html(&torrent.info_hash);
-            let download_dir = escape_html(&torrent.download_dir);
-            let total_bytes = human_bytes(torrent.total_bytes);
-            let mut completed_bytes = if torrent.completed_bytes > 0 || torrent.total_pieces == 0 {
-                torrent.completed_bytes
-            } else {
-                torrent
-                    .total_bytes
-                    .saturating_mul(torrent.completed_pieces as u64)
-                    / torrent.total_pieces.max(1) as u64
-            };
-            if is_complete_torrent(torrent) && torrent.total_bytes > 0 {
-                completed_bytes = torrent.total_bytes;
-            }
-            let completed_label = human_bytes(completed_bytes.min(torrent.total_bytes));
-            let downloaded_label = human_bytes(torrent.downloaded_bytes);
-            let uploaded_label = human_bytes(torrent.uploaded_bytes);
-            let ratio = format_ratio(torrent.uploaded_bytes, torrent.downloaded_bytes);
-            let speed = human_rate(torrent.download_rate_bps);
-            let upload_rate = human_rate(torrent.upload_rate_bps);
-            let eta = format_eta_secs(torrent.eta_secs);
-            let pct = percent(completed_bytes, torrent.total_bytes);
-            let pct_value = (pct as f64 / 100.0).min(100.0);
-            let peers = format!(
-                "{} connected / {} known",
-                torrent.active_peers, torrent.tracker_peers
-            );
-            let pieces = format!("{}/{}", torrent.completed_pieces, torrent.total_pieces);
-            let progress_note = if torrent.paused || matches!(status_raw, "stopped" | "stopping") {
-                "Transfer paused"
-            } else if bucket == "complete" {
-                if torrent.upload_rate_bps > 0.0 {
-                    "Sharing with peers"
-                } else {
-                    "Ready to share when peers request pieces"
-                }
-            } else if matches!(status_raw, "complete" | "seeding") {
-                "Verification pending"
-            } else if torrent.active_peers > 0 {
-                "Peers connected"
-            } else if torrent.tracker_peers > 0 {
-                "Finding reachable peers"
-            } else {
-                "Looking for peers"
-            };
-            let progress_class =
-                if torrent.total_bytes > 0 && completed_bytes >= torrent.total_bytes {
-                    "progress good"
-                } else {
-                    "progress"
-                };
-            let preallocate = if torrent.preallocate { "true" } else { "false" };
-            let is_stopping = status_raw == "stopping";
-            let can_resume = torrent.paused || status_raw == "stopped";
-            let paused = if can_resume { "true" } else { "false" };
-            let pause_label = if can_resume { "Resume" } else { "Pause" };
-            let pause_disabled =
-                is_stopping || matches!(status_raw, "queued" | "loading" | "fetching metadata");
-            let pause_attrs = if is_stopping {
-                " disabled title=\"Torrent is stopping\""
-            } else if pause_disabled {
-                " disabled title=\"Not available while torrent is initializing\""
-            } else {
-                ""
-            };
-            let stop_disabled =
-                is_stopping || matches!(status_raw, "loading" | "fetching metadata");
-            let stop_attrs = if is_stopping {
-                " disabled title=\"Torrent is stopping\""
-            } else if stop_disabled {
-                " disabled title=\"Not available while metadata is loading\""
-            } else {
-                ""
-            };
-            let priority_disabled =
-                matches!(status_raw, "queued" | "loading" | "fetching metadata");
-            let priority_attrs = if priority_disabled {
-                " disabled title=\"Priority can be changed after metadata is ready\""
-            } else {
-                ""
-            };
-
-            out.push_str(&format!(
-                "<section class=\"panel torrent-card\" style=\"--card-index:{card_index}\" data-status=\"{bucket}\" data-id=\"{id}\" data-info-hash=\"{info_hash}\" data-name=\"{name}\" data-paused=\"{paused}\" data-label=\"{label}\" data-collapsed=\"true\">",
-                id = torrent.id,
-                card_index = card_index,
-                label = escape_html(&torrent.label)
-            ));
-            out.push_str("<div class=\"torrent-head\">");
-            out.push_str("<div>");
-            out.push_str(&format!("<div class=\"torrent-title\">{name}</div>"));
-            out.push_str(&format!(
-                "<div class=\"torrent-sub\"><span class=\"status-pill {status_class}\">{status}</span><span class=\"torrent-size\">{total_bytes}</span></div>"
-            ));
-            out.push_str("</div>");
-            let pause_icon = if can_resume { "play_arrow" } else { "pause" };
-            out.push_str("<div class=\"torrent-actions\">");
-            out.push_str(&format!(
-                "<button class=\"btn ghost\" type=\"button\" data-action=\"toggle-pause\"{pause_attrs}><svg class=\"material-symbols-rounded\"><use href=\"#i-{pause_icon}\"></use></svg>{pause_label}</button>"
-            ));
-            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"toggle-expand\"><svg class=\"material-symbols-rounded\"><use href=\"#i-unfold_more\"></use></svg>Expand</button>");
-            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"open-folder\"><svg class=\"material-symbols-rounded\"><use href=\"#i-folder_open\"></use></svg>Open Folder</button>");
-            let stop_label = if is_stopping { "Stopping..." } else { "Stop" };
-            out.push_str(&format!(
-                "<button class=\"btn ghost\" type=\"button\" data-action=\"stop\"{stop_attrs}><svg class=\"material-symbols-rounded\"><use href=\"#i-stop\"></use></svg>{stop_label}</button>"
-            ));
-            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"archive\"><svg class=\"material-symbols-rounded\"><use href=\"#i-archive\"></use></svg>Archive</button>");
-            out.push_str("<button class=\"btn danger\" type=\"button\" data-action=\"delete\"><svg class=\"material-symbols-rounded\"><use href=\"#i-delete\"></use></svg>Remove</button>");
-            out.push_str("</div>");
-            out.push_str("</div>");
-            if !torrent.last_error.is_empty() && bucket == "error" {
-                out.push_str(&format!(
-                    "<div class=\"torrent-error\" role=\"alert\">{}</div>",
-                    escape_html(&torrent.last_error)
-                ));
-            }
-            out.push_str(&format!(
-                "<div class=\"torrent-progress\"><div class=\"torrent-progress-top\"><div class=\"meta\">Progress {completed_label} / {total_bytes} ({:.2}%)</div><div class=\"torrent-progress-note\">{progress_note}</div></div>",
-                pct_value
-            ));
-            out.push_str(&format!(
-                "<div class=\"{progress_class}\"><div class=\"fill\" style=\"width:{:.2}%\"></div></div></div>",
-                pct_value
-            ));
-            out.push_str(&format!(
-                "<div class=\"torrent-quick\"><span><svg class=\"material-symbols-rounded\"><use href=\"#i-download\"></use></svg>{speed}</span><span><svg class=\"material-symbols-rounded\"><use href=\"#i-upload\"></use></svg>{upload_rate}</span><span><svg class=\"material-symbols-rounded\"><use href=\"#i-group\"></use></svg>{peers}</span><span><svg class=\"material-symbols-rounded\"><use href=\"#i-schedule\"></use></svg>{eta}</span></div>"
-            ));
-            out.push_str("<div class=\"torrent-stats\">");
-            out.push_str(&format!(
-                "<div class=\"stat\"><span class=\"k\"><svg class=\"material-symbols-rounded\"><use href=\"#i-download\"></use></svg>Down</span><span class=\"v\">{speed}</span></div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"stat\"><span class=\"k\"><svg class=\"material-symbols-rounded\"><use href=\"#i-upload\"></use></svg>Up</span><span class=\"v\">{upload_rate}</span></div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"stat\"><span class=\"k\"><svg class=\"material-symbols-rounded\"><use href=\"#i-swap_vert\"></use></svg>Ratio</span><span class=\"v\">{ratio}</span></div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"stat\"><span class=\"k\"><svg class=\"material-symbols-rounded\"><use href=\"#i-schedule\"></use></svg>ETA</span><span class=\"v\">{eta}</span></div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"stat\"><span class=\"k\"><svg class=\"material-symbols-rounded\"><use href=\"#i-group\"></use></svg>Peers</span><span class=\"v\">{peers}</span></div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"stat\"><span class=\"k\"><svg class=\"material-symbols-rounded\"><use href=\"#i-grid_view\"></use></svg>Pieces</span><span class=\"v\">{pieces}</span></div>"
-            ));
-            out.push_str("</div>");
-
-            out.push_str("<div class=\"torrent-grid\">");
-            out.push_str("<div class=\"detail-actions\">");
-            out.push_str(&format!("<button class=\"btn ghost\" type=\"button\" data-action=\"stop\"{stop_attrs}><svg class=\"material-symbols-rounded\"><use href=\"#i-stop\"></use></svg>{stop_label}</button>"));
-            out.push_str("<button class=\"btn ghost\" type=\"button\" data-action=\"recheck\"><svg class=\"material-symbols-rounded\"><use href=\"#i-verified\"></use></svg>Recheck</button>");
-            out.push_str("</div>");
-            out.push_str("<div class=\"subpanel\">");
-            out.push_str("<div class=\"panel-title\">General</div>");
-            out.push_str("<div class=\"kv\">");
-            out.push_str(&format!(
-                "<div class=\"k\">Info hash</div><div>{info_hash}</div>"
-            ));
-            {
-                let version_label = match torrent.meta_version {
-                    2 => "v2",
-                    3 => "Hybrid",
-                    _ => "v1",
-                };
-                out.push_str(&format!(
-                    "<div class=\"k\">Version</div><div>{version_label}</div>"
-                ));
-            }
-            out.push_str(&format!(
-                "<div class=\"k\">Download dir</div><div>{download_dir}</div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"k\">Preallocate</div><div>{preallocate}</div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"k\">Downloaded</div><div>{downloaded_label}</div>"
-            ));
-            out.push_str(&format!(
-                "<div class=\"k\">Uploaded</div><div>{uploaded_label}</div>"
-            ));
-            out.push_str(&format!("<div class=\"k\">Ratio</div><div>{ratio}</div>"));
-            out.push_str(&format!(
-                "<div class=\"k\">Label</div><div class=\"inline-form\"><input class=\"label-input input\" type=\"text\" value=\"{}\" placeholder=\"none\"><button class=\"btn\" data-action=\"set-label\">Set</button></div>",
-                escape_html(&torrent.label)
-            ));
-            out.push_str("</div>");
-            out.push_str("</div>");
-
-            // Peer countries panel
-            if !torrent.peer_country_counts.is_empty() {
-                out.push_str("<div class=\"subpanel\">");
-                out.push_str("<div class=\"panel-title\">Peers by Country</div>");
-                out.push_str("<div class=\"country-tags\">");
-                for (cc, count) in &torrent.peer_country_counts {
-                    let flag = crate::geoip::country_flag(cc);
-                    out.push_str(&format!(
-                        "<span class=\"country-tag\">{} {} <b>{count}</b></span>",
-                        escape_html(&flag),
-                        escape_html(cc),
-                    ));
-                }
-                out.push_str("</div></div>");
-            }
-
-            // Trackers panel
-            out.push_str("<div class=\"subpanel\">");
-            out.push_str("<div class=\"panel-title\">Trackers</div>");
-            if !torrent.trackers.is_empty() {
-                out.push_str("<div class=\"tracker-list\">");
-                for tracker in &torrent.trackers {
-                    out.push_str(&format!(
-                        "<div class=\"tracker-item\"><span>{}</span><button class=\"remove-btn\" data-action=\"remove-tracker\" data-url=\"{}\" title=\"Remove\">\u{00d7}</button></div>",
-                        escape_html(tracker),
-                        escape_html(tracker)
-                    ));
-                }
-                out.push_str("</div>");
-            }
-            out.push_str("<div class=\"inline-form\"><input class=\"tracker-add-input input\" type=\"text\" placeholder=\"https://... or udp://...\"><button class=\"btn\" data-action=\"add-tracker\">Add</button></div>");
-            out.push_str("</div>");
-
-            out.push_str("<div class=\"subpanel\">");
-            out.push_str("<div class=\"panel-title\">Files</div>");
-            if torrent.files.is_empty() {
-                out.push_str("<div class=\"small\" style=\"margin-top:8px\">No files.</div>");
-            } else {
-                out.push_str("<table class=\"table\"><thead><tr><th>File</th><th>Size</th><th>Done</th><th>Progress</th><th>Priority</th></tr></thead><tbody>");
-                for (idx, file) in torrent.files.iter().enumerate() {
-                    let file_name = escape_html(&file.path);
-                    let size = human_bytes(file.length);
-                    let done = human_bytes(file.completed);
-                    let file_pct = percent(file.completed, file.length);
-                    let file_pct_value = (file_pct as f64 / 100.0).min(100.0);
-                    let priority = file.priority;
-                    let priority_select = format!(
-                        "<select class=\"input\" onchange=\"setPriority({id},{idx}, this.value)\"{priority_attrs}><option value=\"0\"{}>Skip</option><option value=\"1\"{}>Low</option><option value=\"2\"{}>Normal</option><option value=\"3\"{}>High</option></select>",
-                        if priority == 0 { " selected" } else { "" },
-                        if priority == 1 { " selected" } else { "" },
-                        if priority == 2 { " selected" } else { "" },
-                        if priority == 3 { " selected" } else { "" },
-                        priority_attrs = priority_attrs,
-                        id = torrent.id,
-                        idx = idx
-                    );
-                    let tid = torrent.id;
-                    out.push_str(&format!(
-                        "<tr><td class=\"file-cell\" ondblclick=\"startRename({tid},{idx},this)\" title=\"Double-click to rename\">{file_name}</td><td>{size}</td><td>{done}</td><td><div class=\"file-bar\"><div class=\"fill\" style=\"width:{file_pct_value:.2}%\"></div></div></td><td>{priority_select}</td></tr>"
-                    ));
-                }
-                out.push_str("</tbody></table>");
-            }
-            out.push_str("</div>");
-            out.push_str("</div>");
-            out.push_str("</section>");
-        }
+        out.push('0');
     }
-    out.push_str("</main>");
+}
 
-    out.push_str("</div>");
-    out.push_str("<div class=\"layout workspace search-layout\" data-main-tab=\"search\">");
-    out.push_str("<aside class=\"sidebar search-sidebar\">");
-    render_search_panel(&mut out);
-    out.push_str("</aside>");
-    out.push_str("<main class=\"torrent-list search-main\">");
-    render_search_results_panel(&mut out);
-    render_search_plugin_manager(&mut out);
-    out.push_str("</main>");
-    out.push_str("</div>");
-    out.push_str("<div id=\"addModal\" class=\"modal\" onclick=\"maybeClose(event)\">");
-    out.push_str("<div class=\"modal-card\">");
-    out.push_str("<div class=\"modal-head\"><div class=\"modal-title\">Add Torrent</div><button class=\"btn icon-btn ghost\" type=\"button\" title=\"Close\" aria-label=\"Close\" onclick=\"closeAdd()\"><svg class=\"material-symbols-rounded\" aria-hidden=\"true\"><use href=\"#i-close\"></use></svg></button></div>");
-    out.push_str("<div class=\"add-grid\">");
-    // Drop zone for .torrent file
-    out.push_str("<div id=\"dropZone\" class=\"drop-zone\" onclick=\"document.getElementById('torrentFile').click()\">");
-    out.push_str("<input id=\"torrentFile\" type=\"file\" accept=\".torrent\" onchange=\"handleTorrentInputChange()\" onclick=\"event.stopPropagation()\">");
-    out.push_str(
-        "<svg class=\"material-symbols-rounded dz-icon\"><use href=\"#i-upload_file\"></use></svg>",
-    );
-    out.push_str("<span class=\"dz-text\">Drop .torrent file here or click to browse</span>");
-    out.push_str("<span class=\"dz-hint\">.torrent files only</span>");
-    out.push_str("<div class=\"dz-file-info\"><svg class=\"material-symbols-rounded dz-icon\"><use href=\"#i-description\"></use></svg><span id=\"dzFileName\" class=\"dz-file-name\"></span><button type=\"button\" class=\"dz-file-remove\" onclick=\"event.stopPropagation();clearTorrentFile()\" title=\"Remove file\"><svg class=\"material-symbols-rounded\" style=\"font-size:18px\"><use href=\"#i-close\"></use></svg></button></div>");
-    out.push_str("</div>");
-    // Divider
-    out.push_str("<div class=\"add-divider\">or paste a magnet link</div>");
-    // Magnet input
-    out.push_str("<input id=\"magnet\" class=\"input\" type=\"text\" placeholder=\"magnet:?xt=urn:btih:...\" autocomplete=\"off\" oninput=\"handleMagnetInput()\">");
-    // Summary & review
-    out.push_str("<div id=\"addSummary\" class=\"add-summary\">Select a .torrent file or paste a magnet link.</div>");
-    out.push_str("<div id=\"addReview\" class=\"add-review\" style=\"display:none\"></div>");
-    // Options section
-    out.push_str("<div class=\"add-opts\">");
-    out.push_str("<div><div class=\"add-field-label\">Save to</div>");
-    out.push_str("<div class=\"add-download-row\">");
-    out.push_str(&format!(
-        "<input id=\"downloadDir\" class=\"input\" type=\"text\" placeholder=\"Download directory\" value=\"{download_dir}\">"
-    ));
-    out.push_str("<button class=\"btn ghost\" type=\"button\" title=\"Browse for folder\" aria-label=\"Browse for folder\" onclick=\"chooseDownloadDir()\"><svg class=\"material-symbols-rounded\" style=\"font-size:18px\" aria-hidden=\"true\"><use href=\"#i-folder_open\"></use></svg></button>");
-    out.push_str("</div></div>");
-    out.push_str(&format!(
-        "<div class=\"add-prefs\"><label class=\"add-check\"><input id=\"preallocate\" type=\"checkbox\" {}> Preallocate</label><label class=\"add-check\"><input id=\"startWhenAdded\" type=\"checkbox\" checked> Start immediately</label></div>",
-        if state.preallocate { "checked" } else { "" }
-    ));
-    out.push_str("</div>");
-    // Actions
-    out.push_str("<div class=\"modal-actions\"><button class=\"btn ghost\" type=\"button\" onclick=\"closeAdd()\">Cancel</button><button class=\"btn primary\" type=\"button\" onclick=\"return submitAdd();\"><svg class=\"material-symbols-rounded\" style=\"font-size:18px\"><use href=\"#i-add\"></use></svg> Add Torrent</button></div>");
-    out.push_str("</div>");
-    out.push_str("</div>");
-    out.push_str("</div>");
-    // Page-level drop overlay
-    out.push_str("<div id=\"pageDropOverlay\" class=\"page-drop-overlay\"><div class=\"page-drop-overlay-inner\"><svg class=\"material-symbols-rounded\"><use href=\"#i-cloud_upload\"></use></svg><p>Drop to add torrent</p></div></div>");
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    escape_json_into(out, value);
+    out.push('"');
+}
+
+fn push_session_fields(json: &mut JsonObject<'_>, state: &UiState) {
+    json.str("version", env!("CARGO_PKG_VERSION"))
+        .str("download_dir", &state.download_dir)
+        .num("preallocate", state.preallocate)
+        .float("download_rate_bps", state.download_rate_bps, 0)
+        .float("upload_rate_bps", state.upload_rate_bps, 0)
+        .num("session_downloaded_bytes", state.session_downloaded_bytes)
+        .num("session_uploaded_bytes", state.session_uploaded_bytes)
+        .num("global_download_limit_bps", state.global_download_limit_bps)
+        .num("global_upload_limit_bps", state.global_upload_limit_bps)
+        .float("seed_ratio", state.seed_ratio, 2)
+        .str("peer_profile", &state.peer_profile)
+        .num("peer_profile_global_limit", state.peer_profile_global_limit)
+        .num(
+            "peer_profile_torrent_limit",
+            state.peer_profile_torrent_limit,
+        )
+        .num("peer_profile_numwant", state.peer_profile_numwant)
+        .num("incoming_port", state.incoming_port)
+        .str("natpmp_status", &state.natpmp_status)
+        .str("upnp_status", &state.upnp_status)
+        .num("peer_connected", state.peer_connected)
+        .num("peer_disconnected", state.peer_disconnected)
+        .float("disk_read_ms_avg", state.disk_read_ms_avg, 3)
+        .float("disk_write_ms_avg", state.disk_write_ms_avg, 3)
+        .str("proxy_label", &state.proxy_label);
+    for (key, values) in [
+        ("download_history_bps", &state.download_history_bps),
+        ("upload_history_bps", &state.upload_history_bps),
+    ] {
+        let out = json.key(key);
+        out.push('[');
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_float(out, *value, 0);
+        }
+        out.push(']');
+    }
+}
+
+/// Cheap fingerprint of a torrent's file list so the UI can tell when to
+/// refetch `/torrent/files` without the stream carrying every file.
+fn files_rev(files: &[UiFile]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    let mut mix = |bytes: &[u8]| {
+        for byte in bytes {
+            hash = (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193);
+        }
+    };
+    for file in files {
+        mix(file.path.as_bytes());
+        mix(&file.completed.to_le_bytes());
+        mix(&[file.priority]);
+    }
+    hash
+}
+
+fn push_files_json(out: &mut String, files: &[UiFile]) {
+    out.push('[');
+    for (index, file) in files.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let mut json = JsonObject::new(out);
+        json.str("path", &file.path)
+            .num("length", file.length)
+            .num("completed", file.completed)
+            .num("percent", percent(file.completed, file.length))
+            .num("priority", file.priority);
+        json.finish();
+    }
+    out.push(']');
+}
+
+fn push_torrent_json(out: &mut String, torrent: &UiTorrent, with_files: bool) {
+    let mut json = JsonObject::new(out);
+    json.num("id", torrent.id)
+        .str("name", &torrent.name)
+        .str("info_hash", &torrent.info_hash)
+        .str("download_dir", &torrent.download_dir)
+        .num("preallocate", torrent.preallocate)
+        .str("status", &torrent.status)
+        .num("total_bytes", torrent.total_bytes)
+        .num("completed_bytes", torrent.completed_bytes)
+        .num("downloaded_bytes", torrent.downloaded_bytes)
+        .num("uploaded_bytes", torrent.uploaded_bytes)
+        .float(
+            "ratio",
+            ratio_value(torrent.uploaded_bytes, torrent.downloaded_bytes),
+            3,
+        )
+        .num("total_pieces", torrent.total_pieces)
+        .num("completed_pieces", torrent.completed_pieces)
+        .num(
+            "percent",
+            percent(torrent.completed_bytes, torrent.total_bytes),
+        )
+        .float("download_rate_bps", torrent.download_rate_bps, 0)
+        .float("upload_rate_bps", torrent.upload_rate_bps, 0)
+        .num("eta_secs", torrent.eta_secs)
+        .num("tracker_peers", torrent.tracker_peers)
+        .num("active_peers", torrent.active_peers)
+        .num("interested_peers", torrent.interested_peers)
+        .num("upload_requests_served", torrent.upload_requests_served)
+        .num("paused", torrent.paused)
+        .str("last_error", &torrent.last_error)
+        .str("label", &torrent.label)
+        .num("meta_version", torrent.meta_version)
+        .num("file_count", torrent.files.len())
+        .num("files_rev", files_rev(&torrent.files));
+    let trackers = json.key("trackers");
+    trackers.push('[');
+    for (index, tracker) in torrent.trackers.iter().enumerate() {
+        if index > 0 {
+            trackers.push(',');
+        }
+        push_json_string(trackers, tracker);
+    }
+    trackers.push(']');
+    let countries = json.key("peer_countries");
+    countries.push('[');
+    for (index, (code, count)) in torrent.peer_country_counts.iter().enumerate() {
+        if index > 0 {
+            countries.push(',');
+        }
+        let mut country = JsonObject::new(countries);
+        country
+            .str("code", code)
+            .num("count", count)
+            .str("flag", &crate::geoip::country_flag(code));
+        country.finish();
+    }
+    countries.push(']');
+    if with_files {
+        push_files_json(json.key("files"), &torrent.files);
+    }
+    json.finish();
+}
+
+fn torrent_files_json(torrent: &UiTorrent) -> String {
+    let mut out = String::new();
+    let mut json = JsonObject::new(&mut out);
+    json.num("id", torrent.id)
+        .num("files_rev", files_rev(&torrent.files));
+    push_files_json(json.key("files"), &torrent.files);
+    json.finish();
     out
 }
 
+/// Full status for API clients: session fields, the legacy "current torrent"
+/// fields, and every torrent including its files.
 fn status_json(state: &UiState) -> String {
-    let overall_percent = percent(state.completed_bytes, state.total_bytes);
-    let ratio = ratio_value(state.uploaded_bytes, state.downloaded_bytes);
-    let current_id_json = state
-        .current_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let mut files_json = String::new();
-    files_json.push('[');
-    for (idx, file) in state.files.iter().enumerate() {
-        if idx > 0 {
-            files_json.push(',');
+    let mut out = String::with_capacity(1024 + state.torrents.len() * 1024);
+    let mut json = JsonObject::new(&mut out);
+    push_session_fields(&mut json, state);
+    json.str("name", &state.name)
+        .str("info_hash", &state.info_hash)
+        .str("status", &state.status)
+        .str("last_error", &state.last_error)
+        .num("total_pieces", state.total_pieces)
+        .num("completed_pieces", state.completed_pieces)
+        .num("total_bytes", state.total_bytes)
+        .num("completed_bytes", state.completed_bytes)
+        .num("downloaded_bytes", state.downloaded_bytes)
+        .num("uploaded_bytes", state.uploaded_bytes)
+        .float(
+            "ratio",
+            ratio_value(state.uploaded_bytes, state.downloaded_bytes),
+            3,
+        )
+        .num("percent", percent(state.completed_bytes, state.total_bytes))
+        .num("tracker_peers", state.tracker_peers)
+        .num("active_peers", state.active_peers)
+        .num("interested_peers", state.interested_peers)
+        .num("upload_requests_served", state.upload_requests_served)
+        .num("paused", state.paused)
+        .num("eta_secs", state.eta_secs)
+        .num("queue_len", state.queue_len)
+        .str("last_added", &state.last_added);
+    match state.current_id {
+        Some(id) => json.num("current_id", id),
+        None => json.num("current_id", "null"),
+    };
+    push_files_json(json.key("files"), &state.files);
+    let torrents = json.key("torrents");
+    torrents.push('[');
+    for (index, torrent) in state.torrents.iter().enumerate() {
+        if index > 0 {
+            torrents.push(',');
         }
-        let file_percent = percent(file.completed, file.length);
-        files_json.push_str(&format!(
-            "{{\"path\":\"{}\",\"length\":{},\"completed\":{},\"percent\":{},\"priority\":{}}}",
-            escape_json(&file.path),
-            file.length,
-            file.completed,
-            file_percent,
-            file.priority
-        ));
+        push_torrent_json(torrents, torrent, true);
     }
-    files_json.push(']');
-    let mut torrents_json = String::new();
-    torrents_json.push('[');
-    for (idx, torrent) in state.torrents.iter().enumerate() {
-        if idx > 0 {
-            torrents_json.push(',');
-        }
-        let percent_done = percent(torrent.completed_bytes, torrent.total_bytes);
-        let ratio = ratio_value(torrent.uploaded_bytes, torrent.downloaded_bytes);
-        let mut torrent_files_json = String::new();
-        torrent_files_json.push('[');
-        for (file_idx, file) in torrent.files.iter().enumerate() {
-            if file_idx > 0 {
-                torrent_files_json.push(',');
-            }
-            let file_percent = percent(file.completed, file.length);
-            torrent_files_json.push_str(&format!(
-                "{{\"path\":\"{}\",\"length\":{},\"completed\":{},\"percent\":{},\"priority\":{}}}",
-                escape_json(&file.path),
-                file.length,
-                file.completed,
-                file_percent,
-                file.priority
-            ));
-        }
-        torrent_files_json.push(']');
-        let mut trackers_json = String::from("[");
-        for (ti, t) in torrent.trackers.iter().enumerate() {
-            if ti > 0 {
-                trackers_json.push(',');
-            }
-            trackers_json.push('"');
-            trackers_json.push_str(&escape_json(t));
-            trackers_json.push('"');
-        }
-        trackers_json.push(']');
-        let mut countries_json = String::from("[");
-        for (ci, (cc, count)) in torrent.peer_country_counts.iter().enumerate() {
-            if ci > 0 {
-                countries_json.push(',');
-            }
-            countries_json.push_str(&format!(
-                "{{\"code\":\"{}\",\"count\":{}}}",
-                escape_json(cc),
-                count
-            ));
-        }
-        countries_json.push(']');
-        torrents_json.push_str(&format!(
-            "{{\"id\":{},\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"preallocate\":{},\"status\":\"{}\",\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"total_pieces\":{},\"completed_pieces\":{},\"percent\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"tracker_peers\":{},\"active_peers\":{},\"interested_peers\":{},\"upload_requests_served\":{},\"paused\":{},\"last_error\":\"{}\",\"label\":\"{}\",\"trackers\":{},\"files\":{},\"peer_countries\":{}}}",
-            torrent.id,
-            escape_json(&torrent.name),
-            escape_json(&torrent.info_hash),
-            escape_json(&torrent.download_dir),
-            torrent.preallocate,
-            escape_json(&torrent.status),
-            torrent.total_bytes,
-            torrent.completed_bytes,
-            torrent.downloaded_bytes,
-            torrent.uploaded_bytes,
-            ratio,
-            torrent.total_pieces,
-            torrent.completed_pieces,
-            percent_done,
-            torrent.download_rate_bps,
-            torrent.upload_rate_bps,
-            torrent.eta_secs,
-            torrent.tracker_peers,
-            torrent.active_peers,
-            torrent.interested_peers,
-            torrent.upload_requests_served,
-            torrent.paused,
-            escape_json(&torrent.last_error),
-            escape_json(&torrent.label),
-            trackers_json,
-            torrent_files_json,
-            countries_json
-        ));
-    }
-    torrents_json.push(']');
-    format!(
-        "{{\"version\":\"{}\",\"name\":\"{}\",\"info_hash\":\"{}\",\"download_dir\":\"{}\",\"status\":\"{}\",\"last_error\":\"{}\",\"total_pieces\":{},\"completed_pieces\":{},\"total_bytes\":{},\"completed_bytes\":{},\"downloaded_bytes\":{},\"uploaded_bytes\":{},\"ratio\":{:.3},\"percent\":{},\"tracker_peers\":{},\"active_peers\":{},\"interested_peers\":{},\"upload_requests_served\":{},\"preallocate\":{},\"paused\":{},\"download_rate_bps\":{:.2},\"upload_rate_bps\":{:.2},\"eta_secs\":{},\"incoming_port\":{},\"natpmp_status\":\"{}\",\"upnp_status\":\"{}\",\"queue_len\":{},\"last_added\":\"{}\",\"current_id\":{},\"peer_connected\":{},\"peer_disconnected\":{},\"disk_read_ms_avg\":{:.3},\"disk_write_ms_avg\":{:.3},\"session_downloaded_bytes\":{},\"session_uploaded_bytes\":{},\"global_download_limit_bps\":{},\"global_upload_limit_bps\":{},\"seed_ratio\":{:.2},\"files\":{},\"torrents\":{}}}",
-        env!("CARGO_PKG_VERSION"),
-        escape_json(&state.name),
-        escape_json(&state.info_hash),
-        escape_json(&state.download_dir),
-        escape_json(&state.status),
-        escape_json(&state.last_error),
-        state.total_pieces,
-        state.completed_pieces,
-        state.total_bytes,
-        state.completed_bytes,
-        state.downloaded_bytes,
-        state.uploaded_bytes,
-        ratio,
-        overall_percent,
-        state.tracker_peers,
-        state.active_peers,
-        state.interested_peers,
-        state.upload_requests_served,
-        state.preallocate,
-        state.paused,
-        state.download_rate_bps,
-        state.upload_rate_bps,
-        state.eta_secs,
-        state.incoming_port,
-        escape_json(&state.natpmp_status),
-        escape_json(&state.upnp_status),
-        state.queue_len,
-        escape_json(&state.last_added),
-        current_id_json,
-        state.peer_connected,
-        state.peer_disconnected,
-        state.disk_read_ms_avg,
-        state.disk_write_ms_avg,
-        state.session_downloaded_bytes,
-        state.session_uploaded_bytes,
-        state.global_download_limit_bps,
-        state.global_upload_limit_bps,
-        state.seed_ratio,
-        files_json,
-        torrents_json
-    )
+    torrents.push(']');
+    json.finish();
+    out
 }
 
 fn percent(done: u64, total: u64) -> u64 {
@@ -3297,163 +2728,13 @@ fn ratio_value(uploaded: u64, downloaded: u64) -> f64 {
     }
 }
 
-fn format_ratio(uploaded: u64, downloaded: u64) -> String {
-    if downloaded == 0 {
-        if uploaded == 0 {
-            "0.00".to_string()
-        } else {
-            "inf".to_string()
-        }
-    } else {
-        format!("{:.2}", uploaded as f64 / downloaded as f64)
-    }
-}
-
-fn human_bytes(value: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = value as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit + 1 < UNITS.len() {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{value} {}", UNITS[unit])
-    } else {
-        format!("{:.2} {}", size, UNITS[unit])
-    }
-}
-
-fn human_rate(bps: f64) -> String {
-    const UNITS: [&str; 5] = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
-    if !bps.is_finite() || bps <= 0.0 {
-        return "0 B/s".to_string();
-    }
-    let mut size = bps;
-    let mut unit = 0;
-    while size >= 1024.0 && unit + 1 < UNITS.len() {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{:.0} {}", size, UNITS[unit])
-    } else {
-        format!("{:.2} {}", size, UNITS[unit])
-    }
-}
-
-fn render_speed_chart(download: &[f64], upload: &[f64]) -> String {
-    let sample_count = download.len().max(upload.len());
-    let latest_down = human_rate(*download.last().unwrap_or(&0.0));
-    let latest_up = human_rate(*upload.last().unwrap_or(&0.0));
-    if sample_count < 2 {
-        return format!(
-            "<div class=\"speed-chart\"><div class=\"speed-chart-empty\">Collecting speed samples...</div><div class=\"speed-legend\"><span class=\"item\"><span class=\"swatch down\"></span>Download {latest_down}</span><span class=\"item\"><span class=\"swatch up\"></span>Upload {latest_up}</span></div></div>"
-        );
-    }
-
-    let width = 720.0;
-    let height = 120.0;
-    let pad_x = 8.0;
-    let pad_y = 10.0;
-    let plot_width = width - (pad_x * 2.0);
-    let plot_height = height - (pad_y * 2.0);
-    let max_rate = download
-        .iter()
-        .chain(upload.iter())
-        .copied()
-        .fold(0.0f64, f64::max)
-        .max(1.0);
-
-    let mut grid = String::new();
-    for idx in 0..=3 {
-        let y = pad_y + (plot_height / 3.0) * idx as f64;
-        grid.push_str(&format!(
-            "<line x1=\"{pad_x:.1}\" y1=\"{y:.1}\" x2=\"{x2:.1}\" y2=\"{y:.1}\" stroke=\"rgba(116,119,127,0.25)\" stroke-width=\"1\" />",
-            x2 = width - pad_x
-        ));
-    }
-
-    let build_points = |values: &[f64]| -> String {
-        if values.is_empty() {
-            return String::new();
-        }
-        let start = sample_count.saturating_sub(values.len());
-        let denom = sample_count.saturating_sub(1).max(1) as f64;
-        let mut out = String::new();
-        for (idx, value) in values.iter().enumerate() {
-            let x = pad_x + ((start + idx) as f64 / denom) * plot_width;
-            let normalized = (*value / max_rate).clamp(0.0, 1.0);
-            let y = pad_y + (1.0 - normalized) * plot_height;
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(&format!("{x:.1},{y:.1}"));
-        }
-        out
-    };
-
-    let max_label = human_rate(max_rate);
-    format!(
-        "<div class=\"speed-chart\"><svg viewBox=\"0 0 {width:.0} {height:.0}\" preserveAspectRatio=\"none\" aria-label=\"transfer speed chart\"><text x=\"{label_x:.1}\" y=\"{label_y:.1}\" fill=\"currentColor\" opacity=\"0.65\" font-size=\"10\" text-anchor=\"end\">{max_label}</text>{grid}<polyline fill=\"none\" stroke=\"var(--primary)\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"{down_points}\" /><polyline fill=\"none\" stroke=\"var(--tertiary)\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"{up_points}\" /></svg><div class=\"speed-legend\"><span class=\"item\"><span class=\"swatch down\"></span>Download {latest_down}</span><span class=\"item\"><span class=\"swatch up\"></span>Upload {latest_up}</span></div></div>",
-        label_x = width - pad_x,
-        label_y = pad_y - 2.0,
-        down_points = build_points(download),
-        up_points = build_points(upload),
-    )
-}
-
-fn format_eta_secs(secs: u64) -> String {
-    if secs == 0 {
-        return "--:--".to_string();
-    }
-    let hours = secs / 3600;
-    let minutes = (secs % 3600) / 60;
-    let seconds = secs % 60;
-    if hours > 0 {
-        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-    } else {
-        format!("{:02}:{:02}", minutes, seconds)
-    }
-}
-
-fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn escape_js_single_quoted(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            '<' => out.push_str("\\x3c"),
-            '>' => out.push_str("\\x3e"),
-            '&' => out.push_str("\\x26"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 fn escape_json(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
+    escape_json_into(&mut out, input);
+    out
+}
+
+fn escape_json_into(out: &mut String, input: &str) {
     for ch in input.chars() {
         match ch {
             '"' => out.push_str("\\\""),
@@ -3461,13 +2742,13 @@ fn escape_json(input: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             _ => out.push(ch),
         }
     }
-    out
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3475,34 +2756,6 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
-
-    fn torrent_list_is_inside_layout(html: &str) -> bool {
-        let mut index = 0usize;
-        let mut div_stack: Vec<&'static str> = Vec::new();
-        while let Some(start_rel) = html[index..].find('<') {
-            let start = index + start_rel;
-            let Some(end_rel) = html[start..].find('>') else {
-                break;
-            };
-            let end = start + end_rel + 1;
-            let tag = &html[start..end];
-            if tag.starts_with("<div") {
-                if tag.contains("class=\"layout\"") || tag.contains("class=\"layout ") {
-                    div_stack.push("layout");
-                } else {
-                    div_stack.push("div");
-                }
-            } else if tag.starts_with("</div") {
-                if div_stack.pop().is_none() {
-                    return false;
-                }
-            } else if tag.starts_with("<main") && tag.contains("class=\"torrent-list\"") {
-                return div_stack.contains(&"layout");
-            }
-            index = end;
-        }
-        false
-    }
 
     fn run_single_request(request_bytes: &[u8], cmd_tx: Option<mpsc::Sender<UiCommand>>) -> String {
         let state = Arc::new(Mutex::new(UiState::default()));
@@ -3909,207 +3162,282 @@ mod tests {
         assert_eq!(extract_origin_host("invalid"), None);
     }
 
+    fn run_request_with_state(request_bytes: &[u8], state: UiState) -> String {
+        let state = Arc::new(Mutex::new(state));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            handle_connection(stream, state, None).expect("handle request");
+        });
+        let mut client = TcpStream::connect(addr).expect("connect test listener");
+        client.write_all(request_bytes).expect("write request");
+        client.shutdown(Shutdown::Write).expect("shutdown write");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        server.join().expect("join server");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+        let head = response.split("\r\n\r\n").next()?;
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    fn body(response: &str) -> &str {
+        response.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for (index, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+                if index <= chunk.len() {
+                    out.push(TABLE[((n >> shift) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    fn sample_torrent(id: u64, name: &str) -> UiTorrent {
+        UiTorrent {
+            id,
+            name: name.to_string(),
+            info_hash: format!("{id:040x}"),
+            status: "downloading".to_string(),
+            total_bytes: 2048,
+            completed_bytes: 1024,
+            files: vec![UiFile {
+                path: format!("{name}/a.bin"),
+                length: 2048,
+                completed: 1024,
+                priority: 2,
+            }],
+            trackers: vec!["udp://tracker.example:1337/announce".to_string()],
+            peer_country_counts: vec![("US".to_string(), 3)],
+            ..UiTorrent::default()
+        }
+    }
+
     #[test]
-    fn formatting_helpers_are_stable() {
-        assert_eq!(human_bytes(999), "999 B");
-        assert_eq!(human_bytes(1024), "1.00 KB");
-        assert_eq!(human_rate(0.0), "0 B/s");
-        assert_eq!(human_rate(1536.0), "1.50 KB/s");
-        assert_eq!(format_eta_secs(0), "--:--");
-        assert_eq!(format_eta_secs(61), "01:01");
-        assert_eq!(format_eta_secs(3661), "01:01:01");
-        assert_eq!(escape_html("<a&\"'>"), "&lt;a&amp;&quot;&#39;&gt;");
+    fn json_escaping_is_stable() {
         assert_eq!(escape_json("a\"b\\\n"), "a\\\"b\\\\\\n");
+        assert_eq!(escape_json("\u{1}\u{2028}"), "\\u0001\\u2028");
+        let mut out = String::new();
+        push_float(&mut out, f64::NAN, 2);
+        assert_eq!(out, "0");
     }
 
     #[test]
-    fn desktop_layout_breakpoints_keep_two_columns_until_small_widths() {
-        let html = status_html(&UiState::default());
-        assert!(html.contains(".app{"));
-        assert!(html.contains("max-width:1600px;"));
-        assert!(html.contains("height:100svh;"));
-        assert!(html.contains(".layout{"));
-        assert!(html.contains("flex:1 1 auto;"));
-        assert!(html.contains("overflow:hidden;"));
-        assert!(html.contains(".sidebar{"));
-        assert!(html.contains("flex:0 0 260px;"));
-        assert!(html.contains("width:260px;"));
-        assert!(html.contains(".torrent-list{"));
-        assert!(html.contains("overflow-y:auto;"));
-        assert!(html.contains("@media(max-width:900px){"));
-        assert!(html.contains(".layout{gap:16px}"));
-        assert!(html.contains(".sidebar{flex-basis:240px;width:240px}"));
-        assert!(html.contains("@media(max-width:520px){"));
-        assert!(html.contains(".layout{flex-direction:column;align-items:stretch;overflow-y:auto;"));
-        assert!(html.contains(".sidebar{position:static;flex:0 0 auto;width:100%;"));
-        assert!(html.contains(".torrent-list{flex:0 0 auto;overflow:visible;"));
-        assert!(html.contains(".appbar-main{width:100%;min-width:0;flex-direction:column;"));
+    fn shell_is_small_and_loads_external_assets() {
+        let html = shell_html();
+        assert!(html.len() < 2048, "shell grew to {} bytes", html.len());
+        assert!(html.contains(&format!(
+            "<meta name=\"rustorrent-api-token\" content=\"{}\">",
+            api_token()
+        )));
+        assert!(html.contains("<link rel=\"stylesheet\" href=\"/app.css\">"));
+        assert!(html.contains("<script src=\"/app.js\" defer></script>"));
+        assert!(html.contains("<div id=\"app\"></div>"));
+        assert!(html.contains(&format!("<script>{THEME_BOOTSTRAP}</script>")));
+        assert!(!html.contains("<style"));
     }
 
     #[test]
-    fn session_port_mapping_uses_stacked_layout_for_long_statuses() {
-        let state = UiState {
-            incoming_port: 6881,
-            natpmp_status: "mapped nat-pmp on port 6881".to_string(),
-            upnp_status: "mapped upnp on port 6881".to_string(),
+    fn content_security_policy_allows_only_the_theme_bootstrap_inline() {
+        let hash = base64(&crate::sha256::sha256(THEME_BOOTSTRAP.as_bytes()));
+        let policy = SECURITY_HEADERS
+            .lines()
+            .find(|line| line.starts_with("Content-Security-Policy:"))
+            .expect("csp header");
+        assert!(
+            policy.contains(&format!("script-src 'self' 'sha256-{hash}'")),
+            "update the script-src hash to 'sha256-{hash}'"
+        );
+        assert!(!policy.contains("unsafe-inline"));
+    }
+
+    #[test]
+    fn root_serves_the_shell_without_caching() {
+        let response = run_single_request(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:9473\r\n\r\n", None);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            header(&response, "content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(header(&response, "cache-control")
+            .unwrap_or("")
+            .contains("no-store"));
+        assert_eq!(body(&response), shell_html());
+    }
+
+    #[test]
+    fn assets_are_served_with_strong_etags_and_revalidate() {
+        for (path, content_type, asset) in UI_ASSETS {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:9473\r\n\r\n");
+            let response = run_single_request(request.as_bytes(), None);
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{path}");
+            assert_eq!(header(&response, "content-type"), Some(content_type));
+            assert_eq!(header(&response, "cache-control"), Some("no-cache"));
+            assert_eq!(header(&response, "x-content-type-options"), Some("nosniff"));
+            let etag = header(&response, "etag").expect("etag").to_string();
+            assert_eq!(etag, asset_etag(asset));
+            assert!(etag.starts_with('"') && etag.len() == 42);
+            assert_eq!(body(&response).as_bytes(), asset);
+
+            let request = format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:9473\r\nIf-None-Match: \"stale\", {etag}\r\n\r\n"
+            );
+            let response = run_single_request(request.as_bytes(), None);
+            assert!(response.starts_with("HTTP/1.1 304 Not Modified"), "{path}");
+            assert_eq!(header(&response, "etag"), Some(etag.as_str()));
+            assert_eq!(header(&response, "content-length"), None);
+            assert!(body(&response).is_empty());
+
+            let request = format!(
+                "HEAD {path} HTTP/1.1\r\nHost: 127.0.0.1:9473\r\nIf-None-Match: \"stale\"\r\n\r\n"
+            );
+            let response = run_single_request(request.as_bytes(), None);
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            let length = asset.len().to_string();
+            assert_eq!(header(&response, "content-length"), Some(length.as_str()));
+            assert!(body(&response).is_empty());
+        }
+    }
+
+    #[test]
+    fn etag_matching_accepts_lists_weak_tags_and_wildcards() {
+        assert!(etag_matches(Some("\"a\""), "\"a\""));
+        assert!(etag_matches(Some("W/\"a\""), "\"a\""));
+        assert!(etag_matches(Some("\"b\" , \"a\""), "\"a\""));
+        assert!(etag_matches(Some("*"), "\"a\""));
+        assert!(!etag_matches(Some("\"b\""), "\"a\""));
+        assert!(!etag_matches(None, "\"a\""));
+    }
+
+    #[test]
+    fn asset_requests_still_require_a_safe_host() {
+        let response = run_single_request(
+            b"GET /app.js HTTP/1.1\r\nHost: attacker.example\r\n\r\n",
+            None,
+        );
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn sse_delta_sends_a_snapshot_then_only_changes() {
+        let mut state = UiState {
+            download_dir: "/downloads".to_string(),
             ..UiState::default()
         };
+        state.torrents.push(sample_torrent(1, "alpha"));
+        state.torrents.push(sample_torrent(2, "beta"));
+        let mut snapshot = SseSnapshot::default();
 
-        let body_html = app_body_html(&state);
-        let full_html = status_html(&state);
-        assert!(body_html.contains("<div class=\"session-row stack\"><span>Port Mapping</span>"));
-        assert!(
-            body_html.contains(
-                "<span class=\"session-value\"><span>mapped nat-pmp on port 6881</span><span>mapped upnp on port 6881</span></span>"
+        let first = sse_delta(&state, &mut snapshot).expect("initial snapshot");
+        assert!(first.starts_with("{\"g\":{\"version\":"));
+        assert!(first.contains("\"download_dir\":\"/downloads\""));
+        assert!(first.contains("\"name\":\"alpha\"") && first.contains("\"name\":\"beta\""));
+        assert!(first.ends_with(",\"ids\":[1,2]}"));
+        assert!(!first.contains("\"files\""), "stream omits file lists");
+        assert!(first.contains("\"file_count\":1"));
+        assert!(first.contains("\"flag\":\"\u{1F1FA}\u{1F1F8}\""));
+        assert_eq!(sse_delta(&state, &mut snapshot), None);
+
+        state.torrents[1].download_rate_bps = 2048.4;
+        let second = sse_delta(&state, &mut snapshot).expect("torrent change");
+        assert!(second.starts_with("{\"t\":[{\"id\":2,"));
+        assert!(second.contains("\"download_rate_bps\":2048"));
+        assert!(!second.contains("\"g\"") && !second.contains("\"ids\""));
+
+        state.upload_rate_bps = 10.0;
+        state.torrents.remove(0);
+        let third = sse_delta(&state, &mut snapshot).expect("session and order change");
+        assert!(third.starts_with("{\"g\":{"));
+        assert!(third.ends_with("\"ids\":[2]}"));
+        assert!(!third.contains("\"t\""));
+    }
+
+    #[test]
+    fn files_revision_tracks_progress_priority_and_names() {
+        let mut torrent = sample_torrent(1, "alpha");
+        let original = files_rev(&torrent.files);
+        torrent.files[0].completed += 1;
+        let progressed = files_rev(&torrent.files);
+        assert_ne!(original, progressed);
+        torrent.files[0].priority = 3;
+        let prioritized = files_rev(&torrent.files);
+        assert_ne!(progressed, prioritized);
+        torrent.files[0].path = "alpha/b.bin".to_string();
+        assert_ne!(prioritized, files_rev(&torrent.files));
+    }
+
+    #[test]
+    fn torrent_files_endpoint_returns_one_torrents_files() {
+        let mut state = UiState::default();
+        state.torrents.push(sample_torrent(7, "gamma \"quoted\""));
+        let rev = files_rev(&state.torrents[0].files);
+        let response = run_request_with_state(
+            b"GET /torrent/files?id=7 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            state.clone(),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            body(&response),
+            format!(
+                "{{\"id\":7,\"files_rev\":{rev},\"files\":[{{\"path\":\"gamma \\\"quoted\\\"/a.bin\",\"length\":2048,\"completed\":1024,\"percent\":5000,\"priority\":2}}]}}"
             )
         );
-        assert!(full_html.contains(".session-row.stack{"));
+        let response = run_request_with_state(
+            b"GET /torrent/files?id=8 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            state,
+        );
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
     }
 
     #[test]
-    fn successful_port_mapping_hides_failed_alternative() {
-        let state = UiState {
-            incoming_port: 6881,
-            natpmp_status: "failed nat-pmp on port 6881: unsupported".to_string(),
-            upnp_status: "mapped upnp on port 6881".to_string(),
-            ..UiState::default()
-        };
-
-        let body_html = app_body_html(&state);
-        assert!(body_html.contains("<span>mapped upnp on port 6881</span>"));
-        assert!(!body_html.contains("failed nat-pmp"));
-    }
-
-    #[test]
-    fn theme_defaults_to_light_without_saved_preference() {
-        let html = status_html(&UiState::default());
-        assert!(html.contains("if(t!=='light'&&t!=='dark'){t='light';}"));
-        assert!(html.contains("function resolveTheme(){"));
-        assert!(html.contains("let theme='light';"));
-    }
-
-    #[test]
-    fn torrent_list_is_nested_inside_layout_container() {
-        let html = app_body_html(&UiState::default());
-        assert!(torrent_list_is_inside_layout(&html));
-    }
-
-    #[test]
-    fn search_ui_renders_separate_main_tab_workspace() {
-        let html = app_body_html(&UiState::default());
-        assert!(html.contains("data-main-tab-target=\"library\""));
-        assert!(html.contains("data-main-tab-target=\"search\""));
-        assert!(html.contains("data-main-tab=\"library\""));
-        assert!(html.contains("data-main-tab=\"search\""));
-    }
-
-    #[test]
-    fn search_ui_explains_empty_plugin_state() {
-        let html = status_html(&UiState::default());
-        assert!(html.contains(
-            "No search plugins are installed yet. Open Plugins or Community Catalog to add one."
-        ));
-    }
-
-    #[test]
-    fn seeding_status_does_not_force_full_progress_when_bytes_lag() {
-        let mut state = UiState::default();
-        state.torrents.push(UiTorrent {
-            id: 7,
-            name: "ubuntu.iso".to_string(),
-            status: "seeding".to_string(),
-            total_bytes: 1000,
-            completed_bytes: 998,
-            total_pieces: 10,
-            completed_pieces: 9,
-            ..UiTorrent::default()
-        });
-
-        let html = app_body_html(&state);
-        assert!(html.contains("Progress 998 B / 1000 B (99.80%)"));
-    }
-
-    #[test]
-    fn stopped_torrent_renders_resume_action() {
-        let mut state = UiState::default();
-        state.torrents.push(UiTorrent {
-            id: 9,
-            name: "bugonia".to_string(),
-            status: "stopped".to_string(),
-            ..UiTorrent::default()
-        });
-
-        let html = app_body_html(&state);
-        assert!(html.contains("data-paused=\"true\""));
-        assert!(html.contains("#i-play_arrow\"></use></svg>Resume"));
-    }
-
-    #[test]
-    fn stopping_torrent_disables_stop_and_pause_actions() {
-        let mut state = UiState::default();
-        state.torrents.push(UiTorrent {
-            id: 10,
-            name: "ubuntu.iso".to_string(),
-            status: "stopping".to_string(),
-            ..UiTorrent::default()
-        });
-
-        let html = app_body_html(&state);
-        assert!(html.contains("status-paused\">stopping"));
-        assert!(html.contains("Stopping...</button>"));
-        assert!(html.contains("title=\"Torrent is stopping\""));
-    }
-
-    #[test]
-    fn transfer_panel_renders_archive_recheck_and_speed_chart() {
+    fn status_json_keeps_api_fields_and_adds_ui_fields() {
         let mut state = UiState {
-            download_history_bps: vec![1024.0, 2048.0, 4096.0],
-            upload_history_bps: vec![256.0, 512.0, 768.0],
             peer_profile: "balanced".to_string(),
             peer_profile_global_limit: 200,
-            peer_profile_torrent_limit: 30,
-            peer_profile_numwant: 200,
+            download_history_bps: vec![1.4, 2.6],
             ..UiState::default()
         };
         state.torrents.push(UiTorrent {
-            id: 12,
-            name: "ubuntu.iso".to_string(),
-            status: "downloading".to_string(),
-            ..UiTorrent::default()
+            meta_version: 3,
+            label: "work".to_string(),
+            paused: true,
+            ..sample_torrent(3, "delta")
         });
-
-        let html = app_body_html(&state);
-        assert_eq!(html.matches("data-action=\"recheck\"").count(), 1);
-        assert!(html.contains("data-action=\"archive\""));
-        assert!(html.contains("data-panel=\"transfer\""));
-        assert!(html.contains("data-collapsed=\"true\""));
-        assert!(html.contains("aria-label=\"transfer speed chart\""));
-        assert!(html.contains("data-action=\"toggle-panel\""));
-        assert!(html.contains("id=\"peerProfile\""));
-        assert!(html.contains("Peer Profile"));
-    }
-
-    #[test]
-    fn search_shell_keeps_plugin_panel_hidden_by_default_and_includes_toast_assets() {
-        let html = status_html(&UiState::default());
-        assert!(html.contains(".search-main-panel{display:none}"));
-        assert!(
-            html.contains(".search-main-panel.active{display:flex;flex-direction:column;gap:12px}")
-        );
-        assert!(html.contains(".search-results-panel{min-height:0}"));
-        assert!(html.contains(".search-plugin-manager{min-height:0}"));
-        assert!(!html.contains(".search-results-panel{display:flex"));
-        assert!(!html.contains(".search-plugin-manager{display:flex"));
-        assert!(html.contains(".toast-stack{"));
-        assert!(html.contains("function showToast("));
-        assert!(html.contains("function setSearchSort("));
-        assert!(html.contains("id=\"searchPluginWarning\""));
-    }
-
-    #[test]
-    fn scheduled_live_render_defers_while_add_modal_is_open() {
-        let html = status_html(&UiState::default());
-        assert!(html.contains("function isAddModalOpen()"));
-        assert!(html.contains("if(isAddModalOpen()){pendingHtml=nextHtml;return;}"));
+        let json = status_json(&state);
+        for field in [
+            "\"torrents\":[{\"id\":3,",
+            "\"percent\":5000",
+            "\"paused\":true",
+            "\"files\":[{\"path\":\"delta/a.bin\"",
+            "\"priority\":2",
+            "\"trackers\":[\"udp://tracker.example:1337/announce\"]",
+            "\"peer_countries\":[{\"code\":\"US\",\"count\":3,",
+            "\"meta_version\":3",
+            "\"label\":\"work\"",
+            "\"peer_profile\":\"balanced\"",
+            "\"peer_profile_global_limit\":200",
+            "\"download_history_bps\":[1,3]",
+            "\"session_downloaded_bytes\":0",
+        ] {
+            assert!(json.contains(field), "missing {field} in {json}");
+        }
+        assert_eq!(json.matches('{').count(), json.matches('}').count());
     }
 }

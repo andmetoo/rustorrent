@@ -1,1672 +1,801 @@
-const themeKey='rustorrent-theme';
-const filterKey='rustorrent-library-filter';
-const searchKey='rustorrent-library-search';
-const mainTabKey='rustorrent-main-tab';
-const searchPluginSelectionKey='rustorrent-search-plugins';
-const searchCategoryKey='rustorrent-search-category';
-const searchSortStorageKey='rustorrent-search-sort';
-const collapsePrefix='rustorrent-collapse:';
-const panelCollapsePrefix='rustorrent-panel:';
-let pendingHtml=null;
-let activeTheme=null;
-let queuedLiveHtml=null;
-let liveRenderTimer=null;
-let searchStateCache=null;
-let searchCatalogCache=[];
-let searchPollTimer=null;
-let searchPollActive=false;
-let searchCatalogLoading=false;
-let searchCatalogFetchedAt=0;
-let activeSearchPanelView='results';
-const addedSearchResults=new Set();
-let lastSearchStartedAt=0;
-let activeSearchSort={key:'seeds',dir:'desc'};
-const liveRenderIntervalMs=450;
-const MAX_RATE_LIMIT_KBPS=102400;
-const apiTokenMeta=document.querySelector('meta[name="rustorrent-api-token"]');
-let apiToken=apiTokenMeta?String(apiTokenMeta.getAttribute('content')||'').trim():'';
-function syncApiTokenMeta(){
-  if(!apiTokenMeta){return;}
-  const value=String(apiTokenMeta.getAttribute('content')||'').trim();
-  if(value){apiToken=value;}
+'use strict';
+// Rustorrent web UI. Everything renders client-side from the /events JSON stream.
+const $=id=>document.getElementById(id);
+const store={
+  get(k,d=''){try{const v=localStorage.getItem('rustorrent-'+k);return v==null?d:v}catch(e){return d}},
+  set(k,v){try{v==null?localStorage.removeItem('rustorrent-'+k):localStorage.setItem('rustorrent-'+k,v)}catch(e){}}
+};
+const ICONS={
+  plus:'M12 5v14M5 12h14',down:'M12 5v14m-5.5-5.5L12 19l5.5-5.5',up:'M12 19V5M6.5 10.5 12 5l5.5 5.5',
+  pause:'M9 6.5v11M15 6.5v11',play:'M8 5.5v13L19 12z',
+  folder:'M3.5 6.5a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z',
+  trash:'M4.5 7h15M10 4h4M6.5 7l.8 11.2a1.5 1.5 0 0 0 1.5 1.3h6.4a1.5 1.5 0 0 0 1.5-1.3L17.5 7M10 11v5M14 11v5',
+  chev:'m9.5 6.5 5.5 5.5-5.5 5.5',list:'M9 6.5h11M9 12h11M9 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01',
+  dl:'M12 4v10.5m-4.5-4.5 4.5 4.5 4.5-4.5M5 19.5h14',
+  alert:'M10.3 4.3 2.9 17.5A2 2 0 0 0 4.6 20.5h14.8a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0zM12 9.5v4M12 17h.01',
+  tag:'M3.5 12V5a1.5 1.5 0 0 1 1.5-1.5h7l8.5 8.5-8.5 8.5zM8.2 8.2h.01',
+  search:'M10.5 17a6.5 6.5 0 1 0 0-13 6.5 6.5 0 0 0 0 13zM20 20l-4.8-4.8',
+  rss:'M5.5 18.5h.01M5 11.5a7.5 7.5 0 0 1 7.5 7.5M5 5a14 14 0 0 1 14 14',
+  sliders:'M4 7.5h9M17 7.5h3M15 5v5M4 16.5h3M11 16.5h9M9 14v5',
+  sun:'M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 3v2M12 19v2M5.6 5.6 7 7M17 17l1.4 1.4M3 12h2M19 12h2M5.6 18.4 7 17M17 7l1.4-1.4',
+  moon:'M19.5 14.6A7.5 7.5 0 0 1 9.4 4.5a7.8 7.8 0 1 0 10.1 10.1z',
+  x:'M6.5 6.5l11 11M17.5 6.5l-11 11',recheck:'M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4',
+  stop:'M7 7h10v10H7z',
+  archive:'M4.5 9h15v9.5a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1zM3.5 4.5h17V9h-17zM10 12.5h4',
+  file:'M13.5 3.5H7A1.5 1.5 0 0 0 5.5 5v14A1.5 1.5 0 0 0 7 20.5h10a1.5 1.5 0 0 0 1.5-1.5V8.5zM13.5 3.5v5h5M12 17.5v-6m-2.5 2.5L12 11.5l2.5 2.5',
+  pen:'M4.5 19.5h4l10-10a2 2 0 0 0-4-4l-10 10zM13.5 6.5l4 4',ok:'m5.5 12.5 4 4 9-9'
+};
+const ic=n=>`<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[n]}"/></svg>`;
+const tpl=document.createElement('template');
+function icon(n){tpl.innerHTML=ic(n);return tpl.content.firstChild}
+// h('div.a.b',{attr:value,text:'…'},...children); the attribute object is optional.
+function h(sel,...kids){
+  const [tag,...cls]=sel.split('.'),e=document.createElement(tag),a=kids[0];
+  if(cls.length)e.className=cls.join(' ');
+  if(a&&a.constructor===Object){kids.shift();for(const k in a){const v=a[k];if(v==null||v===false)continue;if(k==='text')e.textContent=v;else e.setAttribute(k,v===true?'':v)}}
+  e.append(...kids.flat().filter(c=>c!=null&&c!==false));
+  return e;
 }
-async function refreshApiToken(){
-  try{
-    const res=await fetch('/api-token',{cache:'no-store',headers:{'Accept':'application/json'}});
-    if(!res.ok){return false;}
-    const data=await res.json();
-    const token=data&&typeof data.token==='string'?data.token.trim():'';
-    if(!token){return false;}
-    apiToken=token;
-    if(apiTokenMeta){apiTokenMeta.setAttribute('content',token);}
-    return true;
-  }catch(e){
-    return false;
-  }
-}
-syncApiTokenMeta();
-function resolveTheme(){
-  let theme='light';
-  try{
-    const stored=localStorage.getItem(themeKey);
-    if(stored==='light'||stored==='dark'){theme=stored;}
-  }catch(e){}
-  return theme;
-}
-function applyTheme(theme){
-  const root=document.documentElement;
-  if(activeTheme!==theme){
-    root.classList.add('theme-switching');
-    root.setAttribute('data-theme',theme);
-    activeTheme=theme;
-    requestAnimationFrame(()=>requestAnimationFrame(()=>root.classList.remove('theme-switching')));
-  }
-  const themeBtn=document.getElementById('themeToggle');
-  if(themeBtn){themeBtn.innerHTML='<svg class="material-symbols-rounded"><use href=#i-'+(theme==='light'?'light_mode':'dark_mode')+'></use></svg>';}
-}
-function resolveMainTab(){
-  try{
-    const value=localStorage.getItem(mainTabKey)||'library';
-    if(value==='search'){return 'search';}
-  }catch(e){}
-  return 'library';
-}
-function applyMainTab(tab){
-  const next=tab==='search'?'search':'library';
-  const tabs=Array.from(document.querySelectorAll('[data-main-tab-target]'));
-  tabs.forEach(btn=>{const active=btn.dataset.mainTabTarget===next;btn.classList.toggle('active',active);btn.setAttribute('aria-pressed',String(active));});
-  const workspaces=Array.from(document.querySelectorAll('.workspace[data-main-tab]'));
-  workspaces.forEach(view=>view.classList.toggle('active',view.dataset.mainTab===next));
-  if(next==='search'&&searchCatalogCache.length===0&&!searchCatalogLoading){
-    loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
-  }
-}
-function resolveSearchPanelView(){return activeSearchPanelView;}
-function applySearchPanelView(view){
-  const next=view==='plugins'?'plugins':'results';
-  activeSearchPanelView=next;
-  const panels=Array.from(document.querySelectorAll('[data-search-view]'));
-  panels.forEach(panel=>panel.classList.toggle('active',panel.dataset.searchView===next));
-  const toggles=Array.from(document.querySelectorAll('[data-search-view-target]'));
-  toggles.forEach(btn=>btn.classList.toggle('active',btn.dataset.searchViewTarget===next));
-  if(next==='plugins'&&searchCatalogCache.length===0&&!searchCatalogLoading){
-    loadSearchCatalog(true).catch(err=>console.warn('search catalog failed',err));
-  }
-}
-function resolveFilter(){
-  let filter='all';
-  try{const stored=localStorage.getItem(filterKey);if(stored){filter=stored;}}catch(e){}
-  return filter;
-}
-function resolveSearch(){
-  try{return localStorage.getItem(searchKey)||'';}catch(e){}
-  return '';
-}
-function applyFilter(filter){
-  const searchRaw=resolveSearch();
-  const search=searchRaw.trim().toLowerCase();
-  const searchInput=document.getElementById('librarySearch');
-  if(searchInput&&searchInput.value!==searchRaw){searchInput.value=searchRaw;}
-  const buttons=Array.from(document.querySelectorAll('.nav-item[data-filter]'));
-  buttons.forEach(btn=>{const active=btn.dataset.filter===filter;btn.classList.toggle('active',active);});
-  const cards=Array.from(document.querySelectorAll('.torrent-card'));
-  cards.forEach(card=>{
-    const status=card.dataset.status||'downloading';
-    const name=(card.dataset.name||'').toLowerCase();
-    const cardLabel=card.dataset.label||'';
-    let matchesFilter;
-    if(filter==='all'){matchesFilter=true;}
-    else if(filter.startsWith('label:')){matchesFilter=cardLabel===filter.slice(6);}
-    else{matchesFilter=status===filter;}
-    const matchesSearch=!search||name.includes(search);
-    if(matchesFilter&&matchesSearch){card.style.display='';}else{card.style.display='none';}
-  });
-  const empty=document.getElementById('filterEmpty');
-  if(empty){empty.hidden=cards.length===0||cards.some(card=>card.style.display!=='none');}
-  buttons.forEach(btn=>btn.setAttribute('aria-pressed',String(btn.dataset.filter===filter)));
-}
-function clearLibraryFilters(){
-  try{localStorage.removeItem(searchKey);localStorage.removeItem(filterKey);}catch(e){}
-  applyFilter('all');
-}
-function collapseKey(hash){return collapsePrefix+hash;}
-function panelCollapseKey(name){return panelCollapsePrefix+name;}
-function defaultPanelCollapsed(name){return name==='transfer';}
-function isPanelCollapsed(name){
-  try{
-    const stored=localStorage.getItem(panelCollapseKey(name));
-    if(stored==='1'){return true;}
-    if(stored==='0'){return false;}
-  }catch(e){}
-  return defaultPanelCollapsed(name);
-}
-function applyCollapseState(){
-  const cards=Array.from(document.querySelectorAll('.torrent-card'));
-  cards.forEach(card=>{
-    const hash=card.dataset.infoHash||'';
-    let collapsed=true;
-    try{
-      const stored=localStorage.getItem(collapseKey(hash));
-      if(stored==='0'){collapsed=false;}
-      if(stored==='1'){collapsed=true;}
-    }catch(e){}
-    card.dataset.collapsed=collapsed?'true':'false';
-    const toggle=card.querySelector("[data-action='toggle-expand']");
-    if(toggle){toggle.innerHTML=collapsed?'<svg class="material-symbols-rounded"><use href=#i-unfold_more></use></svg>Expand':'<svg class="material-symbols-rounded"><use href=#i-unfold_less></use></svg>Collapse';toggle.setAttribute('aria-expanded',collapsed?'false':'true');}
-  });
-}
-function applyPanelState(){
-  const panels=Array.from(document.querySelectorAll('[data-panel]'));
-  panels.forEach(panel=>{
-    const name=panel.dataset.panel||'';
-    const collapsed=isPanelCollapsed(name);
-    panel.dataset.collapsed=collapsed?'true':'false';
-    const toggle=panel.querySelector('[data-action="toggle-panel"]');
-    if(toggle){
-      toggle.innerHTML=collapsed?'<svg class="material-symbols-rounded"><use href=#i-unfold_more></use></svg>Expand':'<svg class="material-symbols-rounded"><use href=#i-unfold_less></use></svg>Collapse';
-      toggle.setAttribute('aria-expanded',collapsed?'false':'true');
-    }
-  });
-}
-function syncAttributes(current,next){
-  const isModal=current.id==='addModal';
-  const hadOpen=isModal&&current.classList.contains('open');
-  const isDz=current.id==='dropZone';
-  const dzHasFile=isDz&&current.classList.contains('has-file');
-  const toRemove=[];
-  for(const attr of Array.from(current.attributes||[])){
-    if(attr.name==='open'&&current.tagName==='DETAILS'){continue;}
-    if(!next.hasAttribute(attr.name)){toRemove.push(attr.name);}
-  }
-  toRemove.forEach(name=>current.removeAttribute(name));
-  for(const attr of Array.from(next.attributes||[])){
-    if(current.getAttribute(attr.name)!==attr.value){current.setAttribute(attr.name,attr.value);}
-  }
-  if(hadOpen){current.classList.add('open');}
-  if(dzHasFile){current.classList.add('has-file');}
-}
-function syncElementValue(current,next){
-  if(current===document.activeElement){return;}
-  const tag=current.tagName;
-  if(tag==='INPUT'){
-    const type=String(current.type||'').toLowerCase();
-    if(type==='checkbox'||type==='radio'){
-      if(current.checked!==next.checked){current.checked=next.checked;}
-    }else if(current.value!==next.value){
-      current.value=next.value;
-    }
-    return;
-  }
-  if(tag==='TEXTAREA'){
-    if(current.value!==next.value){current.value=next.value;}
-    return;
-  }
-  if(tag==='SELECT'){
-    if(current.value!==next.value){current.value=next.value;}
-  }
-}
-function morphNode(current,next){
-  if(!current||!next){return;}
-  if(current.nodeType!==next.nodeType||current.nodeName!==next.nodeName){
-    current.replaceWith(next.cloneNode(true));
-    return;
-  }
-  if(current.nodeType===Node.TEXT_NODE||current.nodeType===Node.COMMENT_NODE){
-    if(current.nodeValue!==next.nodeValue){current.nodeValue=next.nodeValue;}
-    return;
-  }
-  if(current.classList?.contains('file-cell')&&current.contains(document.activeElement)){return;}
-  syncAttributes(current,next);
-  syncElementValue(current,next);
-  morphChildren(current,next);
-}
-function morphChildren(current,next){
-  const nextChildren=Array.from(next.childNodes);
-  const key=node=>node.nodeType===1?(node.id|| (node.matches('.torrent-card')?'torrent:'+node.dataset.id:'')):'';
-  for(let i=0;i<nextChildren.length;i+=1){
-    let curr=current.childNodes[i];
-    const nxt=nextChildren[i];
-    const nextKey=key(nxt);
-    if(nextKey&&(!curr||key(curr)!==nextKey)){
-      const match=Array.from(current.childNodes).find(node=>key(node)===nextKey);
-      if(match){current.insertBefore(match,curr||null);curr=match;}
-      else{current.insertBefore(nxt.cloneNode(true),curr||null);continue;}
-    }
-    if(!curr&&nxt){
-      current.appendChild(nxt.cloneNode(true));
-      continue;
-    }
-    morphNode(curr,nxt);
-  }
-  while(current.childNodes.length>nextChildren.length){current.lastChild.remove();}
-}
-function renderApp(html){
-  const root=document.getElementById('appRoot');
-  if(!root){return;}
-  if(!root.firstChild){
-    root.innerHTML=html;
-  }else{
-    const tpl=document.createElement('template');
-    tpl.innerHTML=html;
-    morphChildren(root,tpl.content);
-  }
-  applyTheme(activeTheme||resolveTheme());
-  applyMainTab(resolveMainTab());
-  applySearchPanelView(resolveSearchPanelView());
-  applyFilter(resolveFilter());
-  applyCollapseState();
-  applyPanelState();
-  updateRateLimitLabels();
-  if(searchStateCache){renderSearchStatus(searchStateCache);}
-  if(searchCatalogCache.length>0){renderSearchCatalog(searchCatalogCache);}
-  enhanceUI();
-}
-function scheduleLiveRender(html){
-  queuedLiveHtml=html;
-  if(liveRenderTimer!==null){return;}
-  liveRenderTimer=setTimeout(()=>{
-    liveRenderTimer=null;
-    const nextHtml=queuedLiveHtml;
-    queuedLiveHtml=null;
-    if(nextHtml){
-      if(isAddModalOpen()){pendingHtml=nextHtml;return;}
-      renderApp(nextHtml);
-    }
-  },liveRenderIntervalMs);
-}
-function isAddModalOpen(){
-  const modal=document.getElementById('addModal');
-  return !!(modal&&modal.classList.contains('open'))||!!document.getElementById('removeDialog')?.open;
-}
-function applyUpdate(html){
-  if(isAddModalOpen()){pendingHtml=html;return;}
-  scheduleLiveRender(html);
-  pendingHtml=null;
-}
-let addParseToken=0;
-let addDraft={kind:'none',name:'',fileName:'',files:[],totalBytes:0,infoHash:'',bytes:null,parseError:'',parsing:false};
-const textDecoder=new TextDecoder();
-function resetAddDraft(){
-  addParseToken+=1;
-  addDraft={kind:'none',name:'',fileName:'',files:[],totalBytes:0,infoHash:'',bytes:null,parseError:'',parsing:false};
-}
-let addReturnFocus=null;
-function openAdd(){
-  const modal=document.getElementById('addModal');
-  if(!modal){return;}
-  addReturnFocus=document.activeElement;
-  document.getElementById('addError')?.remove();
-  modal.classList.add('open');
-  resetAddDraft();
-  const fileInput=document.getElementById('torrentFile');
-  const magnetInput=document.getElementById('magnet');
-  const startWhenAdded=document.getElementById('startWhenAdded');
-  if(fileInput){fileInput.value='';}
-  if(magnetInput){magnetInput.value='';}
-  if(startWhenAdded){startWhenAdded.checked=true;}
-  updateDropZoneState();
-  renderAddReview();
-  enhanceUI();
-  document.getElementById('magnet')?.focus();
-}
-function closeAdd(){
-  const modal=document.getElementById('addModal');
-  if(modal){modal.classList.remove('open')}
-  resetAddDraft();
-  if(pendingHtml){
-    const html=pendingHtml;
-    pendingHtml=null;
-    queuedLiveHtml=null;
-    if(liveRenderTimer!==null){
-      clearTimeout(liveRenderTimer);
-      liveRenderTimer=null;
-    }
-    renderApp(html);
-  }
-  if(addReturnFocus?.isConnected){addReturnFocus.focus();}
-}
-function maybeClose(e){if(e.target&&e.target.id==='addModal'){closeAdd()}}
-document.addEventListener('keydown',e=>{
-  const modal=document.getElementById('addModal');
-  if(!(modal&&modal.classList.contains('open'))){
-    if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='o'){e.preventDefault();openAdd();}
-    return;
-  }
-  if(e.key==='Escape'){e.preventDefault();closeAdd();}
-  if(e.key==='Tab'){
-    const items=Array.from(modal.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex="0"]')).filter(node=>node.getClientRects().length);
-    const first=items[0],last=items[items.length-1];
-    if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}
-    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}
-  }
-});
-async function chooseDownloadDir(){
-  const input=document.getElementById('downloadDir');
-  if(!input){return;}
-  const current=(input.value||'').trim();
-  try{
-    const data=await apiPostJson('/select-download-dir');
-    const path=data&&typeof data.path==='string'?data.path.trim():'';
-    if(path){input.value=path;}
-    return;
-  }catch(err){
-    const message=actionErrorMessage(err);
-    const unsupported=message.toLowerCase().includes('not available on this platform');
-    if(!unsupported){
-      alert('Folder picker failed: '+message);
-      return;
-    }
-  }
-  const next=prompt('Download directory path:',current||'');
-  if(next===null){return;}
-  const value=next.trim();
-  if(value){input.value=value;}
-}
-function actionErrorMessage(err){
-  if(err&&err.message){return err.message;}
-  return String(err||'unknown error');
-}
-function toastStack(){
-  let stack=document.querySelector('.toast-stack');
-  if(stack){return stack;}
-  stack=document.createElement('div');
-  stack.className='toast-stack';
-  stack.setAttribute('role','status');
-  stack.setAttribute('aria-live','polite');
-  document.body.appendChild(stack);
-  return stack;
-}
-function showToast(title,message){
-  const stack=toastStack();
-  const toast=document.createElement('div');
-  toast.className='toast';
-  toast.innerHTML=''
-    +'<div class="toast-icon"><svg class="material-symbols-rounded" style="font-size:16px"><use href=#i-check></use></svg></div>'
-    +'<div class="toast-copy">'
-    +'<div class="toast-title">'+escapeHtml(title||'Done')+'</div>'
-    +(message?('<div class="toast-body">'+escapeHtml(message)+'</div>'):'')
-    +'</div>';
-  stack.appendChild(toast);
-  requestAnimationFrame(()=>toast.classList.add('show'));
-  setTimeout(()=>{
-    toast.classList.remove('show');
-    setTimeout(()=>toast.remove(),260);
-  },2600);
-}
-function showActionError(err){
-  showToast('Action failed',actionErrorMessage(err));
-}
-function showAddError(message){
-  let error=document.getElementById('addError');
-  if(!error){error=document.createElement('div');error.id='addError';error.className='add-error';error.setAttribute('role','alert');document.querySelector('#addModal .modal-actions')?.before(error);}
-  error.textContent=message;
-}
-async function apiPost(url,options){
-  if(!apiToken){await refreshApiToken();}
-  let attemptedRefresh=false;
-  while(true){
-    const req=Object.assign({method:'POST',cache:'no-store'},options||{});
-    const headers=new Headers(req.headers||{});
-    if(apiToken){headers.set('X-Rustorrent-Token',apiToken);}
-    req.headers=headers;
+function txt(e,v){v=v==null?'':String(v);if(e.textContent!==v)e.textContent=v}
+function attr(e,k,v){if(v==null||v===false)e.removeAttribute(k);else if(e.getAttribute(k)!==(v=v===true?'':String(v)))e.setAttribute(k,v)}
+const ibtn=(n,label,a,cls='',data={})=>h('button.ib'+cls,{'aria-label':label,title:label,'data-a':a,...data},icon(n));
+const btn=(label,n,a,cls='')=>h('button.btn.sm'+cls,{'data-a':a},icon(n),label);
+const li=(...kids)=>h('div.li',...kids);
+const empty=text=>[h('p.muted',{text})];
 
-    const res=await fetch(url,req);
-    if(res.ok){return res;}
+/* formatting */
+function bytes(v){v=Math.max(0,+v||0);let i=0;while(v>=1024&&i<4){v/=1024;i++}return (i?v.toFixed(v<10?2:v<100?1:0):v)+' '+['B','KB','MB','GB','TB'][i]}
+const rate=v=>v>=1?bytes(v)+'/s':'–';
+function dur(s){s=Math.round(s);if(!(s>0))return '–';const d=s/86400|0,hr=s%86400/3600|0,m=s%3600/60|0;return d?`${d}d ${hr}h`:hr?`${hr}h ${m}m`:m?`${m}m`:`${s}s`}
+const pctText=p=>p>=100?'100%':(Math.floor(p*10)/10).toFixed(1)+'%';
+const ratioText=t=>t.downloaded_bytes>0?(t.uploaded_bytes/t.downloaded_bytes).toFixed(2):t.uploaded_bytes>0?'∞':'–';
+const plural=(n,w)=>n+' '+w+(n===1?'':'s');
 
-    let message='HTTP '+res.status;
-    try{
-      const type=(res.headers.get('content-type')||'').toLowerCase();
-      if(type.includes('application/json')){
-        const data=await res.json();
-        if(data&&typeof data.error==='string'&&data.error.trim()){message=data.error.trim();}
-      }else{
-        const text=(await res.text()).trim();
-        if(text){message=text;}
-      }
-    }catch(e){}
-
-    const lower=String(message||'').toLowerCase();
-    const tokenError=lower.includes('invalid api token')||(lower.includes('missing')&&lower.includes('api token'));
-    if(!attemptedRefresh&&res.status===403&&tokenError){
-      attemptedRefresh=true;
-      if(await refreshApiToken()){continue;}
-    }
-    throw new Error(message);
-  }
-}
-async function apiPostJson(url,options){
-  const res=await apiPost(url,options);
-  const type=(res.headers.get('content-type')||'').toLowerCase();
-  if(type.includes('application/json')){
-    try{
-      const data=await res.json();
-      if(data&&typeof data==='object'){return data;}
-    }catch(e){}
-  }
-  return {ok:true};
-}
-async function fetchJson(url){
-  if(!apiToken){await refreshApiToken();}
-  const headers=new Headers({'Accept':'application/json'});
-  if(apiToken){headers.set('X-Rustorrent-Token',apiToken);}
-  const res=await fetch(url,{cache:'no-store',headers:headers});
-  if(!res.ok){
-    let message='HTTP '+res.status;
-    try{
-      const data=await res.json();
-      if(data&&typeof data.error==='string'&&data.error.trim()){message=data.error.trim();}
-    }catch(e){}
-    throw new Error(message);
-  }
-  return res.json();
-}
-function loadStoredSearchPlugins(){
-  try{
-    const raw=localStorage.getItem(searchPluginSelectionKey)||'[]';
-    const parsed=JSON.parse(raw);
-    if(Array.isArray(parsed)){return parsed.map(v=>String(v||'')).filter(Boolean);}
-  }catch(e){}
-  return [];
-}
-function saveStoredSearchPlugins(modules){
-  try{localStorage.setItem(searchPluginSelectionKey,JSON.stringify(modules||[]));}catch(e){}
-}
-function resolveSearchCategory(){
-  try{
-    const value=localStorage.getItem(searchCategoryKey)||'all';
-    return value||'all';
-  }catch(e){}
-  return 'all';
-}
-function saveSearchCategory(value){
-  try{localStorage.setItem(searchCategoryKey,String(value||'all'));}catch(e){}
-}
-function resolveSearchSort(){
-  try{
-    const raw=localStorage.getItem(searchSortStorageKey)||'';
-    const [key,dir]=raw.split(':');
-    if(key&&dir&&(dir==='asc'||dir==='desc')){
-      return {key:String(key),dir:String(dir)};
-    }
-  }catch(e){}
-  return {key:'seeds',dir:'desc'};
-}
-function saveSearchSort(sort){
-  try{localStorage.setItem(searchSortStorageKey,String(sort.key||'seeds')+':'+String(sort.dir||'desc'));}catch(e){}
-}
-function setSearchSort(key){
-  const nextKey=String(key||'seeds');
-  const nextDir=(activeSearchSort.key===nextKey&&activeSearchSort.dir==='desc')?'asc':'desc';
-  activeSearchSort={key:nextKey,dir:nextDir};
-  saveSearchSort(activeSearchSort);
-  renderSearchResults(searchStateCache&&Array.isArray(searchStateCache.results)?searchStateCache.results:[]);
-}
-function activeSearchPlugins(plugins){
-  const available=(Array.isArray(plugins)?plugins:[]).filter(plugin=>plugin&&plugin.healthy).map(plugin=>String(plugin.module||'')).filter(Boolean);
-  const stored=loadStoredSearchPlugins().filter(module=>available.indexOf(module)!==-1);
-  if(stored.length>0){return stored;}
-  return available;
-}
-function selectedSearchPluginsFromDom(){
-  return Array.from(document.querySelectorAll('input[data-search-plugin]'))
-    .filter(input=>input.checked&&!input.disabled)
-    .map(input=>String(input.getAttribute('data-search-plugin')||''))
-    .filter(Boolean);
-}
-function persistSearchPluginSelectionFromDom(){
-  saveStoredSearchPlugins(selectedSearchPluginsFromDom());
-}
-function recommendedCatalogModules(){
-  return ['piratebay','1337x','bitsearch','limetorrents','torlock','nyaasi','eztv','yts'];
-}
-function recommendedCatalogEntries(entries){
-  const preferred=recommendedCatalogModules();
-  const excluded=new Set(['magnetdl']);
-  const byModule=new Map();
-  const byName=new Map();
-  for(const entry of (Array.isArray(entries)?entries:[])){
-    if(!entry){continue;}
-    const module=String(entry.module||'').toLowerCase();
-    const name=String(entry.name||'').toLowerCase();
-    if(excluded.has(module)||name.includes('magnetdl')){continue;}
-    if(module){byModule.set(module,entry);}
-    if(name){byName.set(name,entry);}
-  }
-  const picked=[];
-  for(const key of preferred){
-    const normalized=String(key||'').toLowerCase();
-    const entry=byModule.get(normalized)||Array.from(byName.values()).find(item=>String(item.name||'').toLowerCase().includes(normalized));
-    if(entry&&!picked.some(item=>item.module===entry.module)){
-      picked.push(entry);
-    }
-  }
-  return picked;
-}
-function useAllReadyPlugins(){
-  const plugins=Array.isArray(searchStateCache&&searchStateCache.plugins)?searchStateCache.plugins:[];
-  const all=plugins.filter(plugin=>plugin&&plugin.healthy).map(plugin=>String(plugin.module||'')).filter(Boolean);
-  saveStoredSearchPlugins(all);
-  renderSearchStatus(searchStateCache||{plugins:plugins||[]});
-}
-function renderSearchPluginList(plugins){
-  const list=document.getElementById('searchPluginList');
-  if(!list){return;}
-  const visiblePlugins=(Array.isArray(plugins)?plugins:[]).filter(plugin=>plugin&&String(plugin.module||'')!=='__init__');
-  const selected=activeSearchPlugins(visiblePlugins);
-  saveStoredSearchPlugins(selected);
-  if(visiblePlugins.length===0){
-    list.innerHTML='<div class="rss-item"><span class="rss-item-info">No search plugins installed yet.</span></div>';
-    return;
-  }
-  list.innerHTML='<table class="search-plugin-table"><tbody>'+visiblePlugins.map(plugin=>{
-    const module=escapeHtml(plugin.module||'');
-    const checked=selected.indexOf(plugin.module)!==-1;
-    const healthy=!!plugin.healthy;
-    const badge=healthy?'<span class="search-plugin-badge ready">Ready</span>':'<span class="search-plugin-badge">Broken</span>';
-    const version=plugin.version?(' v'+escapeHtml(plugin.version)):'';
-    const cats=Array.isArray(plugin.categories)&&plugin.categories.length>0?escapeHtml(plugin.categories.join(', ')):'all';
-    const reason=plugin.broken_reason?'<div style="color:var(--error);font-size:11px;margin-top:2px">'+escapeHtml(plugin.broken_reason)+'</div>':'';
-    return '<tr>'
-      +'<td><input type="checkbox" data-search-plugin="'+module+'" '+(checked&&healthy?'checked ':'')+(healthy?'':'disabled ')+'title="Enable for search"></td>'
-      +'<td><div style="font-weight:600">'+escapeHtml(plugin.display_name||plugin.module||'plugin')+version+' '+badge+'</div>'
-      +'<div style="opacity:0.6;font-size:11px">'+cats+'</div>'+reason+'</td>'
-      +'<td><button class="btn ghost search-remove-btn" type="button" data-action="search-remove-plugin" data-module="'+module+'" title="Uninstall plugin"><svg class="material-symbols-rounded" style="font-size:16px"><use href=#i-delete></use></svg></button></td>'
-      +'</tr>';
-  }).join('')+'</tbody></table>';
-}
-function renderRecommendedCatalog(entries){
-  const container=document.getElementById('searchRecommended');
-  if(!container){return;}
-  const recommended=recommendedCatalogEntries(entries);
-  if(recommended.length===0){
-    container.innerHTML='<div class="rss-item"><span class="rss-item-info">Recommended public plugins will appear here when they are available in the live catalog.</span></div>';
-    return;
-  }
-  container.innerHTML='<div class="search-recommended-list">'+recommended.map(entry=>''
-    +'<div class="search-recommended-card">'
-    +'<div class="search-recommended-name">'+escapeHtml(entry.name||entry.module||'plugin')
-      +(entry.installed?(' <span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+(entry.installed_healthy?'Installed':'Needs fix')+'</span>'):'')
-      +'</div>'
-    +'<div class="search-recommended-copy">'+escapeHtml(entry.comment||'Popular public search source.')+'</div>'
-    +'<div class="search-recommended-meta">'+escapeHtml([entry.author||'',entry.version?('wiki v'+entry.version):'',entry.updated||''].filter(Boolean).join(' / '))+'</div>'
-    +'<button class="btn primary" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+(entry.installed?'Update':'Install')+'</button>'
-    +'</div>'
-  ).join('')+'</div>';
-}
-function renderSearchResults(results){
-  const container=document.getElementById('searchResults');
-  if(!container){return;}
-  if(!activeSearchSort||!activeSearchSort.key){
-    activeSearchSort=resolveSearchSort();
-  }
-  if(!Array.isArray(results)||results.length===0){
-    container.innerHTML='<div class="search-results-empty"><div>Results will appear here after you search.</div><div class="small" style="margin-top:6px">Enter a query on the left, click Search, and use Manage Plugins if you want to enable or install providers.</div></div>';
-    return;
-  }
-  const sortKey=String(activeSearchSort&&activeSearchSort.key||'seeds');
-  const sortDir=String(activeSearchSort&&activeSearchSort.dir||'desc');
-  const multiplier=sortDir==='asc'?1:-1;
-  const sorted=results.slice().sort((left,right)=>{
-    const key=sortKey;
-    let cmp=0;
-    if(key==='name'){
-      cmp=String(left.name||'').localeCompare(String(right.name||''));
-    }else if(key==='plugin'){
-      cmp=String(left.plugin||left.site_url||'').localeCompare(String(right.plugin||right.site_url||''));
-    }else if(key==='size'){
-      cmp=(Number(left.size)||0)-(Number(right.size)||0);
-    }else if(key==='leech'){
-      cmp=(Number(left.leech)||0)-(Number(right.leech)||0);
-    }else if(key==='updated'){
-      cmp=(Number(left.pub_date)||0)-(Number(right.pub_date)||0);
-    }else{
-      cmp=(Number(left.seeds)||0)-(Number(right.seeds)||0);
-    }
-    if(cmp===0){
-      cmp=String(left.name||'').localeCompare(String(right.name||''));
-    }
-    return cmp*multiplier;
-  });
-  const sortIcon=(key)=>{
-    if(sortKey!==key){return 'unfold_more';}
-    return sortDir==='asc'?'arrow_upward':'arrow_downward';
-  };
-  const sortHeader=(key,label)=>'<button class="search-sort-btn" type="button" data-search-sort="'+key+'">'+label+'<svg class="material-symbols-rounded" style="font-size:14px"><use href=#i-'+sortIcon(key)+'></use></svg></button>';
-  const formatUpdated=(value)=>{
-    const ts=Number(value)||0;
-    if(ts<=0){return '—';}
-    const date=new Date(ts*1000);
-    if(Number.isNaN(date.getTime())){return '—';}
-    return date.toLocaleDateString();
-  };
-  container.innerHTML=''
-    +'<div class="search-results-table-wrap"><table class="search-results-table">'
-    +'<thead><tr>'
-    +'<th>'+sortHeader('name','Name')+'</th>'
-    +'<th>'+sortHeader('plugin','Plugin')+'</th>'
-    +'<th>'+sortHeader('size','Size')+'</th>'
-    +'<th>'+sortHeader('seeds','Seeds')+'</th>'
-    +'<th>'+sortHeader('leech','Leech')+'</th>'
-    +'<th>'+sortHeader('updated','Updated')+'</th>'
-    +'<th>Action</th>'
-    +'</tr></thead><tbody>'
-    +sorted.map(result=>{
-      const added=addedSearchResults.has(String(result.index));
-      const pluginLabel=result.plugin?escapeHtml(result.plugin):escapeHtml(result.site_url||'plugin');
-      const size=Number(result.size);
-      const seeds=Number(result.seeds);
-      const leech=Number(result.leech);
-      const safeDesc=safeExternalUrl(result.desc_link||'');
-      const desc=safeDesc?'<a class="search-result-link" href="'+escapeHtml(safeDesc)+'" target="_blank" rel="noopener noreferrer">Open description</a>':'';
-      return ''
-        +'<tr>'
-        +'<td><div class="search-result-title">'+escapeHtml(result.name||'result')+'</div>'+desc+'</td>'
-        +'<td>'+pluginLabel+'</td>'
-        +'<td>'+(size>0?formatBytes(size):'size unknown')+'</td>'
-        +'<td>'+(seeds>=0?seeds:'?')+'</td>'
-        +'<td>'+(leech>=0?leech:'?')+'</td>'
-        +'<td>'+formatUpdated(result.pub_date)+'</td>'
-        +'<td><button class="btn primary'+(added?' added':'')+'" type="button" data-action="search-add-result" data-index="'+escapeHtml(String(result.index))+'" data-name="'+escapeHtml(result.name||'Search result')+'" '+(added?'disabled aria-disabled="true"':'')+'>'+(added?'Added':'Add')+'</button></td>'
-        +'</tr>';
-    }).join('')
-    +'</tbody></table></div>';
-}
-function renderSearchStatus(data){
-  searchStateCache=data||null;
-  if(!activeSearchSort||!activeSearchSort.key){
-    activeSearchSort=resolveSearchSort();
-  }
-  const startedAt=Number(data&&data.last_started_at)||0;
-  if(startedAt>0&&startedAt!==lastSearchStartedAt){
-    lastSearchStartedAt=startedAt;
-    addedSearchResults.clear();
-  }
-  const category=document.getElementById('searchCategory');
-  if(category&&category.value!==resolveSearchCategory()){category.value=resolveSearchCategory();}
-  const pluginError=document.getElementById('searchPluginError');
-  if(pluginError){
-    const message=(data&&data.plugin_error?String(data.plugin_error):'').trim();
-    pluginError.textContent=message;
-    pluginError.style.display=message?'block':'none';
-  }
-  renderSearchPluginList(data&&Array.isArray(data.plugins)?data.plugins:[]);
-  renderSearchResults(data&&Array.isArray(data.results)?data.results:[]);
-  const summary=document.getElementById('searchSelectionSummary');
-  const warning=document.getElementById('searchPluginWarning');
-  if(summary){
-    const plugins=Array.isArray(data&&data.plugins)?data.plugins:[];
-    const selected=activeSearchPlugins(plugins);
-    const healthyCount=plugins.filter(plugin=>plugin&&plugin.healthy).length;
-    let summaryHtml='';
-    if(healthyCount===0){
-      summaryHtml='<span class="search-selection-text">No ready plugins installed yet.</span>';
-    }else if(selected.length===healthyCount){
-      summaryHtml='<span class="search-selection-text">Using all '+healthyCount+' ready plugins.</span>';
-    }else{
-      summaryHtml='<span class="search-selection-text">Using '+selected.length+' of '+healthyCount+' ready plugins. Some providers are disabled in Plugins.</span>'
-        +'<button class="btn ghost" type="button" onclick="useAllReadyPlugins()">Use All</button>';
-    }
-    summary.innerHTML=summaryHtml;
-  }
-  if(warning){
-    const plugins=Array.isArray(data&&data.plugins)?data.plugins:[];
-    const healthyCount=plugins.filter(plugin=>plugin&&plugin.healthy).length;
-    if(healthyCount===0){
-      warning.style.display='block';
-      warning.innerHTML=''
-        +'<div class="search-warning-title">No Search Plugins Installed</div>'
-        +'<div class="search-warning-copy">Install at least one public plugin before searching. rustorrent does not ship with active public search providers by default.</div>'
-        +'<button class="btn primary" type="button" data-search-view-target="plugins"><svg class="material-symbols-rounded"><use href=#i-extension></use></svg>Manage Plugins</button>';
-    }else{
-      warning.style.display='none';
-      warning.innerHTML='';
-    }
-  }
-  const queryInput=document.getElementById('searchQuery');
-  if(queryInput&&!queryInput.matches(':focus')){
-    const next=data&&typeof data.query==='string'?data.query:'';
-    if(queryInput.value!==next){queryInput.value=next;}
-  }
-  const status=document.getElementById('searchStatusText');
-  if(status){
-    let message='Enter a query on the left and click Search. Use Manage Plugins to change providers.';
-    if(data&&data.busy){message='Searching across installed plugins...';}
-    else if(data&&data.last_error){message=String(data.last_error);}
-    else if(data&&Array.isArray(data.results)&&data.results.length>0){message='Found '+data.results.length+' search results.';}
-    else if(data&&data.plugin_error){message=String(data.plugin_error);}
-    else if(data&&Array.isArray(data.plugins)&&data.plugins.length>0){message='Installed plugins are ready. Enter a query to search.';}
-    else if(data&&data.python_available){message='No search plugins are installed yet. Open Plugins or Community Catalog to add one.';}
-    status.textContent=message;
-  }
-  if(!(data&&data.busy)){
-    searchPollActive=false;
-    if(searchPollTimer!==null){
-      clearTimeout(searchPollTimer);
-      searchPollTimer=null;
-    }
-  }else{
-    scheduleSearchStatusPoll(900);
-  }
-}
-async function loadSearchStatus(_forceRefresh){
-  const data=await fetchJson('/search/status');
-  renderSearchStatus(data);
-  return data;
-}
-function scheduleSearchStatusPoll(delayMs){
-  if(searchPollActive){return;}
-  if(searchPollTimer!==null){
-    clearTimeout(searchPollTimer);
-  }
-  searchPollTimer=setTimeout(()=>pumpSearchStatus().catch(err=>console.warn(err)),delayMs);
-}
-async function pumpSearchStatus(){
-  if(searchPollActive){return;}
-  searchPollActive=true;
-  if(searchPollTimer!==null){
-    clearTimeout(searchPollTimer);
-    searchPollTimer=null;
-  }
-  try{
-    while(true){
-      const data=await fetchJson('/search/status');
-      renderSearchStatus(data);
-      if(!(data&&data.busy)){break;}
-      await sleep(900);
-    }
-  }finally{
-    searchPollActive=false;
-  }
-}
-function renderSearchCatalog(entries){
-  const container=document.getElementById('searchCatalog');
-  if(!container){return;}
-  renderRecommendedCatalog(entries);
-  const meta=document.getElementById('searchCatalogMeta');
-  const filter=document.getElementById('searchCatalogFilter');
-  const search=filter?String(filter.value||'').trim().toLowerCase():'';
-  const sorted=(Array.isArray(entries)?entries:[]).slice().sort((a,b)=>{
-    const installedA=!!(a&&a.installed);
-    const installedB=!!(b&&b.installed);
-    if(installedA!==installedB){return installedA?-1:1;}
-    return String(a&&a.name||'').localeCompare(String(b&&b.name||''));
-  });
-  const filtered=sorted.filter(entry=>{
-    if(!search){return true;}
-    const haystack=[entry.name,entry.author,entry.comment,entry.version,entry.module].join(' ').toLowerCase();
-    return haystack.includes(search);
-  });
-  if(meta){
-    if(searchCatalogLoading){
-      meta.textContent='Loading latest qBittorrent unofficial plugin list...';
-    }else if(searchCatalogFetchedAt>0){
-      meta.textContent='Live list loaded from the qBittorrent unofficial search plugin wiki.';
-    }else{
-      meta.textContent='Latest unofficial qBittorrent search plugins.';
-    }
-  }
-  if(filtered.length===0){
-    container.innerHTML='<div class="rss-item"><span class="rss-item-info">'+(search?'No community plugins match that filter.':'Load the community list to install unofficial qBittorrent plugins with one click.')+'</span></div>';
-    return;
-  }
-  container.innerHTML='<table class="search-catalog-table"><tbody>'+filtered.map(entry=>{
-    const name=escapeHtml(entry.name||entry.module||'plugin');
-    const author=entry.author?escapeHtml(entry.author):'';
-    const version=entry.version?'v'+escapeHtml(entry.version):'';
-    const status=entry.installed
-      ?'<span class="search-plugin-badge'+(entry.installed_healthy?' ready':'')+'">'+
-       (entry.installed_healthy?'Installed':'Needs fix')+'</span>'
-      :'';
-    const meta=[author,version,entry.updated||''].filter(Boolean).join(' \u00b7 ');
-    const btnLabel=entry.installed?'Update':'Install';
-    return '<tr>'
-      +'<td><div style="font-weight:600">'+name+' '+status+'</div>'
-      +'<div style="opacity:0.6;font-size:11px">'+escapeHtml(meta)+'</div></td>'
-      +'<td><button class="btn '+(entry.installed?'ghost':'primary')+' search-catalog-btn" type="button" data-action="search-install-catalog" data-url="'+escapeHtml(entry.download_url||'')+'">'+btnLabel+'</button></td>'
-      +'</tr>';
-  }).join('')+'</tbody></table>';
-}
-async function loadSearchCatalog(force){
-  if(searchCatalogLoading){return {entries:searchCatalogCache};}
-  searchCatalogLoading=true;
-  renderSearchCatalog(searchCatalogCache);
-  const suffix=force?'?refresh=1':'';
-  try{
-    const data=await fetchJson('/search/catalog'+suffix);
-    searchCatalogCache=Array.isArray(data&&data.entries)?data.entries:[];
-    searchCatalogFetchedAt=Number(data&&data.fetched_at)||0;
-    renderSearchCatalog(searchCatalogCache);
-    if(data&&data.error){
-      const box=document.getElementById('searchPluginError');
-      if(box){
-        box.textContent=String(data.error);
-        box.style.display='block';
-      }
-    }
-    return data;
-  }finally{
-    searchCatalogLoading=false;
-    renderSearchCatalog(searchCatalogCache);
-  }
-}
-function safeExternalUrl(value){
-  if(!value){return '';}
-  try{
-    const parsed=new URL(String(value),window.location.href);
-    return parsed.protocol==='http:'||parsed.protocol==='https:'?parsed.href:'';
-  }catch(e){return '';}
-}
-function confirmSearchPluginInstall(name){
-  return confirm('Search plugins run third-party Python code on this computer. Install '+(name||'this plugin')+' only if you trust its source. Continue?');
-}
-async function installCatalogPlugin(url,skipConfirmation){
-  if(!url){return;}
-  if(!skipConfirmation&&!confirmSearchPluginInstall('the selected plugin')){return;}
-  await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)});
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function updateInstalledCatalogPlugins(){
-  const installed=(searchCatalogCache||[]).filter(entry=>entry&&entry.installed&&entry.download_url);
-  if(installed.length===0){
-    alert('No installed community plugins are linked to the live catalog.');
-    return;
-  }
-  if(!confirmSearchPluginInstall('updates for all installed community plugins')){return;}
-  for(const entry of installed){
-    await apiPost('/search/install-url',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(entry.download_url)});
-  }
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function submitSearchQuery(e){
-  if(e){e.preventDefault();}
-  const queryInput=document.getElementById('searchQuery');
-  const categoryInput=document.getElementById('searchCategory');
-  const query=queryInput?String(queryInput.value||'').trim():'';
-  const category=categoryInput?String(categoryInput.value||'all'):'all';
-  const engines=selectedSearchPluginsFromDom();
-  if(!query){alert('Enter a search query.');return false;}
-  saveStoredSearchPlugins(engines);
-  saveSearchCategory(category);
-  addedSearchResults.clear();
-  lastSearchStartedAt=0;
-  const submitBtn=document.querySelector('.search-form button[type=\"submit\"]');
-  if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='Searching\u2026';}
-  const status=document.getElementById('searchStatusText');
-  if(status){status.textContent='Searching across installed plugins\u2026';}
-  const resultsList=document.getElementById('searchResults');
-  if(resultsList){resultsList.innerHTML='<div style=\"text-align:center;padding:32px 0;opacity:0.6\">Searching\u2026</div>';}
-  const body='query='+encodeURIComponent(query)+'&category='+encodeURIComponent(category)+'&engines='+encodeURIComponent(engines.join(','));
-  try{
-    await apiPost('/search/run',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-  }finally{
-    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent='Search';}
-  }
-  applySearchPanelView('results');
-  scheduleSearchStatusPoll(100);
-  await loadSearchStatus(false);
+/* api */
+let token=(document.querySelector('meta[name="rustorrent-api-token"]')||{}).content||'';
+async function refreshToken(){
+  try{const r=await fetch('/api-token',{cache:'no-store'}),d=await r.json();if(r.ok&&d.token){token=d.token;return true}}catch(e){}
   return false;
 }
-async function installSearchPluginUrl(e){
-  if(e){e.preventDefault();}
-  const input=document.getElementById('searchPluginUrl');
-  const url=input?String(input.value||'').trim():'';
-  if(!url){return false;}
-  await installCatalogPlugin(url);
-  if(input){input.value='';}
-  return false;
-}
-async function installSearchPluginFile(e){
-  const input=e&&e.target?e.target:null;
-  const file=input&&input.files&&input.files[0]?input.files[0]:null;
-  if(!file){return;}
-  if(!confirmSearchPluginInstall(file.name)){
-    if(input){input.value='';}
-    return;
-  }
-  const bytes=new Uint8Array(await file.arrayBuffer());
-  await apiPost('/search/install-plugin?filename='+encodeURIComponent(file.name),{headers:{'Content-Type':'text/x-python'},body:bytes});
-  if(input){input.value='';}
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function removeSearchPlugin(module){
-  if(!module){return;}
-  const ok=confirm('Remove search plugin '+module+'?');
-  if(!ok){return;}
-  await apiPost('/search/remove-plugin',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'module='+encodeURIComponent(module)});
-  await Promise.all([
-    loadSearchStatus(true),
-    loadSearchCatalog(true),
-  ]);
-}
-async function addSearchResult(index,name){
-  const downloadDir=document.getElementById('downloadDir');
-  const preallocate=document.getElementById('preallocate');
-  const body='index='+encodeURIComponent(index)
-    +'&dir='+encodeURIComponent(downloadDir?String(downloadDir.value||'').trim():'')
-    +'&prealloc='+(preallocate&&preallocate.checked?'1':'0');
-  await apiPostJson('/search/add-result',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-  addedSearchResults.add(String(index));
-  if(searchStateCache&&Array.isArray(searchStateCache.results)){
-    renderSearchResults(searchStateCache.results);
-  }
-  showToast('Torrent added',name||'The search result was queued in rustorrent.');
-  scheduleRefreshFallback();
-}
-function escapeHtml(value){
-  return String(value||'')
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;')
-    .replace(/'/g,'&#39;');
-}
-function formatBytes(value){
-  const units=['B','KB','MB','GB','TB'];
-  let size=Math.max(0,Number(value)||0);
-  let unit=0;
-  while(size>=1024&&unit+1<units.length){size/=1024;unit+=1;}
-  if(unit===0){return Math.round(size)+' '+units[unit];}
-  return size.toFixed(2)+' '+units[unit];
-}
-function formatRateLimitKbps(kbps){
-  const value=Math.max(0,Number(kbps)||0);
-  if(value===0){return 'Unlimited';}
-  return formatBytes(value*1024)+'/s';
-}
-function updateRateLimitLabels(){
-  const down=document.getElementById('downloadLimit');
-  const up=document.getElementById('uploadLimit');
-  const downLabel=document.getElementById('downloadLimitValue');
-  const upLabel=document.getElementById('uploadLimitValue');
-  if(down&&downLabel){
-    const next=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Number(down.value)||0));
-    down.value=String(next);
-    downLabel.textContent=formatRateLimitKbps(next);
-  }
-  if(up&&upLabel){
-    const next=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Number(up.value)||0));
-    up.value=String(next);
-    upLabel.textContent=formatRateLimitKbps(next);
+async function post(url,body,type){
+  for(let retry=0;;retry++){
+    const headers={'X-Rustorrent-Token':token};
+    if(body!=null)headers['Content-Type']=type||'application/x-www-form-urlencoded';
+    const r=await fetch(url,{method:'POST',headers,body,cache:'no-store'}),d=await r.json().catch(()=>({}));
+    if(r.ok)return d;
+    const msg=d.error||'HTTP '+r.status;
+    if(!retry&&r.status===403&&/api token/.test(msg)&&await refreshToken())continue;
+    throw new Error(msg);
   }
 }
-function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
-function decodeUtf8(bytes){
-  try{return textDecoder.decode(bytes);}catch(e){return '';}
+async function getJSON(url){
+  const r=await fetch(url,{cache:'no-store'}),d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.error||'HTTP '+r.status);
+  return d;
 }
-function parseBencode(bytes){
+const q=o=>new URLSearchParams(o).toString();
+// Posts a form and reports the outcome; resolves to the response, or undefined on failure.
+const act=(url,body,title,msg)=>post(url,body==null?body:q(body)).then(d=>{if(title)toast(title,msg);return d},e=>{toast('Action failed',e.message,true)});
+
+/* toasts */
+const toasts=h('div.toasts',{role:'status','aria-live':'polite'});
+function toast(title,msg,bad){
+  const e=h('div.toast'+(bad?'.bad':''),icon(bad?'alert':'ok'),h('div',h('b',{text:title}),msg&&h('span',{text:msg})));
+  const kill=()=>{e.classList.add('out');setTimeout(()=>e.remove(),200)};
+  e.onclick=kill;toasts.append(e);setTimeout(kill,bad?6000:3200);
+  while(toasts.children.length>4)toasts.firstChild.remove();
+}
+
+/* skeleton: static markup only; dynamic text is set with textContent */
+const NAV=[['all','All','list'],['downloading','Downloading','down'],['seeding','Seeding','up'],['paused','Paused','pause'],['completed','Completed','ok'],['error','Errors','alert']];
+const TITLES={all:'All transfers',downloading:'Downloading',seeding:'Seeding',paused:'Paused',completed:'Completed',error:'Errors',search:'Search',rss:'RSS feeds',settings:'Settings'};
+const navBtn=(n,label,data)=>`<button class="nav" ${data}>${ic(n)}<span>${label}</span><b class="c"></b></button>`;
+const field=(id,label,control,note='')=>`<div class="field"><label for="${id}">${label}</label>${control}${note&&`<small>${note}</small>`}</div>`;
+const num=(id,max,step,u)=>`<div class="unit"><input id="${id}" class="in" type="number" min="0" max="${max}" step="${step}"><span class="muted">${u}</span></div>`;
+const choice=(id,opts)=>`<select id="${id}" class="in">${opts.map(([v,l])=>`<option value="${v}">${l}</option>`).join('')}</select>`;
+$('app').outerHTML=`<div class="app" id="app">
+<nav class="side" aria-label="Sections">
+ <div class="brand"><span class="logo">${ic('dl')}</span>Rustorrent</div>
+ <div class="nav-h">Library</div>${NAV.map(([f,l,n])=>navBtn(n,l,`data-f="${f}"`)).join('')}
+ <div class="labels" id="labels"></div>
+ <div class="nav-h">Tools</div>${navBtn('search','Search','data-v="search"')}${navBtn('rss','RSS','data-v="rss"')}${navBtn('sliders','Settings','data-v="settings"')}
+ <div class="foot"><svg class="spark" viewBox="0 0 100 34" preserveAspectRatio="none" role="img" aria-label="Recent transfer rates"><path class="sd"/><path class="su"/></svg><div class="tot"><span id="totDown"></span><span id="totUp"></span></div></div>
+</nav>
+<main class="main">
+ <header class="bar">
+  <h1 id="title">All transfers</h1>
+  <div class="rates"><span>${ic('down')}<span class="vh">Download rate</span><b id="rDown">–</b></span><span>${ic('up')}<span class="vh">Upload rate</span><b id="rUp">–</b></span></div>
+  <label class="find" id="findWrap">${ic('search')}<input id="find" class="in" type="search" placeholder="Filter" aria-label="Filter transfers" autocomplete="off" spellcheck="false"></label>
+  <button class="ib" id="theme" aria-label="Toggle theme"></button>
+  <button class="btn primary" id="addBtn" data-a="add" title="Add torrent (A)">${ic('plus')}Add</button>
+ </header>
+ <div class="conn" id="conn" role="status" hidden>Connection lost. Reconnecting to Rustorrent…</div>
+ <section class="view" id="v-library" aria-labelledby="title">
+  <div class="lh" id="lh" aria-hidden="true"><span>Name</span><span>Status</span><span>Progress</span><span class="c-down">Down</span><span class="c-up">Up</span><span class="c-eta">ETA</span><span class="c-ratio">Ratio</span><span></span></div>
+  <div id="list" role="list" aria-label="Transfers"></div>
+  <div class="empty" id="empty" hidden>${ic('dl')}<h2>No transfers yet</h2><p>Add a .torrent file or paste a magnet link. You can also drop a .torrent file anywhere in this window.</p><button class="btn primary" data-a="add">${ic('plus')}Add your first torrent</button></div>
+  <div class="empty" id="nomatch" hidden>${ic('search')}<h2>No matches</h2><p>No transfers match this view.</p><button class="btn" data-a="clear">Show all transfers</button></div>
+ </section>
+ <section class="view" id="v-search" aria-labelledby="title" hidden><div class="pad">
+  <form class="sform" data-f="search"><input id="sq" class="in" type="search" aria-label="Search query" placeholder="Search with your plugins" autocomplete="off"><select id="scat" class="in" aria-label="Category">${['All categories','Anime','Books','Games','Movies','Music','Pictures','Software','TV'].map((c,i)=>`<option value="${i?c.toLowerCase():'all'}">${c}</option>`).join('')}</select><button class="btn primary" id="sGo">Search</button></form>
+  <p class="muted gap" id="sStatus">Loading search plugins…</p>
+  <div class="note" id="sWarn" hidden><b>No search plugins installed.</b> Rustorrent doesn't ship with search providers. Install a public plugin to start searching.<br><button class="btn" data-a="plugins">Manage plugins</button></div>
+  <div id="sResults"></div>
+  <details class="card gap" id="plugins"><summary>Plugins</summary>
+   <p class="muted">Search plugins run third-party Python code on this computer. Install only plugins you trust.</p>
+   <div class="list" id="pList"></div>
+   <form class="inline" data-f="purl"><input id="pUrl" class="in" type="url" aria-label="Plugin URL" placeholder="https://…/plugin.py"><button class="btn">Install</button><label class="btn">Upload .py<input id="pFile" class="vh" type="file" accept=".py"></label><button class="btn" type="button" data-a="pupdate">Update all</button></form>
+   <div class="sect"><h3>Community catalog <button class="ib" data-a="pcat" aria-label="Refresh catalog" title="Refresh catalog">${ic('recheck')}</button></h3>
+   <input id="cFilter" class="in wide" type="search" aria-label="Filter catalog" placeholder="Filter plugins"><p class="muted gap" id="cMeta"></p><div class="list scroll" id="cList"></div></div>
+  </details>
+ </div></section>
+ <section class="view" id="v-rss" aria-labelledby="title" hidden><div class="pad">
+  <section class="card"><h2>Feeds</h2><p class="muted">Rustorrent checks each feed on a schedule.</p><div class="list" id="rFeeds"></div>
+   <form class="inline" data-f="rfeed"><input id="rUrl" class="in" type="url" aria-label="Feed URL" placeholder="https://example.com/feed.xml"><select id="rInt" class="in" aria-label="Check interval">${[[900,'15 min'],[1800,'30 min'],[3600,'hour'],[21600,'6 hours']].map(([v,l])=>`<option value="${v}">Every ${l}</option>`).join('')}</select><button class="btn">Add feed</button></form></section>
+  <section class="card"><h2>Download rules</h2><p class="muted">New feed items whose titles match a pattern are added automatically.</p><div class="list" id="rRules"></div>
+   <form class="inline" data-f="rrule"><input id="rName" class="in" aria-label="Rule name" placeholder="Name"><input id="rPat" class="in" aria-label="Title pattern" placeholder="Pattern"><button class="btn">Add rule</button></form></section>
+ </div></section>
+ <section class="view" id="v-settings" aria-labelledby="title" hidden><div class="pad">
+  <section class="card"><h2>Bandwidth</h2><p class="muted">Limits apply to all transfers. Use 0 for unlimited.</p>${field('limDown','Download limit',num('limDown',102400,64,'KiB/s'))}${field('limUp','Upload limit',num('limUp',102400,64,'KiB/s'))}</section>
+  <section class="card"><h2>Seeding</h2>${field('ratio','Stop seeding at ratio',num('ratio',10,0.1,'0 = keep seeding'))}</section>
+  <section class="card"><h2>Connections</h2>${field('profile','Peer profile',choice('profile',[['conservative','Conservative'],['balanced','Balanced'],['aggressive','Aggressive']]),'<span id="profileNote"></span>')}</section>
+  <section class="card"><h2>Appearance</h2>${field('appearance','Theme',choice('appearance',[['system','Match system'],['light','Light'],['dark','Dark']]))}</section>
+  <section class="card"><h2>Session</h2><dl class="kv" id="session"></dl></section>
+  <section class="card"><h2>Keyboard shortcuts</h2><p class="muted">${[['/','filter'],['A','add'],['↑ ↓','move'],['Enter','details'],['Space','pause or resume'],['Delete','remove'],['Esc','close']].map(([k,v])=>`<kbd>${k}</kbd> ${v}`).join(' · ')}</p></section>
+ </div></section>
+</main></div>
+<dialog class="dlg" id="addDlg" aria-labelledby="addTitle"><div class="dc">
+ <div class="dh"><h2 id="addTitle">Add torrent</h2><button class="ib" data-a="close" aria-label="Close">${ic('x')}</button></div>
+ <label class="drop" id="drop"><input id="tFile" class="vh" type="file" accept=".torrent,application/x-bittorrent" aria-label="Torrent file">${ic('file')}<b id="dropName"></b><span id="dropHint"></span></label>
+ <div class="or">or paste a magnet link</div>
+ <input id="magnet" class="in" aria-label="Magnet link" placeholder="magnet:?xt=urn:btih:…" autocomplete="off" spellcheck="false">
+ <p class="muted" id="addSummary"></p>
+ <div class="rv" id="review" hidden></div>
+ <div class="fld"><label for="dir">Save to</label><div class="inrow"><input id="dir" class="in" autocomplete="off" spellcheck="false"><button class="btn" id="browse" data-a="browse" hidden>Choose…</button></div></div>
+ <div class="checks"><label class="chk"><input id="start" type="checkbox" checked>Start immediately</label><label class="chk"><input id="prealloc" type="checkbox">Preallocate disk space</label></div>
+ <p class="err" id="addErr" role="alert" hidden></p>
+ <div class="df"><button class="btn" data-a="close">Cancel</button><button class="btn primary" id="addGo" data-a="submit-add" disabled>Add</button></div>
+</div></dialog>
+<dialog class="dlg sm" id="rmDlg" aria-labelledby="rmTitle"><div class="dc">
+ <h2 id="rmTitle">Remove transfer?</h2><p id="rmText" class="muted"></p>
+ <label class="chk"><input id="rmFiles" type="checkbox">Also delete downloaded files</label>
+ <div class="df"><button class="btn" id="rmCancel" data-a="close">Cancel</button><button class="btn danger" id="rmGo" data-a="rm-go">Remove transfer</button></div>
+</div></dialog>
+<div class="overlay" id="overlay"><div>Drop to add torrent</div></div>`;
+document.body.append(toasts);
+const list=$('list'),addDlg=$('addDlg'),rmDlg=$('rmDlg');
+
+/* theme: no stored preference follows the system appearance */
+const mq=matchMedia('(prefers-color-scheme: dark)');
+const themePref=()=>{const t=store.get('theme');return t==='light'||t==='dark'?t:''};
+function applyTheme(pref){
+  const t=pref||(mq.matches?'dark':'light'),r=document.documentElement,b=$('theme');
+  r.dataset.theme=t;
+  b.innerHTML=ic(t==='dark'?'sun':'moon');b.title=`Switch to ${t==='dark'?'light':'dark'} appearance`;
+  $('appearance').value=pref||'system';
+}
+mq.addEventListener&&mq.addEventListener('change',()=>applyTheme(themePref()));
+
+/* state */
+let G={},ready=false,view='library',filter=store.get('filter','all'),findText=store.get('find',''),lastTab=store.get('tab','files');
+const T=new Map(),I=new Map(),rows=new Map(),dirty=new Set();
+let order=[],structural=false,raf=0,selected=null,expanded=new Set();
+try{expanded=new Set(JSON.parse(store.get('open','[]')))}catch(e){}
+const INIT=/^(queued|loading|fetching metadata|pending)$/;
+const LABELS={'fetching metadata':'Metadata',announcing:'Connecting','waiting for peers':'Waiting',deleting:'Removing',complete:'Verifying',seeding:'Verifying'};
+// Derives the one visible state of a transfer from the raw engine status.
+function infoOf(t){
+  const s=t.status||'',done=(t.total_pieces>0&&t.completed_pieces>=t.total_pieces)||(t.total_bytes>0&&t.completed_bytes>=t.total_bytes);
+  const stopping=s==='stopping',resume=!!t.paused||s==='stopped'||s==='shutdown';
+  let k='downloading',label=LABELS[s]||(s&&s[0].toUpperCase()+s.slice(1))||'Downloading',note;
+  if(resume||s==='paused'||stopping){k='paused';label=stopping?'Stopping':s==='paused'||t.paused?'Paused':'Stopped'}
+  else if(/error|failed/.test(s)){k='error';label='Error'}
+  else if(s==='queued'){k='queued';label='Queued'}
+  else if(done){k='seeding';label='Seeding'}
+  if(k==='paused')note=stopping?'Stopping…':label;
+  else if(k==='error')note='Needs attention';
+  else if(k==='queued')note='Waiting for a free slot';
+  else if(s==='fetching metadata')note='Fetching metadata from peers';
+  else if(k==='seeding')note=t.upload_rate_bps>0?`Sharing with ${plural(t.active_peers,'peer')}`:'Ready to share when peers ask';
+  else if(s==='complete'||s==='seeding')note='Verifying pieces';
+  else note=t.active_peers>0?`${plural(t.active_peers,'peer')} connected`:t.tracker_peers>0?'Finding reachable peers':'Looking for peers';
+  const size=t.total_bytes?(done?bytes(t.total_bytes):`${bytes(t.completed_bytes)} of ${bytes(t.total_bytes)}`)+' · ':'';
+  return {k,label,done,resume,stopping,init:INIT.test(s),note:size+note,cat:k==='queued'?'downloading':k,
+    pct:done?100:t.total_bytes>0?Math.min(100,t.completed_bytes*100/t.total_bytes):0};
+}
+function matches(t,f){
+  const s=I.get(t.id);
+  return !!s&&(f==='all'||f===s.cat||(f==='completed'&&s.done)||(f.startsWith('label:')&&t.label===f.slice(6)));
+}
+
+/* live stream: status events carry deltas (see src/ui.rs) */
+function apply(d){
+  if(d.g)G=d.g;
+  if(d.t)for(const t of d.t){T.set(t.id,t);I.set(t.id,infoOf(t));dirty.add(t.id)}
+  if(d.ids){order=d.ids;const keep=new Set(order);for(const id of [...T.keys()])if(!keep.has(id)){T.delete(id);I.delete(id)}structural=true}
+  ready=true;
+  if(!raf)raf=requestAnimationFrame(render);
+}
+let es,connTimer=0;
+function connect(){
+  es=new EventSource('/events');
+  es.addEventListener('status',e=>{try{apply(JSON.parse(e.data))}catch(err){console.warn(err)}});
+  es.onopen=()=>{clearTimeout(connTimer);$('conn').hidden=true};
+  es.onerror=()=>{
+    clearTimeout(connTimer);connTimer=setTimeout(()=>{$('conn').hidden=false},600);
+    if(es.readyState===2){es.close();setTimeout(connect,2000)}
+  };
+}
+
+/* rendering */
+function render(){
+  raf=0;
+  txt($('rDown'),rate(G.download_rate_bps));txt($('rUp'),rate(G.upload_rate_bps));
+  renderSide();
+  if(structural){
+    for(const [id,r] of rows)if(!T.has(id)){r.el.remove();rows.delete(id)}
+    let prev=null;
+    for(const id of order){
+      let r=rows.get(id);if(!r){rows.set(id,r=makeRow(id));dirty.add(id)}
+      const want=prev?prev.nextSibling:list.firstChild;
+      if(r.el!==want)list.insertBefore(r.el,want);
+      prev=r.el;
+    }
+  }
+  for(const id of dirty){const r=rows.get(id),t=T.get(id);if(r&&t)updateRow(r,t)}
+  dirty.clear();structural=false;
+  applyFilter();
+  if(view==='settings')renderSettings();
+}
+function renderSide(){
+  const c={all:T.size,downloading:0,seeding:0,paused:0,completed:0,error:0},labels=new Map();
+  for(const t of T.values()){const s=I.get(t.id);c[s.cat]++;if(s.done)c.completed++;if(t.label)labels.set(t.label,(labels.get(t.label)||0)+1)}
+  const names=[...labels.keys()].sort(),box=$('labels'),key=names.join('\n');
+  if(box.dataset.k!==key){
+    box.dataset.k=key;
+    box.replaceChildren(...(names.length?[h('div.nav-h',{text:'Labels'})]:[]),...names.map(n=>h('button.nav',{'data-f':'label:'+n},icon('tag'),h('span',{text:n}),h('b.c'))));
+    markNav();
+  }
+  for(const b of document.querySelectorAll('.nav[data-f]')){const f=b.dataset.f;txt(b.lastChild,f.startsWith('label:')?labels.get(f.slice(6))||0:c[f])}
+  const dh=G.download_history_bps||[],uh=G.upload_history_bps||[],n=Math.max(dh.length,uh.length),max=Math.max(1,...dh,...uh);
+  const pts=a=>a.map((v,i)=>`${((i+n-a.length)/(n-1)*100).toFixed(1)},${(33-v/max*31).toFixed(1)}`).join(' L');
+  const sp=document.querySelector('.spark');
+  attr(sp.firstChild,'d',n>1&&dh.length?`M0,34 L${pts(dh)} L100,34 Z`:'M0,33 L100,33');
+  attr(sp.lastChild,'d',n>1&&uh.length?'M'+pts(uh):'');
+  txt($('totDown'),'↓ '+bytes(G.session_downloaded_bytes));txt($('totUp'),'↑ '+bytes(G.session_uploaded_bytes));
+}
+function makeRow(id){
+  const r={id,name:h('span.nm'),tag:h('span.badge',{hidden:true}),sub:h('span.sub'),pill:h('span.pill'),fill:h('i'),pct:h('span.pct'),
+    dl:h('span.n.c-down'),ul:h('span.n.c-up'),eta:h('span.n.c-eta'),ratio:h('span.n.c-ratio'),toggle:h('button.ib',{'data-a':'toggle'}),err:h('div.rerr',{role:'alert',hidden:true})};
+  r.btn=h('button.rn',{'data-a':'expand','aria-expanded':'false'},icon('chev'),h('span.nw',h('span.nm-row',r.name,r.tag),r.sub));
+  r.el=h('div.row',{role:'listitem','data-id':id},
+    h('div.rm',r.btn,r.pill,h('div.prog',h('div.track',{'aria-hidden':'true'},r.fill),r.pct),r.dl,r.ul,r.eta,r.ratio,
+      h('div.acts',r.toggle,ibtn('folder','Open folder','folder'),ibtn('trash','Remove','remove','.danger'))),r.err);
+  return r;
+}
+function cellText(e,v){txt(e,v);e.classList.toggle('z',v==='–')}
+function bar(fill,pct,p){const w=p.toFixed(2)+'%';if(fill.style.width!==w)fill.style.width=w;txt(pct,pctText(p))}
+function updateRow(r,t){
+  const s=I.get(t.id);r.t=t;
+  r.el.className='row k-'+s.k+(s.done?' done':'')+(selected===t.id?' sel':'');
+  txt(r.name,t.name||'Unnamed transfer');attr(r.name,'title',t.name);
+  r.tag.hidden=!t.label;txt(r.tag,t.label);txt(r.sub,s.note);txt(r.pill,s.label);
+  bar(r.fill,r.pct,s.pct);
+  cellText(r.dl,rate(t.download_rate_bps));cellText(r.ul,rate(t.upload_rate_bps));
+  cellText(r.eta,s.k==='downloading'&&t.download_rate_bps>0?dur(t.eta_secs):'–');cellText(r.ratio,ratioText(t));
+  const label=s.resume?'Resume':'Pause',lock=s.stopping?'Transfer is stopping':s.init?'Available once the transfer has started':'';
+  if(r.mode!==label){r.mode=label;r.toggle.replaceChildren(icon(s.resume?'play':'pause'));attr(r.toggle,'aria-label',label)}
+  r.toggle.disabled=!!lock;attr(r.toggle,'title',lock||label);
+  const err=s.k==='error'?t.last_error||'This transfer stopped because of an error.':'';
+  r.err.hidden=!err;txt(r.err,err);
+  const open=expanded.has(keyOf(t));
+  attr(r.btn,'aria-expanded',String(open));
+  if(open&&!r.dt)makeDetail(r);
+  if(r.dt){r.dt.hidden=!open;if(open)updateDetail(r,t,s)}
+}
+const keyOf=t=>t.info_hash||'id:'+t.id;
+function applyFilter(){
+  const needle=findText.trim().toLowerCase();let any=false;
+  for(const [id,r] of rows){
+    const t=T.get(id),show=!!t&&matches(t,filter)&&(!needle||(t.name+' '+t.label).toLowerCase().includes(needle));
+    if(r.el.hidden===show)r.el.hidden=!show;any=any||show;
+  }
+  $('empty').hidden=!ready||T.size>0;$('nomatch').hidden=!ready||!T.size||any;$('lh').hidden=!any;
+}
+
+/* detail pane: tabs are built once per row and updated in place */
+const TABS=[['files','Files'],['trackers','Trackers'],['peers','Peers'],['info','Info']];
+function kv(pairs){const f={},dl=h('dl.kv');for(const [k,label] of pairs)dl.append(h('dt',{text:label}),f[k]=h('dd'));return [dl,f]}
+function makeDetail(r){
+  const id=r.id,tl=h('div.tabs',{role:'tablist','aria-label':'Transfer details'});
+  r.tabs={};r.panels={};r.dt=h('div.dt',tl);
+  for(const [k,label] of TABS){
+    tl.append(r.tabs[k]=h('button.tab',{role:'tab',id:`t${id}${k}`,'aria-controls':`p${id}${k}`,'data-a':'tab','data-tab':k,text:label}));
+    r.dt.append(r.panels[k]=h('div.tp',{role:'tabpanel',id:`p${id}${k}`,'aria-labelledby':`t${id}${k}`,tabindex:'0'}));
+  }
+  r.fl=h('div.fl',empty('Loading files…'));r.frows=[];r.panels.files.append(r.fl);
+  r.trk=h('div.list');
+  r.panels.trackers.append(r.trk,h('form.inline',{'data-f':'tracker'},h('input.in',{'aria-label':'Tracker URL',placeholder:'udp://tracker.example.org:1337/announce'}),h('button.btn',{text:'Add tracker'})));
+  let dl;[dl,r.peers]=kv([['conn','Connected'],['known','Known'],['int','Interested in us'],['served','Requests served'],['down','Download'],['up','Upload']]);
+  r.cc=h('div.chips');r.diag=h('p.mono');
+  r.panels.peers.append(dl,r.ccs=h('div.sect',{hidden:true},h('h3',{text:'Peers by country'}),r.cc),r.diags=h('div.sect',{hidden:true},h('h3',{text:'Diagnostics'}),r.diag));
+  [dl,r.info]=kv([['dir','Save to'],['size','Size'],['pieces','Pieces'],['down','Downloaded'],['up','Uploaded'],['ratio','Ratio'],['hash','Info hash'],['ver','Format'],['pre','Preallocated']]);
+  r.info.hash.className='mono';
+  r.labelIn=h('input.in',{'aria-label':'Transfer label',placeholder:'No label',maxlength:'128'});
+  r.panels.info.append(dl,h('div.sect',h('h3',{text:'Label'}),h('form.inline',{'data-f':'label'},r.labelIn,h('button.btn',{text:'Save label'}))),
+    h('div.dacts',btn('Open folder','folder','folder'),r.stop=btn('Stop','stop','stop'),btn('Recheck','recheck','recheck'),btn('Archive','archive','archive'),btn('Remove transfer…','trash','remove','.danger')));
+  r.el.append(r.dt);selectTab(r,lastTab);
+}
+function selectTab(r,k,focus){
+  if(!r.tabs[k])k='files';r.tab=k;
+  for(const [n] of TABS){const on=n===k;attr(r.tabs[n],'aria-selected',String(on));r.tabs[n].tabIndex=on?0:-1;r.panels[n].hidden=!on}
+  if(focus)r.tabs[k].focus();
+  if(r.t)updateDetail(r,r.t,I.get(r.id));
+}
+function updateDetail(r,t,s){
+  if(r.tab==='info'){
+    const f=r.info;
+    txt(f.dir,t.download_dir||'–');txt(f.size,bytes(t.total_bytes));txt(f.pieces,`${t.completed_pieces} of ${t.total_pieces}`);
+    txt(f.down,bytes(t.downloaded_bytes));txt(f.up,bytes(t.uploaded_bytes));txt(f.ratio,ratioText(t));txt(f.hash,t.info_hash||'–');
+    txt(f.ver,t.meta_version===2?'v2':t.meta_version===3?'Hybrid v1 + v2':'v1');txt(f.pre,t.preallocate?'Yes':'No');
+    if(document.activeElement!==r.labelIn&&!r.labelIn.dataset.dirty&&r.labelIn.value!==t.label)r.labelIn.value=t.label;
+    r.stop.disabled=s.stopping||/^(loading|fetching metadata)$/.test(t.status);txt(r.stop.lastChild,s.stopping?'Stopping…':'Stop');
+  }else if(r.tab==='trackers'){
+    const key=t.trackers.join('\n');
+    if(r.trk.dataset.k!==key){
+      r.trk.dataset.k=key;
+      r.trk.replaceChildren(...(t.trackers.length?t.trackers.map(u=>li(h('span.grow.mono',{title:u,text:u}),ibtn('x','Remove tracker '+u,'untrack','.danger',{'data-url':u})))
+        :empty('No trackers. Peers are found through DHT and peer exchange where the torrent allows it.')));
+    }
+  }else if(r.tab==='peers'){
+    const f=r.peers,cc=t.peer_countries||[],key=cc.map(c=>c.code+c.count).join(),diag=s.k!=='error'?t.last_error:'';
+    txt(f.conn,t.active_peers);txt(f.known,t.tracker_peers);txt(f.int,t.interested_peers);txt(f.served,t.upload_requests_served);
+    txt(f.down,rate(t.download_rate_bps));txt(f.up,rate(t.upload_rate_bps));
+    r.ccs.hidden=!cc.length;
+    if(r.cc.dataset.k!==key){r.cc.dataset.k=key;r.cc.replaceChildren(...cc.map(c=>h('span.badge',{text:`${c.flag||''} ${c.code} · ${c.count}`.trim()})))}
+    r.diags.hidden=!diag;txt(r.diag,diag);
+  }else if(t.files_rev!==r.frev)loadFiles(r);
+}
+// File lists are fetched on demand while the Files tab is open, not streamed.
+function loadFiles(r){
+  if(r.fbusy)return void(r.fagain=true);
+  r.fbusy=true;const rev=r.t.files_rev;
+  getJSON('/torrent/files?id='+r.id).then(d=>{r.frev=d.files_rev;renderFiles(r,d.files||[])},e=>{r.frev=rev;r.frows=[];r.fl.replaceChildren(h('p.err',{text:'Could not load files: '+e.message}))})
+    .finally(()=>{r.fbusy=false;if(r.fagain){r.fagain=false;if(r.tab==='files'&&r.t.files_rev!==r.frev)loadFiles(r)}});
+}
+function renderFiles(r,files){
+  if(!files.length){r.frows=[];return r.fl.replaceChildren(...empty('File details appear once metadata is available.'))}
+  if(!r.frows.length)r.fl.replaceChildren();
+  const s=I.get(r.id)||{},prefix=(r.t.name||'')+'/';
+  files.forEach((f,i)=>{
+    let fr=r.frows[i];
+    if(!fr){
+      fr=r.frows[i]={name:h('span.grow'),size:h('span.meta.num'),fill:h('i'),pct:h('span.pct'),
+        sel:h('select.in.prio',{'data-i':i,'aria-label':'File priority'},...['Skip','Low','Normal','High'].map((text,value)=>h('option',{value,text})))};
+      r.fl.append(fr.el=h('div.li',{'data-i':i},fr.name,fr.size,h('div.prog',h('div.track',{'aria-hidden':'true'},fr.fill),fr.pct),fr.sel,ibtn('pen','Rename file','rename','.ren')));
+    }
+    fr.path=f.path;
+    if(!fr.editing){txt(fr.name,f.path.startsWith(prefix)?f.path.slice(prefix.length):f.path);attr(fr.name,'title',f.path)}
+    txt(fr.size,bytes(f.length));bar(fr.fill,fr.pct,f.length?Math.min(100,f.completed*100/f.length):100);
+    if(document.activeElement!==fr.sel&&fr.sel.value!==String(f.priority))fr.sel.value=String(f.priority);
+    fr.sel.disabled=!!s.init;attr(fr.sel,'title',s.init?'Priority can be changed once metadata is ready':null);
+  });
+  while(r.frows.length>files.length)r.frows.pop().el.remove();
+}
+function startRename(r,i){
+  const fr=r.frows[i];if(!fr||fr.editing)return;fr.editing=true;
+  const shown=fr.name.textContent,base=fr.path.split('/').pop(),input=h('input.in',{value:base,'aria-label':'New file name'});
+  fr.name.replaceChildren(input);input.focus();input.select();
+  const finish=save=>{
+    if(!fr.editing)return;fr.editing=false;const v=input.value.trim();txt(fr.name,shown);
+    if(!save||!v||v===base)return;
+    if(/[\\/]/.test(v)||v==='.'||v==='..')return toast('Invalid file name','Names cannot contain slashes.',true);
+    txt(fr.name,shown.replace(/[^/]*$/,v));r.frev=null;
+    act('/rename-file',{id:r.id,index:i,name:v},'File renamed',v);
+  };
+  input.onkeydown=e=>{if(e.key==='Enter'||e.key==='Escape'){e.preventDefault();e.stopPropagation();finish(e.key==='Enter')}};
+  input.onblur=()=>finish(true);
+}
+
+/* views and selection */
+function markNav(){for(const b of document.querySelectorAll('.nav'))attr(b,'aria-current',(view==='library'?b.dataset.f===filter:b.dataset.v===view)&&'page')}
+function go(v,f){
+  view=['search','rss','settings'].includes(v)?v:'library';store.set('view',view);
+  if(f!=null){filter=f;store.set('filter',f)}
+  for(const n of ['library','search','rss','settings'])$('v-'+n).hidden=n!==view;
+  markNav();
+  txt($('title'),view!=='library'?TITLES[view]:filter.startsWith('label:')?'Label: '+filter.slice(6):TITLES[filter]||TITLES.all);
+  $('findWrap').hidden=view!=='library';
+  if(view==='search')loadSearch();
+  if(view==='rss')loadRss();
+  if(view==='settings')renderSettings(true);
+  applyFilter();
+}
+function select(id){
+  const old=rows.get(selected),r=rows.get(id);
+  if(old)old.el.classList.remove('sel');
+  selected=id;if(r)r.el.classList.add('sel');
+}
+function move(d){
+  const v=order.map(id=>rows.get(id)).filter(r=>r&&!r.el.hidden);if(!v.length)return;
+  let i=v.findIndex(r=>r.id===selected);i=i<0?(d>0?0:v.length-1):Math.max(0,Math.min(v.length-1,i+d));
+  select(v[i].id);v[i].btn.focus();v[i].el.scrollIntoView({block:'nearest'});
+}
+function toggleExpand(r){
+  const k=keyOf(r.t);
+  expanded.has(k)?expanded.delete(k):expanded.add(k);
+  store.set('open',JSON.stringify([...expanded].slice(-50)));
+  updateRow(r,r.t);
+}
+
+/* transfer actions */
+function torrentAction(a,r){
+  const t=r.t,id=t.id;
+  if(a==='toggle')return act(`/torrent/${I.get(id).resume?'resume':'pause'}?id=${id}`);
+  if(a==='folder')return act('/torrent/open-folder?id='+id);
+  if(a==='remove')return confirmRemove(t);
+  if(a==='stop')return act('/torrent/stop?id='+id,null,'Stopping transfer',t.name);
+  if(a==='recheck')return act('/torrent/recheck?id='+id,null,'Checking files',t.name);
+  if(a==='archive')return act('/torrent/archive?id='+id,null,'Transfer archived',t.name);
+}
+let rmTarget=null;
+function confirmRemove(t){
+  rmTarget=t;
+  txt($('rmText'),`“${t.name||'This transfer'}” will be removed from your library. Downloaded files are kept unless you choose to delete them.`);
+  $('rmFiles').checked=false;$('rmGo').disabled=false;
+  openDialog(rmDlg);$('rmCancel').focus();
+}
+async function removeGo(){
+  const t=rmTarget,data=$('rmFiles').checked;$('rmGo').disabled=true;
+  try{await post(`/torrent/delete?id=${t.id}&data=${data?1:0}`);closeDialog(rmDlg);toast(data?'Transfer and files removed':'Transfer removed',t.name)}
+  catch(e){$('rmGo').disabled=false;toast('Could not remove transfer',e.message,true)}
+}
+
+/* dialogs: native <dialog> with a fallback for older WebKit */
+let modal=null,returnFocus=null;
+function openDialog(d){
+  if(modal)closeDialog(modal);
+  returnFocus=document.activeElement;modal=d;
+  if(d.showModal)d.showModal();else{d.classList.add('fb');d.setAttribute('role','dialog');d.setAttribute('aria-modal','true');d.setAttribute('open','')}
+}
+function closeDialog(d){
+  if(!d.hasAttribute('open'))return;
+  if(d.close)d.close();else{d.removeAttribute('open');dialogClosed(d)}
+}
+function dialogClosed(d){
+  if(modal===d)modal=null;
+  if(d===addDlg)resetAdd();
+  if(returnFocus&&returnFocus.isConnected)returnFocus.focus();
+  returnFocus=null;
+}
+for(const d of [addDlg,rmDlg]){
+  d.addEventListener('close',()=>dialogClosed(d));
+  d.addEventListener('cancel',e=>{e.preventDefault();closeDialog(d)});
+  d.addEventListener('click',e=>{if(e.target===d)closeDialog(d)});
+}
+function trapFocus(e){
+  const items=[...modal.querySelectorAll('button,input,select,a[href]')].filter(n=>!n.disabled&&n.getClientRects().length),a=document.activeElement;
+  if(!items.length)return;
+  const first=items[0],last=items[items.length-1];
+  if(e.shiftKey?a===first||!modal.contains(a):a===last||!modal.contains(a)){e.preventDefault();(e.shiftKey?last:first).focus()}
+}
+
+/* add torrent */
+let draft=null,parseSeq=0;
+function resetAdd(){draft=null;parseSeq++;$('tFile').value='';$('magnet').value='';$('addErr').hidden=true;renderReview()}
+function openAdd(magnet){
+  resetAdd();
+  if(!$('dir').value)$('dir').value=G.download_dir||'';
+  $('prealloc').checked=!!G.preallocate;$('start').checked=true;
+  $('browse').hidden=!/Mac/.test(navigator.platform||navigator.userAgent);
+  openDialog(addDlg);
+  if(magnet){$('magnet').value=magnet;renderReview()}
+  $('magnet').focus();
+}
+function validMagnet(m){
+  try{const u=new URL(m);return u.protocol==='magnet:'&&u.searchParams.getAll('xt').some(v=>/^(urn:btih:([0-9a-f]{40}|[a-z2-7]{32})|urn:btmh:1220[0-9a-f]{64})$/i.test(v))}catch(e){return false}
+}
+function renderReview(){
+  const rv=$('review'),m=$('magnet').value.trim();
+  let msg='Choose a .torrent file or paste a magnet link.',ok=false;
+  rv.hidden=true;
+  txt($('dropName'),draft?draft.file:'Choose a .torrent file');txt($('dropHint'),draft?'Choose a different file':'or drop it here');
+  if(draft){
+    if(draft.parsing)msg='Reading torrent…';
+    else if(draft.error)msg='Could not read this .torrent file: '+draft.error;
+    else{
+      const files=draft.files,n=files.filter(f=>f.sel).length;
+      ok=n>0;
+      msg=!ok?'Select at least one file to download.':`${plural(files.length,'file')} · ${bytes(draft.size)}`+(n<files.length?` · ${n} selected (${bytes(files.reduce((a,f)=>a+(f.sel?f.len:0),0))})`:'');
+      if(rv.dataset.k!==draft.key){
+        rv.dataset.k=draft.key;
+        rv.replaceChildren(h('div.rv-h',h('input',{type:'checkbox','data-a':'rv-all','aria-label':'Select all files'}),h('b',{text:draft.name,title:draft.name})),
+          h('div.rv-l',files.map((f,i)=>h('label',h('input.rv-f',{type:'checkbox','data-i':i}),h('span',{text:f.path,title:f.path}),h('span.muted.num',{text:bytes(f.len)})))));
+      }
+      for(const c of rv.querySelectorAll('.rv-f'))c.checked=files[c.dataset.i].sel;
+      const all=rv.querySelector('[data-a=rv-all]');all.checked=n===files.length;all.indeterminate=n>0&&n<files.length;
+      rv.hidden=files.length<2;
+    }
+  }else if(m){ok=validMagnet(m);msg=ok?'Magnet link ready to add.':'Enter a valid magnet link with a BitTorrent info hash.'}
+  txt($('addSummary'),msg);$('addGo').disabled=!ok;
+}
+async function setFile(file){
+  const seq=++parseSeq;$('magnet').value='';$('addErr').hidden=true;
+  draft={file:file.name,files:[],parsing:true};renderReview();
+  try{
+    if(file.size>2*1024*1024)throw new Error('torrent files must be smaller than 2 MiB');
+    const b=new Uint8Array(await file.arrayBuffer()),p=preview(b,file.name);
+    if(seq===parseSeq)draft={file:file.name,bytes:b,key:String(seq),...p};
+  }catch(e){if(seq===parseSeq)draft={file:file.name,files:[],error:e.message}}
+  if(seq===parseSeq)renderReview();
+}
+// Bounded bencode reader for the add preview: size, depth and node budgets, no duplicate keys.
+const dec=new TextDecoder();
+function bdecode(b){
   let nodes=0;
-  if(bytes.length>2*1024*1024){throw new Error('Torrent files must be smaller than 2 MiB.');}
-  function parseAt(offset,depth=0){
-    if(depth>64||++nodes>100000){throw new Error('Torrent metadata is too complex.');}
-    if(offset>=bytes.length){throw new Error('unexpected end of file');}
-    const marker=bytes[offset];
-    if(marker===100){
-      let idx=offset+1;
-      const dict=Object.create(null);
-      while(idx<bytes.length&&bytes[idx]!==101){
-        const keyNode=parseAt(idx,depth+1);
-        if(keyNode.t!=='bytes'){throw new Error('invalid dictionary key');}
-        const key=decodeUtf8(keyNode.v);
-        const valueNode=parseAt(keyNode.end,depth+1);
-        if(Object.prototype.hasOwnProperty.call(dict,key)){throw new Error('duplicate dictionary key');}
-        dict[key]=valueNode;
-        idx=valueNode.end;
+  const parse=(o,depth)=>{
+    if(depth>64||++nodes>100000)throw new Error('metadata is too complex');
+    const c=b[o];
+    if(c===100||c===108){
+      const dict=c===100,v=dict?Object.create(null):[];let i=o+1;
+      while(i<b.length&&b[i]!==101){
+        if(!dict){const val=parse(i,depth+1);v.push(val);i=val.end;continue}
+        const key=parse(i,depth+1);if(!(key.v instanceof Uint8Array))throw new Error('invalid dictionary key');
+        const k=dec.decode(key.v);if(k in v)throw new Error('duplicate dictionary key');
+        const val=parse(key.end,depth+1);v[k]=val;i=val.end;
       }
-      if(bytes[idx]!==101){throw new Error('unterminated dictionary');}
-      return {t:'dict',v:dict,start:offset,end:idx+1};
+      if(b[i]!==101)throw new Error('unexpected end of file');
+      return {v,end:i+1};
     }
-    if(marker===108){
-      let idx=offset+1;
-      const list=[];
-      while(idx<bytes.length&&bytes[idx]!==101){
-        const valueNode=parseAt(idx,depth+1);
-        list.push(valueNode);
-        idx=valueNode.end;
-      }
-      if(bytes[idx]!==101){throw new Error('unterminated list');}
-      return {t:'list',v:list,start:offset,end:idx+1};
-    }
-    if(marker===105){
-      let idx=offset+1;
-      while(idx<bytes.length&&bytes[idx]!==101){idx+=1;}
-      if(bytes[idx]!==101){throw new Error('unterminated integer');}
-      const raw=textDecoder.decode(bytes.subarray(offset+1,idx));
-      const value=Number(raw);
-      if(!Number.isSafeInteger(value)||!(/^(0|-?[1-9][0-9]*)$/).test(raw)){throw new Error('invalid integer');}
-      return {t:'int',v:value,start:offset,end:idx+1};
-    }
-    if(marker>=48&&marker<=57){
-      let colon=offset;
-      while(colon<bytes.length&&bytes[colon]!==58){
-        if(bytes[colon]<48||bytes[colon]>57){throw new Error('invalid byte string length');}
-        colon+=1;
-      }
-      if(bytes[colon]!==58){throw new Error('invalid byte string');}
-      const lenRaw=textDecoder.decode(bytes.subarray(offset,colon));
-      const len=Number(lenRaw);
-      if(!Number.isSafeInteger(len)||len<0){throw new Error('invalid byte string length');}
-      const start=colon+1;
-      const end=start+len;
-      if(end>bytes.length){throw new Error('byte string exceeds buffer');}
-      return {t:'bytes',v:bytes.slice(start,end),start:offset,end:end};
-    }
-    throw new Error('invalid bencode token');
-  }
-  const root=parseAt(0);
-  if(root.end!==bytes.length){throw new Error('trailing data');}
-  return root;
+    if(c===105){const e=b.indexOf(101,o),raw=e<0?'':dec.decode(b.subarray(o+1,e));if(!/^(0|-?[1-9]\d*)$/.test(raw)||!Number.isSafeInteger(+raw))throw new Error('invalid integer');return {v:+raw,end:e+1}}
+    const colon=b.indexOf(58,o),len=c>=48&&c<=57&&colon>o&&colon-o<=10?+dec.decode(b.subarray(o,colon)):NaN;
+    if(!Number.isSafeInteger(len)||colon+1+len>b.length)throw new Error('invalid bencode');
+    return {v:b.subarray(colon+1,colon+1+len),end:colon+1+len};
+  };
+  const root=parse(0,0);if(root.end!==b.length)throw new Error('trailing data');return root.v;
 }
-function nodeString(node){
-  if(!node||node.t!=='bytes'){return '';}
-  return decodeUtf8(node.v);
-}
-function nodeInt(node){
-  if(!node||node.t!=='int'){return 0;}
-  return Math.max(0,Math.floor(node.v));
-}
-function extractInfoHashFromMagnet(magnet){
-  const match=/[?&]xt=urn:btih:([^&]+)/i.exec(String(magnet||''));
-  if(!match){return '';}
-  let value='';
-  try{value=decodeURIComponent(match[1]);}catch(e){value=match[1];}
-  if(/^[a-f0-9]{40}$/i.test(value)){return value.toLowerCase();}
-  return '';
-}
-async function sha1Hex(bytes){
-  const digest=await crypto.subtle.digest('SHA-1',bytes);
-  return Array.from(new Uint8Array(digest)).map(v=>v.toString(16).padStart(2,'0')).join('');
-}
-async function parseTorrentPreview(bytes,fallbackName){
-  const root=parseBencode(bytes);
-  if(!root||root.t!=='dict'){throw new Error('invalid torrent file');}
-  const info=root.v.info;
-  if(!info||info.t!=='dict'){throw new Error('missing info dictionary');}
-  const name=nodeString(info.v['name.utf-8']||info.v.name)||fallbackName||'torrent';
-  const files=[];
-  const fileList=info.v.files;
-  if(fileList&&fileList.t==='list'&&fileList.v.length>0){
-    fileList.v.forEach((entry,idx)=>{
-      if(!entry||entry.t!=='dict'){return;}
-      const length=nodeInt(entry.v.length);
-      const pathNode=entry.v['path.utf-8']||entry.v.path;
-      const segments=(pathNode&&pathNode.t==='list')?pathNode.v.map(nodeString).filter(Boolean):[];
-      const relPath=segments.join('/');
-      files.push({index:idx,path:relPath?name+'/'+relPath:name,length:length,selected:true});
-    });
-  }else if(info.v['file tree']?.t==='dict'){
-    function visit(tree,segments){
-      if(tree['']?.t==='dict'){
-        files.push({index:files.length,path:[name,...segments].join('/'),length:nodeInt(tree[''].v.length),selected:true});
-      }
-      for(const key of Object.keys(tree).sort()){
-        if(key&&tree[key].t==='dict'){visit(tree[key].v,[...segments,key]);}
-      }
-    }
-    visit(info.v['file tree'].v,[]);
-  }else{
-    files.push({index:0,path:name,length:nodeInt(info.v.length),selected:true});
-  }
-  const totalBytes=files.reduce((acc,file)=>acc+file.length,0);
-  const infoHash=await sha1Hex(bytes.slice(info.start,info.end));
-  return {name:name,files:files,totalBytes:totalBytes,infoHash:infoHash};
-}
-function renderAddReview(){
-  const summary=document.getElementById('addSummary');
-  const review=document.getElementById('addReview');
-  const fileInput=document.getElementById('torrentFile');
-  const magnetInput=document.getElementById('magnet');
-  const addBtn=document.querySelector('#addModal .btn.primary');
-  if(!summary||!review||!addBtn){return;}
-  const hasFile=!!(fileInput&&fileInput.files&&fileInput.files[0]);
-  const magnet=magnetInput?magnetInput.value.trim():'';
-  if(addDraft.parsing){
-    summary.textContent='Reading torrent metadata...';
-    review.style.display='none';
-    addBtn.disabled=true;
-    return;
-  }
-  if(hasFile){
-    if(addDraft.parseError){
-      summary.textContent='Could not read this .torrent file. '+addDraft.parseError;
-      review.style.display='none';
-      addBtn.disabled=true;
-      return;
-    }
-    if(addDraft.kind==='file'&&addDraft.bytes&&addDraft.files.length>0){
-      const selected=addDraft.files.filter(file=>file.selected).length;
-      summary.textContent='Adding 1 torrent';
-      const rows=addDraft.files.map((file,idx)=>(
-        '<div class=\"add-file-row\">'
-        +'<div><input aria-label=\"Download '+escapeHtml(file.path)+'\" type=\"checkbox\" '+(file.selected?'checked ':'')+'onchange=\"toggleReviewFile('+idx+',this.checked)\"></div>'
-        +'<div class=\"add-file-name\" title=\"'+escapeHtml(file.path)+'\">'+escapeHtml(file.path)+'</div>'
-        +'<div class=\"add-file-size\">'+formatBytes(file.length)+'</div>'
-        +'</div>'
-      )).join('');
-      review.innerHTML=''
-        +'<div class=\"add-review-title\">'+escapeHtml(addDraft.name||addDraft.fileName||'torrent')+'</div>'
-        +'<div class=\"add-review-meta\"><span>'+addDraft.files.length+' files</span><span>'+formatBytes(addDraft.totalBytes)+'</span><span>'+selected+' selected</span></div>'
-        +'<div class=\"add-file-actions\"><button class=\"btn\" type=\"button\" onclick=\"toggleAllReviewFiles(true)\">Select all</button><button class=\"btn\" type=\"button\" onclick=\"toggleAllReviewFiles(false)\">Clear all</button></div>'
-        +'<div class=\"add-file-list\"><div class=\"add-file-head\"><div></div><div>Name</div><div class=\"add-file-size\">Size</div></div>'+rows+'</div>';
-      review.style.display='block';
-      addBtn.disabled=selected===0;
-      return;
-    }
-    summary.textContent='Select a valid .torrent file.';
-    review.style.display='none';
-    addBtn.disabled=true;
-    return;
-  }
-  if(magnet){
-    let valid=false;
-    try{const link=new URL(magnet);valid=link.protocol==='magnet:'&&link.searchParams.getAll('xt').some(value=>/^(urn:btih:([0-9a-f]{40}|[a-z2-7]{32})|urn:btmh:1220[0-9a-f]{64})$/i.test(value));}catch(e){}
-    summary.textContent=valid?'Magnet link ready to add.':'Enter a valid magnet link with a BitTorrent info hash.';
-    review.style.display='none';
-    addBtn.disabled=!valid;
-    return;
-  }
-  summary.textContent='Select a .torrent file or paste a magnet link.';
-  review.style.display='none';
-  addBtn.disabled=true;
-}
-function toggleReviewFile(index,checked){
-  if(addDraft.kind!=='file'||!addDraft.files[index]){return;}
-  addDraft.files[index].selected=!!checked;
-  renderAddReview();
-}
-function toggleAllReviewFiles(checked){
-  if(addDraft.kind!=='file'){return;}
-  addDraft.files.forEach(file=>{file.selected=!!checked;});
-  renderAddReview();
-}
-async function handleTorrentInputChange(){
-  const fileInput=document.getElementById('torrentFile');
-  const magnetInput=document.getElementById('magnet');
-  const file=fileInput&&fileInput.files?fileInput.files[0]:null;
-  if(file&&magnetInput){magnetInput.value='';}
-  const token=addParseToken+1;
-  addParseToken=token;
-  updateDropZoneState();
-  if(!file){
-    resetAddDraft();
-    renderAddReview();
-    return;
-  }
-  addDraft={kind:'file',name:file.name,fileName:file.name,files:[],totalBytes:file.size||0,infoHash:'',bytes:null,parseError:'',parsing:true};
-  renderAddReview();
-  try{
-    const bytes=new Uint8Array(await file.arrayBuffer());
-    if(token!==addParseToken){return;}
-    const parsed=await parseTorrentPreview(bytes,file.name);
-    if(token!==addParseToken){return;}
-    addDraft={kind:'file',name:parsed.name,fileName:file.name,files:parsed.files,totalBytes:parsed.totalBytes,infoHash:parsed.infoHash,bytes:bytes,parseError:'',parsing:false};
-  }catch(err){
-    if(token!==addParseToken){return;}
-    addDraft={kind:'file',name:file.name,fileName:file.name,files:[],totalBytes:file.size||0,infoHash:'',bytes:null,parseError:actionErrorMessage(err),parsing:false};
-  }
-  renderAddReview();
-}
-function handleMagnetInput(){
-  const magnetInput=document.getElementById('magnet');
-  const fileInput=document.getElementById('torrentFile');
-  const magnet=magnetInput?magnetInput.value.trim():'';
-  addParseToken+=1;
-  if(magnet&&fileInput){fileInput.value='';}
-  if(magnet){
-    addDraft={kind:'magnet',name:'',fileName:'',files:[],totalBytes:0,infoHash:extractInfoHashFromMagnet(magnet),bytes:null,parseError:'',parsing:false};
-  }else{
-    resetAddDraft();
-  }
-  updateDropZoneState();
-  renderAddReview();
-}
-function clearTorrentFile(){
-  const fileInput=document.getElementById('torrentFile');
-  if(fileInput){fileInput.value='';}
-  resetAddDraft();
-  updateDropZoneState();
-  renderAddReview();
-}
-function updateDropZoneState(){
-  const dz=document.getElementById('dropZone');
-  const nameEl=document.getElementById('dzFileName');
-  if(!dz){return;}
-  const fileInput=document.getElementById('torrentFile');
-  const hasFile=!!(fileInput&&fileInput.files&&fileInput.files[0]);
-  if(hasFile){
-    dz.classList.add('has-file');
-    if(nameEl){nameEl.textContent=fileInput.files[0].name;}
-  }else{
-    dz.classList.remove('has-file');
-    if(nameEl){nameEl.textContent='';}
-  }
-}
-(function initDragDrop(){
-  let dragCount=0;
-  const overlay=()=>document.getElementById('pageDropOverlay');
-  function isTorrentDrag(e){
-    if(!e.dataTransfer||!e.dataTransfer.types){return false;}
-    return e.dataTransfer.types.indexOf('Files')!==-1;
-  }
-  document.addEventListener('dragenter',e=>{
-    if(!isTorrentDrag(e)){return;}
-    e.preventDefault();
-    dragCount+=1;
-    const ov=overlay();
-    if(ov){ov.classList.add('active');}
-  });
-  document.addEventListener('dragleave',e=>{
-    dragCount-=1;
-    if(dragCount<=0){
-      dragCount=0;
-      const ov=overlay();
-      if(ov){ov.classList.remove('active');}
-    }
-  });
-  document.addEventListener('dragover',e=>{
-    if(!isTorrentDrag(e)){return;}
-    e.preventDefault();
-    e.dataTransfer.dropEffect='copy';
-  });
-  document.addEventListener('drop',e=>{
-    e.preventDefault();
-    dragCount=0;
-    const ov=overlay();
-    if(ov){ov.classList.remove('active');}
-    const files=e.dataTransfer&&e.dataTransfer.files;
-    if(!files||files.length===0){return;}
-    let torrentFile=null;
-    for(let i=0;i<files.length;i+=1){
-      if(files[i].name.endsWith('.torrent')){torrentFile=files[i];break;}
-    }
-    if(!torrentFile){return;}
-    const modal=document.getElementById('addModal');
-    if(!modal||!modal.classList.contains('open')){openAdd();}
-    const fileInput=document.getElementById('torrentFile');
-    if(fileInput){
-      const dt=new DataTransfer();
-      dt.items.add(torrentFile);
-      fileInput.files=dt.files;
-      updateDropZoneState();
-      handleTorrentInputChange();
-    }
-  });
-  const dzEl=document.getElementById('dropZone');
-  if(dzEl){
-    dzEl.addEventListener('dragenter',e=>{e.preventDefault();dzEl.classList.add('drag-over');});
-    dzEl.addEventListener('dragleave',e=>{dzEl.classList.remove('drag-over');});
-    dzEl.addEventListener('dragover',e=>{e.preventDefault();e.dataTransfer.dropEffect='copy';});
-    dzEl.addEventListener('drop',e=>{dzEl.classList.remove('drag-over');});
-  }
-})();
-document.addEventListener('click',e=>{
-  const target=e.target;
-  const mainTabBtn=target&&target.closest('[data-main-tab-target]');
-  if(mainTabBtn){
-    const tab=mainTabBtn.dataset.mainTabTarget==='search'?'search':'library';
-    try{localStorage.setItem(mainTabKey,tab);}catch(e){}
-    applyMainTab(tab);
-    if(tab==='search'){
-      loadSearchCatalog(true).catch(showActionError);
-    }
-    return;
-  }
-  const searchViewBtn=target&&target.closest('[data-search-view-target]');
-  if(searchViewBtn){
-    const view=searchViewBtn.dataset.searchViewTarget==='plugins'?'plugins':'results';
-    applySearchPanelView(view);
-    return;
-  }
-  const searchSortBtn=target&&target.closest('[data-search-sort]');
-  if(searchSortBtn){
-    setSearchSort(searchSortBtn.dataset.searchSort||'seeds');
-    return;
-  }
-  if(target&&target.closest('#themeToggle')){
-    let theme=activeTheme||resolveTheme();
-    theme=theme==='dark'?'light':'dark';
-    try{localStorage.setItem(themeKey,theme);}catch(e){}
-    applyTheme(theme);
-  }
-  const navItem=target.closest('.nav-item[data-filter]');
-  if(navItem){
-    const filter=navItem.dataset.filter||'all';
-    try{localStorage.setItem(filterKey,filter);}catch(e){}
-    applyFilter(filter);
-  }
-  const actionBtn=target.closest('[data-action]');
-  if(actionBtn){
-    const action=actionBtn.dataset.action;
-    if(action==='toggle-panel'){
-      const name=actionBtn.dataset.panel||'';
-      try{
-        const collapsed=isPanelCollapsed(name);
-        localStorage.setItem(panelCollapseKey(name),collapsed?'0':'1');
-      }catch(e){}
-      applyPanelState();
-      return;
-    }
-    if(action==='search-remove-plugin'){
-      removeSearchPlugin(actionBtn.dataset.module||'').catch(showActionError);
-      return;
-    }
-    if(action==='search-install-catalog'){
-      const url=actionBtn.dataset.url||'';
-      if(!url){return;}
-      actionBtn.disabled=true;
-      const origLabel=actionBtn.textContent;
-      actionBtn.textContent='Installing\u2026';
-      installCatalogPlugin(url).catch(showActionError).finally(()=>{actionBtn.disabled=false;actionBtn.textContent=origLabel;});
-      return;
-    }
-    if(action==='search-add-result'){
-      addSearchResult(actionBtn.dataset.index||'',actionBtn.dataset.name||'Search result').catch(showActionError);
-      return;
-    }
-    const card=actionBtn.closest('.torrent-card');
-    const id=card?card.dataset.id:'';
-    if(!id){return;}
-    const paused=card.dataset.paused==='true';
-      if(action==='toggle-pause'){togglePause(id,paused).catch(showActionError);}
-      else if(action==='stop'){torrentAction('stop',id).catch(showActionError);}
-      else if(action==='archive'){torrentAction('archive',id).catch(showActionError);}
-      else if(action==='delete'){confirmDelete(id,card.dataset.name||'torrent').catch(showActionError);}
-      else if(action==='open-folder'){torrentAction('open-folder',id).catch(showActionError);}
-      else if(action==='recheck'){torrentAction('recheck',id).catch(showActionError);}
-    else if(action==='toggle-expand'){toggleExpand(card);}
-    else if(action==='add-tracker'){
-      const input=card.querySelector('.tracker-add-input');
-      if(input&&input.value.trim()){
-        apiPost('/torrent/add-tracker',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&url='+encodeURIComponent(input.value.trim())}).then(()=>{input.value='';}).catch(showActionError);
-      }
-    }
-    else if(action==='remove-tracker'){
-      const url=actionBtn.dataset.url||'';
-      if(url){apiPost('/torrent/remove-tracker',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&url='+encodeURIComponent(url)}).catch(showActionError);}
-    }
-    else if(action==='set-label'){
-      const input=card.querySelector('.label-input');
-      if(input){apiPost('/torrent/set-label',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(id)+'&label='+encodeURIComponent(input.value.trim())}).catch(showActionError);}
-    }
-  }
-});
-document.addEventListener('input',e=>{
-  const target=e.target;
-  if(target&&target.id==='librarySearch'){
-    const search=String(target.value||'');
-    try{localStorage.setItem(searchKey,search);}catch(e){}
-    applyFilter(resolveFilter());
-    return;
-  }
-  if(target&&target.id==='searchCatalogFilter'){
-    renderSearchCatalog(searchCatalogCache);
-    return;
-  }
-  if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
-    updateRateLimitLabels();
-  }
-  if(target&&target.id==='seedRatio'){
-    const v=Number(target.value)/10;
-    const label=document.getElementById('seedRatioValue');
-    if(label){label.textContent=v>0?v.toFixed(2):'unlimited';}
-  }
-});
-document.addEventListener('change',e=>{
-  const target=e.target;
-  if(target&&target.matches('input[data-search-plugin]')){
-    persistSearchPluginSelectionFromDom();
-    return;
-  }
-  if(target&&target.id==='searchCategory'){
-    saveSearchCategory(target.value||'all');
-    return;
-  }
-  if(target&&(target.id==='downloadLimit'||target.id==='uploadLimit')){
-    setGlobalRateLimits().catch(showActionError);
-  }
-  if(target&&target.id==='seedRatio'){
-    const v=Number(target.value)/10;
-    const body='ratio='+encodeURIComponent(v);
-    apiPost('/settings/seed-ratio',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).catch(showActionError);
-  }
-  if(target&&target.id==='peerProfile'){
-    setPeerProfile().catch(showActionError);
-  }
-});
-function toggleExpand(card){
-  if(!card){return;}
-  const collapsed=card.dataset.collapsed==='true';
-  const nextCollapsed=!collapsed;
-  card.dataset.collapsed=nextCollapsed?'true':'false';
-  const toggle=card.querySelector("[data-action='toggle-expand']");
-  if(toggle){toggle.innerHTML=nextCollapsed?'<svg class="material-symbols-rounded"><use href=#i-unfold_more></use></svg>Expand':'<svg class="material-symbols-rounded"><use href=#i-unfold_less></use></svg>Collapse';toggle.setAttribute('aria-expanded',nextCollapsed?'false':'true');}
-  try{localStorage.setItem(collapseKey(card.dataset.infoHash||''),nextCollapsed?'1':'0');}catch(e){}
-}
-async function setGlobalRateLimits(){
-  const down=document.getElementById('downloadLimit');
-  const up=document.getElementById('uploadLimit');
-  if(!down||!up){return;}
-  const downloadKbps=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Math.round(Number(down.value)||0)));
-  const uploadKbps=Math.max(0,Math.min(MAX_RATE_LIMIT_KBPS,Math.round(Number(up.value)||0)));
-  down.value=String(downloadKbps);
-  up.value=String(uploadKbps);
-  updateRateLimitLabels();
-  const body='download_kbps='+encodeURIComponent(downloadKbps)+'&upload_kbps='+encodeURIComponent(uploadKbps);
-  await apiPost('/rate-limits',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-}
-async function setPeerProfile(){
-  const select=document.getElementById('peerProfile');
-  if(!select){return;}
-  const profile=String(select.value||'balanced').trim().toLowerCase();
-  const body='profile='+encodeURIComponent(profile);
-  await apiPost('/settings/peer-profile',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
+function preview(bytes,fallback){
+  const root=bdecode(bytes),info=root&&root.info&&root.info.v;
+  if(!info||info instanceof Uint8Array||Array.isArray(info))throw new Error('missing info dictionary');
+  const str=n=>n&&n.v instanceof Uint8Array?dec.decode(n.v):'',int=n=>n&&typeof n.v==='number'?Math.max(0,n.v):0;
+  const name=str(info['name.utf-8']||info.name)||fallback,files=[];
+  if(info.files&&Array.isArray(info.files.v)){
+    for(const e of info.files.v){const d=e.v||{},p=d['path.utf-8']||d.path;files.push({path:Array.isArray(p&&p.v)?p.v.map(str).join('/'):'',len:int(d.length),sel:true})}
+  }else if(info['file tree']){
+    const walk=(tree,segs)=>{for(const k of Object.keys(tree).sort()){const n=tree[k].v;if(k==='')files.push({path:segs.join('/'),len:int(n.length),sel:true});else if(n&&!(n instanceof Uint8Array))walk(n,[...segs,k])}};
+    walk(info['file tree'].v,[]);
+  }else files.push({path:name,len:int(info.length),sel:true});
+  return {name,files,size:files.reduce((a,f)=>a+f.len,0)};
 }
 async function submitAdd(){
-  const fileInput=document.getElementById('torrentFile');
-  const file=fileInput&&fileInput.files?fileInput.files[0]:null;
-  const magnet=document.getElementById('magnet').value.trim();
-  const dir=document.getElementById('downloadDir').value.trim();
-  const prealloc=document.getElementById('preallocate').checked?'1':'0';
-  const startWhenAdded=document.getElementById('startWhenAdded').checked;
-  const addBtn=document.querySelector('#addModal .btn.primary');
-  if(addBtn){addBtn.disabled=true;addBtn.textContent='Adding...';}
+  const go=$('addGo'),start=$('start').checked,base={dir:$('dir').value.trim(),prealloc:$('prealloc').checked?1:0,paused:start?0:1};
+  go.disabled=true;txt(go,'Adding…');$('addErr').hidden=true;
   try{
-    if(file){
-      if(addDraft.parsing){
-        showAddError('Please wait until torrent metadata is loaded.');
-        return false;
-      }
-      if(addDraft.kind==='file'&&addDraft.files.length>0&&addDraft.files.every(file=>!file.selected)){
-        showAddError('Select at least one file to download.');
-        return false;
-      }
-      const bytes=(addDraft.kind==='file'&&addDraft.bytes)?addDraft.bytes:new Uint8Array(await file.arrayBuffer());
-      const postPlan={
-        torrentId:null,
-        infoHash:addDraft.infoHash||'',
-        skipFiles:(addDraft.kind==='file'&&addDraft.files.length>0)?addDraft.files.filter(file=>!file.selected).map(file=>file.index):[],
-        startPaused:!startWhenAdded,
-      };
-      const addResponse=await apiPostJson('/add-torrent?dir='+encodeURIComponent(dir)+'&prealloc='+prealloc+'&paused='+(startWhenAdded?'0':'1')+'&skip='+encodeURIComponent(postPlan.skipFiles.join(',')),{headers:{'Content-Type':'application/x-bittorrent'},body:bytes});
-      const torrentId=Number(addResponse&&addResponse.torrent_id);
-      postPlan.torrentId=Number.isFinite(torrentId)&&torrentId>0?torrentId:null;
-      closeAdd();
-      showToast(
-        'Torrent added',
-        (!startWhenAdded)
-          ? ((addDraft.name||file.name||'Torrent')+' was added and will be paused.')
-          : ((addDraft.name||file.name||'Torrent')+' was added to rustorrent.')
-      );
-      scheduleRefreshFallback();
-      return false;
-    }
-    if(magnet){
-      const infoHash=extractInfoHashFromMagnet(magnet);
-      const body='magnet='+encodeURIComponent(magnet)+'&dir='+encodeURIComponent(dir)+'&prealloc='+prealloc+'&paused='+(startWhenAdded?'0':'1');
-      const addResponse=await apiPostJson('/add-magnet',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-      const torrentId=Number(addResponse&&addResponse.torrent_id);
-      closeAdd();
-      showToast(
-        'Magnet added',
-        !startWhenAdded
-          ? 'The magnet was added paused. Resume when you are ready.'
-          : 'The magnet was added to rustorrent.'
-      );
-      scheduleRefreshFallback();
-      return false;
-    }
-    showAddError('Select a .torrent file or paste a magnet link.');
-    return false;
-  }catch(err){
-    showAddError('Could not add torrent: '+actionErrorMessage(err));
-    return false;
-  }finally{
-    if(addBtn){addBtn.disabled=false;addBtn.textContent='Add Torrent';}
-  }
+    if(draft&&draft.bytes){
+      const skip=draft.files.map((f,i)=>f.sel?-1:i).filter(i=>i>=0).join(',');
+      await post('/add-torrent?'+q({...base,skip}),draft.bytes,'application/x-bittorrent');
+    }else await post('/add-magnet',q({...base,magnet:$('magnet').value.trim()}));
+    const name=draft?draft.name:'Magnet link';
+    closeDialog(addDlg);toast(start?'Torrent added':'Torrent added paused',name);
+  }catch(e){txt($('addErr'),'Could not add torrent: '+e.message);$('addErr').hidden=false}
+  txt(go,'Add');if(modal===addDlg)renderReview();
+}
+async function browseDir(){
+  try{const d=await post('/select-download-dir');if(d.path)$('dir').value=d.path}
+  catch(e){toast('Folder picker unavailable',e.message,true);$('dir').focus()}
 }
 
-function scheduleRefreshFallback(){
-  setTimeout(()=>{
-    const stale=Date.now()-lastUpdateAt>1200;
-    if(stale&&(!source||source.readyState!==1)){
-      location.reload();
-    }
-  },1200);
+/* search */
+let S=null,sTimer=0,catalog=null,catLoading=false,sStarted=0,sSort={k:store.get('ssort','seeds'),d:store.get('sdir','desc')};
+const added=new Set();
+const trust=n=>confirm(`Search plugins run third-party Python code on this computer. Install ${n} only if you trust its source. Continue?`);
+function enabledPlugins(){
+  const healthy=(S&&S.plugins||[]).filter(p=>p.healthy).map(p=>p.module);
+  let chosen=[];try{chosen=JSON.parse(store.get('search-plugins','[]')).filter(m=>healthy.includes(m))}catch(e){}
+  return chosen.length?chosen:healthy;
 }
-async function torrentAction(action,id){
-  await apiPost('/torrent/'+action+'?id='+encodeURIComponent(id));
+async function loadSearch(){
+  clearTimeout(sTimer);
+  try{S=await getJSON('/search/status');renderSearch()}catch(e){txt($('sStatus'),'Search is unavailable: '+e.message)}
+  if(S&&S.busy&&view==='search')sTimer=setTimeout(loadSearch,900);
+  if($('plugins').open&&!catalog)loadCatalog();
 }
-async function togglePause(id,paused){
-  const action=paused?'resume':'pause';
-  await torrentAction(action,id);
+async function pluginsChanged(){await loadSearch();if(catalog)loadCatalog()}
+function renderSearch(){
+  const plugins=(S.plugins||[]).filter(p=>p.module!=='__init__'),ready=plugins.filter(p=>p.healthy).length,on=enabledPlugins(),res=S.results||[];
+  if(S.last_started_at&&S.last_started_at!==sStarted){sStarted=S.last_started_at;added.clear()}
+  $('sWarn').hidden=ready>0;
+  txt($('sStatus'),S.busy?'Searching…':S.last_error||S.plugin_error||(res.length?`${plural(res.length,'result')} from ${plural(on.length,'plugin')}.`
+    :ready?`Ready to search with ${on.length===ready?'all ':''}${plural(on.length,'plugin')}.`:'Install a plugin to start searching.'));
+  $('sGo').disabled=!!S.busy;txt($('sGo'),S.busy?'Searching…':'Search');
+  if(document.activeElement!==$('sq')&&!$('sq').value&&S.query)$('sq').value=S.query;
+  $('scat').value=store.get('scat','all');
+  renderResults();
+  $('pList').replaceChildren(...(plugins.length?plugins.map(p=>li(
+    h('input',{type:'checkbox','data-plugin':p.module,checked:p.healthy&&on.includes(p.module),disabled:!p.healthy,'aria-label':'Use '+(p.display_name||p.module)}),
+    h('div.grow',h('b',{text:(p.display_name||p.module)+(p.version?' '+p.version:'')}),h('span.badge.'+(p.healthy?'ok':'bad'),{text:p.healthy?'Ready':'Broken'}),
+      h('div.muted',{text:p.broken_reason||(p.categories||[]).join(', ')||'All categories'})),
+    ibtn('trash','Remove plugin '+p.module,'punins','.danger',{'data-module':p.module}))):empty('No plugins installed yet.')));
 }
-async function confirmDelete(id,name){
-  let dialog=document.getElementById('removeDialog');
-  if(!dialog){
-    dialog=document.createElement('dialog');dialog.id='removeDialog';dialog.className='remove-dialog';
-    dialog.setAttribute('aria-labelledby','removeTitle');
-    dialog.innerHTML='<h2 id="removeTitle">Remove transfer?</h2><p id="removeName"></p><label><input id="removeFiles" type="checkbox">Also delete downloaded files</label><div class="modal-actions"><button class="btn ghost" id="removeCancel">Cancel</button><button class="btn danger" id="removeConfirm">Remove transfer</button></div>';
-    document.body.appendChild(dialog);
-    if(typeof dialog.showModal!=='function'){
-      dialog.setAttribute('role','dialog');dialog.setAttribute('aria-modal','true');
-      dialog.showModal=()=>{dialog.open=true;dialog.setAttribute('open','');dialog.style.cssText='position:fixed;inset:0;z-index:200;height:max-content;display:block;box-shadow:0 0 0 100vmax rgba(15,23,42,.45)';};
-      dialog.close=()=>{dialog.open=false;dialog.removeAttribute('open');dialog.style.display='none';dialog.onclose?.();};
-      dialog.addEventListener('keydown',event=>{
-        if(event.key==='Escape'){event.preventDefault();dialog.close();}
-        if(event.key==='Tab'){
-          const items=Array.from(dialog.querySelectorAll('button:not(:disabled),input:not(:disabled)'));
-          if(event.shiftKey&&document.activeElement===items[0]){event.preventDefault();items[items.length-1].focus();}
-          else if(!event.shiftKey&&document.activeElement===items[items.length-1]){event.preventDefault();items[0].focus();}
-        }
-      });
-    }
+function renderResults(){
+  const res=S&&S.results||[],{k,d}=sSort,key={date:'pub_date'}[k]||k,m=d==='asc'?1:-1;
+  if(!res.length)return $('sResults').replaceChildren();
+  const sorted=res.slice().sort((a,b)=>(typeof a[key]==='number'?a[key]-b[key]:String(a[key]||'').localeCompare(String(b[key]||'')))*m||String(a.name).localeCompare(String(b.name)));
+  const th=(k2,label,cls)=>h('th'+(cls||''),{'aria-sort':k===k2&&(d==='asc'?'ascending':'descending')},h('button.sort',{'data-a':'ssort','data-k':k2},label,k===k2&&icon(d==='asc'?'up':'down')));
+  const cell=v=>h('td.n',{text:v});
+  $('sResults').replaceChildren(h('table.tbl',h('thead',h('tr',th('name','Name'),th('plugin','Source'),th('size','Size','.n'),th('seeds','Seeds','.n'),th('leech','Peers','.n'),th('date','Date','.n'),h('th',h('span.vh',{text:'Actions'})))),
+    h('tbody',sorted.map(x=>{
+      let link=null;try{const u=new URL(x.desc_link);if(/^https?:$/.test(u.protocol))link=h('a.muted',{href:u.href,target:'_blank',rel:'noopener noreferrer',text:'Details'})}catch(e){}
+      const done=added.has(String(x.index));
+      return h('tr',h('td',h('div.t',{title:x.name,text:x.name||'Untitled'}),link),h('td',{text:x.plugin||x.site_url||''}),cell(x.size>0?bytes(x.size):'–'),cell(x.seeds>=0?x.seeds:'–'),cell(x.leech>=0?x.leech:'–'),
+        cell(x.pub_date>0?new Date(x.pub_date*1000).toLocaleDateString():'–'),h('td.n',h('button.btn.sm'+(done?'':'.primary'),{'data-a':'sadd','data-index':x.index,'data-name':x.name,disabled:done,text:done?'Added':'Add'})));
+    }))));
+}
+async function loadCatalog(refresh){
+  if(catLoading)return;catLoading=true;txt($('cMeta'),'Loading the community plugin list…');
+  try{const d=await getJSON('/search/catalog'+(refresh?'?refresh=1':''));catalog=d.entries||[];txt($('cMeta'),d.error||`${plural(catalog.length,'plugin')} from the qBittorrent unofficial plugin list.`)}
+  catch(e){txt($('cMeta'),'Could not load the catalog: '+e.message)}
+  catLoading=false;renderCatalog();
+}
+function renderCatalog(){
+  if(!catalog)return;
+  const f=$('cFilter').value.trim().toLowerCase();
+  const items=catalog.filter(e=>!f||[e.name,e.author,e.comment,e.module].join(' ').toLowerCase().includes(f))
+    .sort((a,b)=>(b.installed-a.installed)||String(a.name).localeCompare(String(b.name)));
+  $('cList').replaceChildren(...(items.length?items.map(e=>li(h('div.grow',h('b',{text:e.name||e.module}),
+      e.installed?h('span.badge.'+(e.installed_healthy?'ok':'bad'),{text:e.installed_healthy?'Installed':'Needs fix'}):null,
+      h('div.muted',{text:[e.author,e.version&&'v'+e.version,e.updated].filter(Boolean).join(' · ')||e.comment||''})),
+    h('button.btn.sm'+(e.installed?'':'.primary'),{'data-a':'pinstall','data-url':e.download_url||'',text:e.installed?'Update':'Install'})))
+    :empty(f?'No plugins match that filter.':'The catalog is empty.')));
+}
+
+/* rss */
+let R=null;
+async function loadRss(){try{R=await getJSON('/rss/status');renderRss()}catch(e){toast('Could not load RSS feeds',e.message,true)}}
+function renderRss(){
+  const feeds=R.feeds||[],rules=R.rules||[],title=u=>(feeds.find(f=>f.url===u)||{}).title||u;
+  $('rFeeds').replaceChildren(...(feeds.length?feeds.map(f=>li(h('div.grow',{title:f.url},h('b',{text:f.title||f.url}),
+      h('div.muted',{text:`${plural(f.items,'item')} · every ${dur(f.interval)} · checked ${f.last_poll>0?dur(Date.now()/1000-f.last_poll)+' ago':'never'}`})),
+    ibtn('trash','Remove feed '+(f.title||f.url),'rfeed-rm','.danger',{'data-url':f.url}))):empty('No feeds yet.')));
+  $('rRules').replaceChildren(...(rules.length?rules.map(r=>li(h('div.grow',h('b',{text:r.name}),h('div.muted',{text:`Matches “${r.pattern}” · ${r.feed_url?title(r.feed_url):'all feeds'}`})),
+    ibtn('trash','Remove rule '+r.name,'rrule-rm','.danger',{'data-name':r.name}))):empty('No rules yet.')));
+}
+const rssAct=(url,body,title)=>act(url,body,title).then(d=>{loadRss();return d});
+
+/* settings */
+function renderSettings(force){
+  const set=(id,v)=>{const e=$(id);if(force||document.activeElement!==e&&!e.dataset.dirty)e.value=v};
+  set('limDown',Math.round((G.global_download_limit_bps||0)/1024));set('limUp',Math.round((G.global_upload_limit_bps||0)/1024));
+  set('ratio',G.seed_ratio||0);set('profile',G.peer_profile||'balanced');
+  txt($('profileNote'),G.peer_profile_global_limit?`Up to ${G.peer_profile_global_limit} peers in total, ${G.peer_profile_torrent_limit} per transfer.`:'');
+  const maps=[G.natpmp_status,G.upnp_status].filter(Boolean),mapped=maps.filter(m=>m.startsWith('mapped ')),sum=k=>[...T.values()].reduce((a,t)=>a+t[k],0);
+  const pairs=[['Version',G.version],['Default save location',G.download_dir],['Downloaded this session',bytes(G.session_downloaded_bytes)],['Uploaded this session',bytes(G.session_uploaded_bytes)],
+    ['Peers',`${sum('active_peers')} connected · ${sum('tracker_peers')} known`],['Connections',`${G.peer_connected||0} opened · ${G.peer_disconnected||0} closed`],
+    ['Incoming port',G.incoming_port||'–'],['Port mapping',(mapped.length?mapped:maps).join(' · ')||'–'],
+    ['Disk latency',`read ${(G.disk_read_ms_avg||0).toFixed(1)} ms · write ${(G.disk_write_ms_avg||0).toFixed(1)} ms`],['Proxy',G.proxy_label]].filter(p=>p[1]!=null&&p[1]!=='');
+  const dl=$('session'),key=JSON.stringify(pairs);
+  if(dl.dataset.k!==key){dl.dataset.k=key;dl.replaceChildren(...pairs.flatMap(([k,v])=>[h('dt',{text:k}),h('dd',{text:v})]))}
+}
+function clampInput(e,max,round){const v=Math.max(0,Math.min(max,round(+e.value||0)));e.value=v;delete e.dataset.dirty;return v}
+
+/* events */
+const CLICK={
+  add:()=>openAdd(),'submit-add':submitAdd,browse:browseDir,'rm-go':removeGo,pcat:()=>loadCatalog(true),
+  close:el=>closeDialog(el.closest('dialog')),
+  clear:()=>{findText='';store.set('find','');$('find').value='';go('library','all')},
+  'rv-all':el=>{for(const f of draft.files)f.sel=el.checked;renderReview()},
+  plugins:()=>{$('plugins').open=true;$('plugins').scrollIntoView({block:'start',behavior:'smooth'})},
+  ssort:el=>{const k=el.dataset.k;sSort={k,d:sSort.k===k&&sSort.d==='desc'?'asc':'desc'};store.set('ssort',k);store.set('sdir',sSort.d);renderResults()},
+  sadd:el=>{el.disabled=true;post('/search/add-result',q({index:el.dataset.index,dir:G.download_dir||'',prealloc:G.preallocate?1:0}))
+    .then(()=>{added.add(el.dataset.index);txt(el,'Added');el.classList.remove('primary');toast('Torrent added',el.dataset.name)},e=>{el.disabled=false;toast('Could not add result',e.message,true)})},
+  punins:el=>{if(confirm(`Remove search plugin ${el.dataset.module}?`))act('/search/remove-plugin',{module:el.dataset.module},'Plugin removed').then(pluginsChanged)},
+  pinstall:el=>{if(!el.dataset.url||!trust('this plugin'))return;el.disabled=true;txt(el,'Installing…');act('/search/install-url',{url:el.dataset.url},'Plugin installed').then(pluginsChanged)},
+  pupdate:async()=>{
+    const urls=(catalog||[]).filter(x=>x.installed&&x.download_url).map(x=>x.download_url);
+    if(!urls.length)return toast('Nothing to update','Open the community catalog to link installed plugins.');
+    if(!trust('updates for all installed community plugins'))return;
+    try{for(const url of urls)await post('/search/install-url',q({url}));toast('Plugins updated')}catch(e){toast('Update failed',e.message,true)}
+    pluginsChanged();
+  },
+  'rfeed-rm':el=>rssAct('/rss/remove-feed',{url:el.dataset.url},'Feed removed'),
+  'rrule-rm':el=>rssAct('/rss/remove-rule',{name:el.dataset.name},'Rule removed')
+};
+const on=(type,fn)=>document.addEventListener(type,fn);
+const rowOf=el=>{const e=el.closest('.row');return e&&rows.get(+e.dataset.id)};
+on('click',e=>{
+  const el=e.target.closest('[data-a],.nav,.row');if(!el)return;
+  const a=el.dataset.a,r=rowOf(el);
+  if(r)select(r.id);
+  if(el.classList.contains('nav'))return go(el.dataset.v||'library',el.dataset.f);
+  if(!a)return;
+  if(r&&r.t){
+    if(a==='expand')return toggleExpand(r);
+    if(a==='tab'){store.set('tab',lastTab=el.dataset.tab);return selectTab(r,lastTab)}
+    if(a==='untrack')return act('/torrent/remove-tracker',{id:r.id,url:el.dataset.url},'Tracker removed');
+    if(a==='rename')return startRename(r,+el.closest('.li').dataset.i);
+    return torrentAction(a,r);
   }
-  const returnFocus=document.activeElement;
-  dialog.querySelector('#removeName').textContent=name+' will be removed from your library. Files are kept unless you select the option below.';
-  dialog.querySelector('#removeFiles').checked=false;
-  dialog.querySelector('#removeCancel').onclick=()=>dialog.close();
-  const button=dialog.querySelector('#removeConfirm');button.disabled=false;
-  button.onclick=async()=>{
-    button.disabled=true;
-    try{await apiPost('/torrent/delete?id='+encodeURIComponent(id)+'&data='+(dialog.querySelector('#removeFiles').checked?'1':'0'));dialog.close();showToast('Transfer removed','The library will update shortly.');}
-    catch(err){showActionError(err);button.disabled=false;}
-  };
-  dialog.onclose=()=>{if(pendingHtml){const html=pendingHtml;pendingHtml=null;renderApp(html);}if(returnFocus?.isConnected){returnFocus.focus();}};
-  dialog.showModal();dialog.querySelector('#removeCancel').focus();
-}
-async function setPriorityRequest(torrentId,index,priority){
-  const body='id='+encodeURIComponent(torrentId)+'&index='+encodeURIComponent(index)+'&priority='+encodeURIComponent(priority);
-  await apiPost('/file-priority',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});
-}
-async function setPriority(torrentId,index,priority){
-  try{
-    await setPriorityRequest(torrentId,index,priority);
-  }catch(err){
-    alert('Priority update failed: '+actionErrorMessage(err));
+  if(CLICK[a])CLICK[a](el);
+});
+const SUBMIT={
+  label:(f,r)=>{const v=r.labelIn.value.trim();act('/torrent/set-label',{id:r.id,label:v},v?'Label saved':'Label cleared',v).then(()=>{delete r.labelIn.dataset.dirty})},
+  tracker:(f,r)=>{const input=f.querySelector('input'),url=input.value.trim();if(url)act('/torrent/add-tracker',{id:r.id,url},'Tracker added').then(d=>{if(d)input.value=''})},
+  search:()=>{
+    const query=$('sq').value.trim();if(!query)return $('sq').focus();
+    added.clear();$('sGo').disabled=true;txt($('sStatus'),'Searching…');
+    act('/search/run',{query,category:$('scat').value,engines:enabledPlugins().join(',')}).then(loadSearch);
+  },
+  purl:()=>{const url=$('pUrl').value.trim();if(url&&trust(url))act('/search/install-url',{url},'Plugin installed').then(d=>{if(d)$('pUrl').value='';pluginsChanged()})},
+  rfeed:()=>{const url=$('rUrl').value.trim();if(url)rssAct('/rss/add-feed',{url,interval:$('rInt').value},'Feed added').then(d=>{if(d)$('rUrl').value=''})},
+  rrule:()=>{const name=$('rName').value.trim(),pattern=$('rPat').value.trim();if(name&&pattern)rssAct('/rss/add-rule',{name,pattern},'Rule added').then(d=>{if(d)$('rName').value=$('rPat').value=''})}
+};
+on('submit',e=>{e.preventDefault();const f=e.target,r=rowOf(f),fn=SUBMIT[f.dataset.f];if(fn&&(r||!f.closest('.row')))fn(f,r)});
+on('input',e=>{
+  const t=e.target;
+  if(t.id==='find'){findText=t.value;store.set('find',findText);applyFilter()}
+  else if(t.id==='magnet'){if(t.value.trim()){draft=null;parseSeq++;$('tFile').value=''}renderReview()}
+  else if(t.id==='cFilter')renderCatalog();
+  else if(t.classList.contains('in'))t.dataset.dirty='1';
+});
+on('change',e=>{
+  const t=e.target,r=rowOf(t),id=t.id;
+  if(id==='tFile'){if(t.files[0])setFile(t.files[0])}
+  else if(t.classList.contains('rv-f')){draft.files[t.dataset.i].sel=t.checked;renderReview()}
+  else if(t.classList.contains('prio')&&r)act('/file-priority',{id:r.id,index:t.dataset.i,priority:t.value});
+  else if(id==='limDown'||id==='limUp')act('/rate-limits',{download_kbps:clampInput($('limDown'),102400,Math.round),upload_kbps:clampInput($('limUp'),102400,Math.round)},'Bandwidth limits saved');
+  else if(id==='ratio')act('/settings/seed-ratio',{ratio:clampInput(t,10,v=>Math.round(v*100)/100)},'Seeding limit saved');
+  else if(id==='profile'){delete t.dataset.dirty;act('/settings/peer-profile',{profile:t.value},'Peer profile saved')}
+  else if(id==='appearance'){const v=t.value==='system'?'':t.value;store.set('theme',v||null);applyTheme(v)}
+  else if(id==='scat')store.set('scat',t.value);
+  else if(t.dataset.plugin)store.set('search-plugins',JSON.stringify([...document.querySelectorAll('[data-plugin]')].filter(c=>c.checked&&!c.disabled).map(c=>c.dataset.plugin)));
+  else if(id==='pFile'){const file=t.files[0];t.value='';if(file&&trust(file.name))file.arrayBuffer().then(b=>post('/search/install-plugin?filename='+encodeURIComponent(file.name),b,'text/x-python'))
+    .then(()=>toast('Plugin installed',file.name),err=>toast('Action failed',err.message,true)).then(pluginsChanged)}
+});
+on('focusin',e=>{const r=e.target.closest&&rowOf(e.target);if(r)select(r.id)});
+$('plugins').addEventListener('toggle',()=>{if($('plugins').open&&!catalog)loadCatalog()});
+$('theme').addEventListener('click',()=>{const t=document.documentElement.dataset.theme==='dark'?'light':'dark';store.set('theme',t);applyTheme(t)});
+on('keydown',e=>{
+  const t=e.target,key=e.key;
+  if(modal){if(key==='Escape'){e.preventDefault();closeDialog(modal)}else if(key==='Tab')trapFocus(e);return}
+  if((e.metaKey||e.ctrlKey)&&key.toLowerCase()==='o'){e.preventDefault();return openAdd()}
+  if(e.metaKey||e.ctrlKey||e.altKey)return;
+  if(t.getAttribute('role')==='tab'&&/^Arrow(Left|Right)$/.test(key)){
+    const r=rowOf(t),i=TABS.findIndex(x=>x[0]===r.tab);
+    e.preventDefault();store.set('tab',lastTab=TABS[(i+(key==='ArrowRight'?1:3))%4][0]);return selectTab(r,lastTab,true);
   }
-}
-function startRename(torrentId,index,cell){
-  const oldText=cell.textContent;
-  const parts=oldText.split('/');
-  const basename=parts[parts.length-1];
-  const input=document.createElement('input');
-  input.type='text';input.className='input';input.value=basename;
-  input.style.cssText='width:100%;box-sizing:border-box;font-size:12px';
-  cell.textContent='';cell.appendChild(input);input.focus();input.select();
-  let done=false;
-  function finish(save){
-    if(done)return;done=true;
-    const val=input.value.trim();
-    cell.textContent=oldText;
-    if(save&&val&&val!==basename&&!val.includes('/')&&!val.includes('\\\\')&&val!=='.'&&val!=='..'){
-      const newPath=parts.length>1?parts.slice(0,-1).join('/')+'/'+val:val;
-      cell.textContent=newPath;
-      const body='id='+encodeURIComponent(torrentId)+'&index='+encodeURIComponent(index)+'&name='+encodeURIComponent(val);
-      apiPost('/rename-file',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).catch(function(err){
-        cell.textContent=oldText;
-        alert('Rename failed: '+actionErrorMessage(err));
-      });
-    }
-  }
-  input.addEventListener('keydown',function(e){if(e.key==='Enter'){finish(true)}else if(e.key==='Escape'){finish(false)}});
-  input.addEventListener('blur',function(){finish(true)});
-}
-function addRssFeed(e){
-  e.preventDefault();
-  const url=document.getElementById('rssUrl').value.trim();
-  if(!url)return;
-  apiPost('/rss/add-feed',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(()=>location.reload()).catch(err=>alert('Add feed failed: '+actionErrorMessage(err)));
-}
-function removeRssFeed(url){
-  apiPost('/rss/remove-feed',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(()=>location.reload()).catch(err=>alert('Remove feed failed: '+actionErrorMessage(err)));
-}
-function removeRssRule(name){
-  apiPost('/rss/remove-rule',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(name)}).then(()=>location.reload()).catch(err=>alert('Remove rule failed: '+actionErrorMessage(err)));
-}
-function addRssRule(e){
-  e.preventDefault();
-  var name=document.getElementById('rssRuleName').value.trim();
-  var pattern=document.getElementById('rssRulePattern').value.trim();
-  if(!name||!pattern)return;
-  var body='name='+encodeURIComponent(name)+'&pattern='+encodeURIComponent(pattern);
-  apiPost('/rss/add-rule',{headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(){location.reload()}).catch(function(err){alert('Add rule failed: '+actionErrorMessage(err))});
-}
-function enhanceUI(){
-  const labels={librarySearch:'Filter transfers',searchQuery:'Search torrents',searchCategory:'Search category',searchPluginUrl:'Plugin URL',searchCatalogFilter:'Filter plugins',rssUrl:'RSS feed URL',rssRuleName:'Rule name',rssRulePattern:'Rule pattern',magnet:'Magnet link',downloadDir:'Save to folder',torrentFile:'Torrent file',downloadLimit:'Download limit',uploadLimit:'Upload limit',seedRatio:'Seeding ratio limit',peerProfile:'Connection profile'};
-  Object.entries(labels).forEach(([id,label])=>document.getElementById(id)?.setAttribute('aria-label',label));
-  const modal=document.getElementById('addModal');if(modal){modal.setAttribute('role','dialog');modal.setAttribute('aria-modal','true');modal.setAttribute('aria-label','Add Torrent');}
-  const zone=document.getElementById('dropZone');if(zone){
-    const browse=zone.querySelector('.dz-text');
-    if(browse){browse.tabIndex=0;browse.setAttribute('role','button');browse.setAttribute('aria-label','Choose torrent file');browse.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();document.getElementById('torrentFile')?.click();}};}
-  }
-  document.querySelectorAll('.table select').forEach(node=>node.setAttribute('aria-label','File priority'));
-  document.querySelectorAll('.tracker-add-input').forEach(node=>node.setAttribute('aria-label','Tracker URL'));
-  document.querySelectorAll('.label-input').forEach(node=>node.setAttribute('aria-label','Transfer label'));
-}
-enhanceUI();
-applyMainTab(resolveMainTab());
-applyTheme(resolveTheme());
-applySearchPanelView(resolveSearchPanelView());
-activeSearchSort=resolveSearchSort();
-applyFilter(resolveFilter());
-applyCollapseState();
-applyPanelState();
-updateRateLimitLabels();
-renderAddReview();
-const searchCategoryInput=document.getElementById('searchCategory');
-if(searchCategoryInput){searchCategoryInput.value=resolveSearchCategory();}
-loadSearchStatus(false).catch(err=>console.warn('search status failed',err));
-let lastUpdateAt=Date.now();
-const source=new EventSource('/events');
-source.addEventListener('status',event=>{if(event&&event.data){applyUpdate(event.data);lastUpdateAt=Date.now();}});
-const connectionBanner=document.createElement('div');connectionBanner.className='connection-banner';connectionBanner.hidden=true;connectionBanner.setAttribute('role','status');connectionBanner.textContent='Connection lost. Reconnecting to Rustorrent…';document.body.appendChild(connectionBanner);
-source.onopen=()=>{connectionBanner.hidden=true;};
-source.onerror=()=>{connectionBanner.hidden=false;};
+  if(/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)){if(key==='Escape'&&t.id==='find'&&t.value){t.value=findText='';store.set('find','');applyFilter()}return}
+  if(key==='/'){e.preventDefault();if(view!=='library')go('library');return $('find').focus()}
+  if(key==='a'||key==='A'){e.preventDefault();return openAdd()}
+  if(view!=='library')return;
+  if(key==='ArrowDown'){e.preventDefault();return move(1)}
+  if(key==='ArrowUp'){e.preventDefault();return move(-1)}
+  const r=rows.get(selected);if(!r||!r.t||r.el.hidden)return;
+  if(key===' '&&(t===document.body||t.classList.contains('rn'))){e.preventDefault();if(!r.toggle.disabled)torrentAction('toggle',r)}
+  else if(key==='Delete'||key==='Backspace'){e.preventDefault();confirmRemove(r.t)}
+});
+// Space on a focused transfer name pauses/resumes instead of activating the disclosure button.
+on('keyup',e=>{if(e.key===' '&&e.target.classList.contains('rn'))e.preventDefault()});
+on('paste',e=>{
+  if(modal||/^(INPUT|TEXTAREA)$/.test(e.target.tagName))return;
+  const s=(e.clipboardData&&e.clipboardData.getData('text')||'').trim();
+  if(/^magnet:\?/i.test(s)){e.preventDefault();openAdd(s)}
+});
+let drag=0;
+const isFiles=e=>e.dataTransfer&&[...e.dataTransfer.types].includes('Files');
+const dragOff=()=>{drag=0;$('overlay').classList.remove('on');$('drop').classList.remove('over')};
+on('dragenter',e=>{if(!isFiles(e))return;e.preventDefault();drag++;$('overlay').classList.toggle('on',modal!==addDlg);$('drop').classList.add('over')});
+on('dragover',e=>{if(isFiles(e)){e.preventDefault();e.dataTransfer.dropEffect='copy'}});
+on('dragleave',()=>{if(--drag<=0)dragOff()});
+on('drop',e=>{
+  if(!isFiles(e))return;e.preventDefault();dragOff();
+  const file=[...e.dataTransfer.files].find(f=>/\.torrent$/i.test(f.name));
+  if(!file)return toast('Not a torrent file','Drop a file ending in .torrent.',true);
+  if(modal!==addDlg)openAdd();
+  setFile(file);
+});
+
+$('find').value=findText;
+applyTheme(themePref());
+go(store.get('view','library'),filter);
+renderReview();
+connect();
