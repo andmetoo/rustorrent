@@ -831,35 +831,34 @@ fn update_catalog(force_refresh: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Each runtime module is stored gzip-compressed next to a one-line loader
+/// with the original name; Python decompresses and runs it in place.
 fn ensure_runtime(root: &Path) -> Result<(), String> {
-    const FILES: [(&str, &str); 7] = [
-        ("__init__.py", ""),
-        ("engines/__init__.py", ""),
-        (
-            "helpers.py",
-            include_str!("../assets/search_runtime/helpers.py"),
-        ),
-        (
-            "nova2.py",
-            include_str!("../assets/search_runtime/nova2.py"),
-        ),
-        (
-            "nova2dl.py",
-            include_str!("../assets/search_runtime/nova2dl.py"),
-        ),
-        (
-            "novaprinter.py",
-            include_str!("../assets/search_runtime/novaprinter.py"),
-        ),
-        (
-            "socks.py",
-            include_str!("../assets/search_runtime/socks.py"),
-        ),
+    macro_rules! module {
+        ($name:literal) => {
+            (
+                $name,
+                include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".gz")).as_slice(),
+            )
+        };
+    }
+    const MODULES: [(&str, &[u8]); 5] = [
+        module!("helpers.py"),
+        module!("nova2.py"),
+        module!("nova2dl.py"),
+        module!("novaprinter.py"),
+        module!("socks.py"),
     ];
     ensure_real_directory(root)?;
     ensure_real_directory(&root.join("engines"))?;
-    for (name, content) in FILES {
-        write_if_changed(&root.join(name), content)?;
+    write_if_changed(&root.join("__init__.py"), b"")?;
+    write_if_changed(&root.join("engines/__init__.py"), b"")?;
+    for (name, compressed) in MODULES {
+        write_if_changed(&root.join(format!("{name}.gz")), compressed)?;
+        let loader = format!(
+            "import gzip,os;exec(compile(gzip.decompress(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),'{name}.gz'),'rb').read()),__file__,'exec'))\n"
+        );
+        write_if_changed(&root.join(name), loader.as_bytes())?;
     }
     Ok(())
 }
@@ -916,8 +915,7 @@ fn ensure_real_directory(path: &Path) -> Result<(), String> {
     }
 }
 
-fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
-    let bytes = content.as_bytes();
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
             return Err(format!(
@@ -2270,7 +2268,7 @@ mod tests {
         let path = root.join("runtime.py");
         fs::write(&path, vec![b'x'; MAX_RUNTIME_FILE_BYTES + 1]).unwrap();
 
-        write_if_changed(&path, "replacement").unwrap();
+        write_if_changed(&path, b"replacement").unwrap();
         let bytes =
             read_regular_file_limited(&path, MAX_RUNTIME_FILE_BYTES, "read replaced runtime")
                 .unwrap();

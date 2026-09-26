@@ -1,5 +1,6 @@
-//! Precompresses the embedded web interface assets with gzip so the binary
-//! carries (and the server sends) a fraction of their size. The small
+//! Precompresses the embedded web interface assets and the search runtime
+//! with gzip so the binary carries (and the server sends) a fraction of
+//! their size. The small
 //! DEFLATE encoder below avoids a build dependency.
 
 use std::env;
@@ -7,20 +8,35 @@ use std::fs;
 use std::path::Path;
 
 const ASSETS: [&str; 2] = ["app.css", "app.js"];
+const SEARCH_RUNTIME: [&str; 5] = [
+    "helpers.py",
+    "nova2.py",
+    "nova2dl.py",
+    "novaprinter.py",
+    "socks.py",
+];
 
 fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
     let mut tag = 0u32;
     for name in ASSETS {
-        let source = Path::new("assets/ui").join(name);
-        println!("cargo:rerun-if-changed={}", source.display());
-        let data = fs::read(&source).unwrap_or_else(|err| panic!("{}: {err}", source.display()));
-        let gz = gzip(&data);
-        tag = crc32(tag, &gz);
-        fs::write(Path::new(&out_dir).join(format!("{name}.gz")), gz).expect("write asset");
+        tag = crc32(tag, &compress("assets/ui", name, &out_dir));
     }
     println!("cargo:rustc-env=UI_ASSET_TAG={tag:08x}");
+    for name in SEARCH_RUNTIME {
+        compress("assets/search_runtime", name, &out_dir);
+    }
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Writes `<OUT_DIR>/<name>.gz` and returns the compressed bytes.
+fn compress(dir: &str, name: &str, out_dir: &str) -> Vec<u8> {
+    let source = Path::new(dir).join(name);
+    println!("cargo:rerun-if-changed={}", source.display());
+    let data = fs::read(&source).unwrap_or_else(|err| panic!("{}: {err}", source.display()));
+    let gz = gzip(&data);
+    fs::write(Path::new(out_dir).join(format!("{name}.gz")), &gz).expect("write asset");
+    gz
 }
 
 fn crc32(seed: u32, data: &[u8]) -> u32 {
