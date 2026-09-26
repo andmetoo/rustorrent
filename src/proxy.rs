@@ -1,21 +1,6 @@
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
-
-const MAX_RESOLVED_ADDRESSES: usize = 16;
-const MAX_PROXY_RESOLVER_WORKERS: usize = 16;
-static ACTIVE_PROXY_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
-
-struct ProxyResolverGuard;
-
-impl Drop for ProxyResolverGuard {
-    fn drop(&mut self) {
-        ACTIVE_PROXY_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 #[derive(Clone, Debug)]
 pub enum ProxyConfig {
@@ -149,8 +134,8 @@ fn format_target_host(host: &str) -> String {
 #[cfg(test)]
 fn connect_target_host(target: SocketAddr) -> String {
     match target.ip() {
-        IpAddr::V4(ip) => ip.to_string(),
-        IpAddr::V6(ip) => format!("[{ip}]"),
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
     }
 }
 
@@ -370,66 +355,20 @@ fn connect_proxy(
     timeout: Duration,
     label: &str,
 ) -> Result<TcpStream, String> {
-    let mut last_err = None;
-    let started = Instant::now();
-    let addrs = resolve_host(host, port, timeout)?;
-    for addr in addrs {
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+    let deadline = Instant::now() + timeout;
+    let mut last_err = "no addresses".to_string();
+    for addr in crate::http::resolve_host(host, port, deadline)
+        .map_err(|err| format!("{label} resolve {host}: {err}"))?
+    {
+        let Ok(remaining) = remaining_until(deadline, label) else {
             break;
-        }
+        };
         match TcpStream::connect_timeout(&addr, remaining) {
             Ok(stream) => return Ok(stream),
-            Err(err) => last_err = Some(err),
+            Err(err) => last_err = err.to_string(),
         }
     }
-    Err(format!(
-        "{label} connect: {}",
-        last_err
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "no addresses".to_string())
-    ))
-}
-
-fn resolve_host(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, String> {
-    if let Ok(ip4) = host.parse::<Ipv4Addr>() {
-        return Ok(vec![SocketAddr::new(IpAddr::V4(ip4), port)]);
-    }
-    if let Ok(ip6) = host.parse::<Ipv6Addr>() {
-        return Ok(vec![SocketAddr::new(IpAddr::V6(ip6), port)]);
-    }
-    if ACTIVE_PROXY_RESOLVERS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_PROXY_RESOLVER_WORKERS).then_some(active + 1)
-        })
-        .is_err()
-    {
-        return Err(format!("proxy resolve {host}: resolver limit reached"));
-    }
-    let addr_str = format!("{host}:{port}");
-    let host_label = host.to_string();
-    let (tx, rx) = mpsc::sync_channel(1);
-    if let Err(err) = thread::Builder::new()
-        .name("proxy-resolver".to_string())
-        .spawn(move || {
-            let _guard = ProxyResolverGuard;
-            let resolved = addr_str
-                .to_socket_addrs()
-                .map(|addrs| addrs.take(MAX_RESOLVED_ADDRESSES).collect::<Vec<_>>())
-                .map_err(|err| format!("proxy resolve {host_label}: {err}"));
-            let _ = tx.try_send(resolved);
-        })
-    {
-        ACTIVE_PROXY_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
-        return Err(format!("proxy resolver thread: {err}"));
-    }
-    let addrs = rx
-        .recv_timeout(timeout)
-        .map_err(|_| format!("proxy resolve {host}: deadline exceeded"))??;
-    if addrs.is_empty() {
-        return Err(format!("proxy resolve {host}: no addresses"));
-    }
-    Ok(addrs)
+    Err(format!("{label} connect: {last_err}"))
 }
 
 #[cfg(test)]
