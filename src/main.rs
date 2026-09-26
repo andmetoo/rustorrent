@@ -847,6 +847,9 @@ struct TorrentContext {
     /// peers that complete a piece, so peer loops need not scan every piece.
     piece_complete: AtomicBool,
     endgame: AtomicBool,
+    /// Running outbound peer workers; surplus workers retire when the
+    /// per-torrent limit drops after the startup burst.
+    peer_workers: AtomicUsize,
 }
 
 type SessionRegistry = Arc<Mutex<HashMap<[u8; 20], Arc<TorrentContext>>>>;
@@ -4530,6 +4533,7 @@ fn run_torrent_once(
         file_renames: Arc::new(Mutex::new(initial_renames)),
         piece_complete: AtomicBool::new(initial_complete),
         endgame: AtomicBool::new(false),
+        peer_workers: AtomicUsize::new(0),
     });
     publish_piece_state(&context, &lock_or_recover(&pieces));
     cancelled()?;
@@ -4620,9 +4624,10 @@ fn run_torrent_once(
                 desired_workers
             };
             per_torrent_slots.set_max(live_target);
-            while handles.len() < live_target {
+            while context.peer_workers.load(Ordering::SeqCst) < live_target {
                 let worker_context = Arc::clone(&context);
                 let worker_connect_cfg = connect_cfg.clone();
+                context.peer_workers.fetch_add(1, Ordering::SeqCst);
                 let spawn_result = spawn_worker(
                     format!("peer-{torrent_id}-{}", handles.len()),
                     PEER_THREAD_STACK,
@@ -4631,6 +4636,7 @@ fn run_torrent_once(
                 match spawn_result {
                     Ok(handle) => handles.push(handle),
                     Err(err) => {
+                        context.peer_workers.fetch_sub(1, Ordering::SeqCst);
                         log_warn!("peer worker could not start: {err}");
                         break;
                     }
@@ -8023,6 +8029,19 @@ fn peer_worker_loop(ctx: &TorrentContext, connect_cfg: &ConnectionConfig) {
         if torrent_stop_requested(&ctx.stop_requested) {
             break;
         }
+        // Retire surplus workers (for example after the startup burst)
+        // instead of leaving them polling for a slot forever.
+        let max = ctx.torrent_peer_slots.max.load(Ordering::SeqCst);
+        if max != 0
+            && ctx
+                .peer_workers
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |workers| {
+                    (workers > max).then(|| workers - 1)
+                })
+                .is_ok()
+        {
+            return;
+        }
 
         let Some(addr) = lock_or_recover(&ctx.peer_queue).pop() else {
             sleep_with_shutdown_or_stop(PEER_QUEUE_POLL_INTERVAL, &ctx.stop_requested);
@@ -8054,6 +8073,7 @@ fn peer_worker_loop(ctx: &TorrentContext, connect_cfg: &ConnectionConfig) {
             let _ = err;
         }
     }
+    ctx.peer_workers.fetch_sub(1, Ordering::SeqCst);
 }
 
 struct ResumeStats {
@@ -14597,6 +14617,7 @@ mod core_helpers_tests {
             file_renames: Arc::new(Mutex::new(HashMap::new())),
             piece_complete: AtomicBool::new(false),
             endgame: AtomicBool::new(false),
+            peer_workers: AtomicUsize::new(0),
         })
     }
 
@@ -15564,6 +15585,28 @@ mod core_helpers_tests {
             assert_eq!(pieces.reserve_piece_for_peer(2, &[0x80], false), Some(0));
         }
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn surplus_peer_workers_retire_when_the_limit_drops() {
+        let root = temp_path("peer-worker-retire");
+        fs::create_dir_all(&root).unwrap();
+        let context = make_test_context(37, &root);
+        context.torrent_peer_slots.set_max(1);
+        context.peer_workers.store(2, Ordering::SeqCst);
+        let cfg = ConnectionConfig {
+            encryption: EncryptionMode::Disable,
+            utp: None,
+            ip_filter: None,
+            proxy: None,
+        };
+        let started = Instant::now();
+        // With no queued peers a worker within the limit would poll forever;
+        // the surplus one returns at once.
+        peer_worker_loop(&context, &cfg);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(context.peer_workers.load(Ordering::SeqCst), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
