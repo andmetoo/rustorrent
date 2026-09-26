@@ -15596,6 +15596,94 @@ mod core_helpers_tests {
     }
 
     #[test]
+    fn deleting_a_stale_queued_duplicate_leaves_the_active_torrent_alone() {
+        let root = temp_path("delete-stale-duplicate");
+        fs::create_dir_all(&root).unwrap();
+        let torrent_bytes = test_torrent_bytes();
+        let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        let context = make_test_context(40, &root);
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        register_session(&registry, Arc::clone(&context)).unwrap();
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
+        session_store
+            .upsert(
+                meta.info_hash,
+                "active".to_string(),
+                torrent_bytes.clone(),
+                &root,
+                false,
+            )
+            .unwrap();
+        let payload = root.join("test");
+        fs::write(&payload, [1u8; 16]).unwrap();
+        let mut queue = VecDeque::from([TorrentRequest {
+            id: 41,
+            source: TorrentSource::Bytes(torrent_bytes),
+            download_dir: root.clone(),
+            preallocate: false,
+            initial_label: String::new(),
+            initial_options: ui::AddOptions::default(),
+            held: true,
+        }]);
+
+        delete_torrent(
+            &registry,
+            &None,
+            &mut queue,
+            41,
+            true,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .unwrap();
+        assert!(queue.is_empty());
+        assert!(session_store.contains(meta.info_hash));
+        assert!(!session_store.get(meta.info_hash).unwrap().pending_delete);
+        assert!(payload.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_entry_without_session_state_can_be_removed() {
+        let root = temp_path("remove-orphan-row");
+        fs::create_dir_all(&root).unwrap();
+        let session_store = Arc::new(SessionStore::load(&root).unwrap());
+        let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ui = Arc::new(Mutex::new(ui::UiState {
+            torrents: vec![ui::UiTorrent {
+                id: 42,
+                status: "error".to_string(),
+                ..ui::UiTorrent::default()
+            }],
+            ..ui::UiState::default()
+        }));
+        let ui_state = Some(Arc::clone(&ui));
+        let mut queue = VecDeque::new();
+        delete_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            42,
+            true,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .unwrap();
+        assert!(lock_or_recover(&ui).torrents.is_empty());
+        assert!(delete_torrent(
+            &registry,
+            &ui_state,
+            &mut queue,
+            43,
+            false,
+            &session_store,
+            &empty_in_flight(),
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn peer_without_needed_pieces_is_kept_while_it_downloads_from_us() {
         let root = temp_path("keep-interested-peer");
         fs::create_dir_all(&root).unwrap();
@@ -19021,8 +19109,24 @@ fn delete_torrent(
             .get(queue_index)
             .cloned()
             .ok_or_else(|| "queued torrent disappeared".to_string())?;
+        // A request whose metadata cannot be read never started, and one whose
+        // torrent is loaded under another id is a stale duplicate: in both
+        // cases only the list entry goes; the session and files stay.
         let info_hash = info_hash_for_source(&request.source)
-            .map_err(|_| "torrent metadata unavailable for safe deletion".to_string())?;
+            .ok()
+            .filter(|info_hash| {
+                let active_elsewhere = find_context(registry, *info_hash)
+                    .is_ok_and(|context| context.id != torrent_id);
+                let loading_elsewhere = lock_or_recover(in_flight)
+                    .get(info_hash)
+                    .is_some_and(|(id, _)| *id != torrent_id);
+                !active_elsewhere && !loading_elsewhere
+            });
+        let Some(info_hash) = info_hash else {
+            let _ = queue.remove(queue_index);
+            remove_torrent_ui(ui_state, torrent_id, queue.len());
+            return Ok(());
+        };
         if remove_data {
             if !session_store.contains(info_hash) {
                 let data = match &request.source {
@@ -19085,11 +19189,24 @@ fn delete_torrent(
         return Ok(());
     }
 
-    let info_hash =
-        info_hash_from_ui(ui_state, torrent_id).ok_or_else(|| "unknown torrent".to_string())?;
-    if !session_store.contains(info_hash) {
-        return Err("torrent metadata unavailable; refusing unsafe deletion".to_string());
-    }
+    let known_row = ui_state.as_ref().is_some_and(|state| {
+        lock_or_recover(state)
+            .torrents
+            .iter()
+            .any(|torrent| torrent.id == torrent_id)
+    });
+    let info_hash = info_hash_from_ui(ui_state, torrent_id)
+        .filter(|info_hash| session_store.contains(*info_hash));
+    let Some(info_hash) = info_hash else {
+        // A list entry without session state (for example a load that
+        // failed before its metadata was stored) has no known payload:
+        // remove the entry and leave the disk untouched.
+        if known_row {
+            remove_torrent_ui(ui_state, torrent_id, queue.len());
+            return Ok(());
+        }
+        return Err("unknown torrent".to_string());
+    };
     remove_stored_torrent(
         session_store,
         ui_state,
