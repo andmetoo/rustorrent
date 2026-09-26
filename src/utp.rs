@@ -1649,6 +1649,31 @@ mod tests {
     }
 
     #[test]
+    fn send_window_never_exceeds_the_peer_receive_window() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut io = Io {
+            socket: &socket,
+            buf: Vec::new(),
+        };
+        let (mut conn, mut stream) = receive_test_conn(0);
+        conn.addr = socket.local_addr().unwrap();
+        conn.cwnd = MAX_CWND * UTP_PAYLOAD_MAX;
+        conn.peer_window = 2 * UTP_PAYLOAD_MAX - 1;
+        stream.write_all(&[5u8; 3 * UTP_PAYLOAD_MAX]).unwrap();
+        fill_send_window(&mut conn, &mut io);
+        assert_eq!(conn.inflight.len(), 1, "a second packet would overshoot");
+        assert_eq!(conn.inflight_bytes, UTP_PAYLOAD_MAX);
+
+        conn.peer_window = 3 * UTP_PAYLOAD_MAX;
+        fill_send_window(&mut conn, &mut io);
+        assert_eq!(conn.inflight.len(), 3);
+        // Sequence numbers are consecutive, starting at the next seq_nr.
+        let seqs: Vec<u16> = conn.inflight.iter().map(|packet| packet.seq).collect();
+        assert_eq!(seqs, vec![10, 11, 12]);
+        assert_eq!(conn.seq, 13);
+    }
+
+    #[test]
     fn piggybacked_and_selective_acks_release_inflight_packets() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut io = Io {
