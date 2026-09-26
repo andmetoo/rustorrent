@@ -124,6 +124,13 @@ impl UtpListener {
     pub fn try_accept(&self) -> Option<UtpStream> {
         self.accept_rx.try_recv().ok()
     }
+
+    /// Waits up to `timeout` for an inbound connection, so callers need not
+    /// poll `try_accept` with sleeps.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn accept_timeout(&self, timeout: Duration) -> Option<UtpStream> {
+        self.accept_rx.recv_timeout(timeout).ok()
+    }
 }
 
 pub struct UtpStream {
@@ -1367,17 +1374,9 @@ mod tests {
     }
 
     fn accept_within(listener: &UtpListener, timeout: Duration) -> UtpStream {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(stream) = listener.try_accept() {
-                return stream;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for utp accept"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        listener
+            .accept_timeout(timeout)
+            .expect("timed out waiting for utp accept")
     }
 
     fn recv_packet(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
