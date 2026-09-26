@@ -1817,9 +1817,10 @@ mod tests {
         assert_eq!(&middle[..], &payload[100..120]);
         storage.flush().unwrap();
         assert!(storage.entries.iter().all(|entry| !entry.dirty));
+        // Windows payload handles deny other readers, so close them first.
+        drop(storage);
         assert_eq!(fs::read(dir.join("root/f00001")).unwrap(), &payload[..7]);
         assert_eq!(fs::read(dir.join("root/f00000")).unwrap(), b"");
-        drop(storage);
         let _ = fs::remove_dir_all(&dir);
     }
 

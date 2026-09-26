@@ -191,7 +191,7 @@ fn code_lengths(freq: &[u32], limit: u8) -> Vec<u8> {
             return lengths;
         }
         while nodes.len() > 1 {
-            nodes.sort_by(|a, b| b.0.cmp(&a.0));
+            nodes.sort_by_key(|node| std::cmp::Reverse(node.0));
             let (fa, sa) = nodes.pop().expect("node");
             let (fb, sb) = nodes.pop().expect("node");
             for &symbol in sa.iter().chain(&sb) {

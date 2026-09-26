@@ -250,11 +250,29 @@ mod tests {
             assert!(received == expected);
         });
 
+        // Nonblocking writes accept only what fits in the socket buffers, so
+        // some are partial or refused. (Windows may buffer a whole send.)
         writer.tcp_stream().unwrap().set_nonblocking(true).unwrap();
-        let written = writer.write(&payload).unwrap();
-        assert!(written > 0 && written < payload.len(), "{written}");
-        writer.tcp_stream().unwrap().set_nonblocking(false).unwrap();
-        writer.write_all(&payload[written..]).unwrap();
+        let mut offset = 0;
+        let mut short_writes = 0;
+        while offset < payload.len() {
+            match writer.write(&payload[offset..]) {
+                Ok(written) => {
+                    if written < payload.len() - offset {
+                        short_writes += 1;
+                    }
+                    offset += written;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    short_writes += 1;
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(err) => panic!("{err}"),
+            }
+        }
+        #[cfg(unix)]
+        assert!(short_writes > 0);
+        let _ = short_writes;
         reader_thread.join().unwrap();
     }
 }

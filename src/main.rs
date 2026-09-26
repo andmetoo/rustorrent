@@ -15650,6 +15650,9 @@ mod core_helpers_tests {
         fs::create_dir_all(&root).unwrap();
         let torrent_bytes = test_torrent_bytes();
         let meta = torrent::parse_torrent(&torrent_bytes).unwrap();
+        // Written before the context opens the payload, which Windows locks.
+        let payload = root.join("test");
+        fs::write(&payload, [1u8; 16]).unwrap();
         let context = make_test_context(40, &root);
         let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
         register_session(&registry, Arc::clone(&context)).unwrap();
@@ -15663,8 +15666,6 @@ mod core_helpers_tests {
                 false,
             )
             .unwrap();
-        let payload = root.join("test");
-        fs::write(&payload, [1u8; 16]).unwrap();
         let mut queue = VecDeque::from([TorrentRequest {
             id: 41,
             source: TorrentSource::Bytes(torrent_bytes),
