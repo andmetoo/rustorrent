@@ -249,11 +249,14 @@ fn parse_top_dict(data: &[u8]) -> Result<(DictEntries, InfoSpan), Error> {
         return Err(Error::InvalidType("top-level dictionary"));
     }
 
-    let mut dict = Vec::new();
+    let mut dict: DictEntries = Vec::new();
     let mut pos = 1;
     let mut info_span = None;
-    let mut previous_key: Option<Vec<u8>> = None;
     let mut terminated = false;
+    // One value budget for the whole document, exactly as a single
+    // `bencode::parse` would charge it; per-entry budgets would let many
+    // top-level keys multiply the allowed allocation count.
+    let mut remaining = bencode::MAX_VALUES;
 
     while pos < data.len() {
         if data[pos] == b'e' {
@@ -261,25 +264,20 @@ fn parse_top_dict(data: &[u8]) -> Result<(DictEntries, InfoSpan), Error> {
             terminated = true;
             break;
         }
-        let (key_value, next) = bencode::parse_value(data, pos)?;
-        let key = match key_value {
-            Value::Bytes(bytes) => bytes,
-            _ => return Err(Error::InvalidType("dictionary key")),
+        let (key_value, next) = bencode::parse_value_with_budget(data, pos, &mut remaining)?;
+        let Value::Bytes(key) = key_value else {
+            return Err(Error::InvalidType("dictionary key"));
         };
-        if previous_key
-            .as_ref()
-            .is_some_and(|previous| previous.as_slice() >= key.as_slice())
-        {
+        if dict.last().is_some_and(|(previous, _)| *previous >= key) {
             return Err(bencode::Error::InvalidDictOrder.into());
         }
         pos = next;
         let value_start = pos;
-        let (value, next) = bencode::parse_value(data, pos)?;
+        let (value, next) = bencode::parse_value_with_budget(data, pos, &mut remaining)?;
         pos = next;
         if key == b"info" {
             info_span = Some((value_start, pos));
         }
-        previous_key = Some(key.clone());
         dict.push((key, value));
     }
 
@@ -328,8 +326,7 @@ fn parse_info_dict(value: &Value, has_v2: bool, has_v1: bool) -> Result<InfoDict
             pieces
         }
         Some(_) => return Err(Error::InvalidType("pieces")),
-        None if has_v1 => unreachable!("presence was checked before parsing"),
-        None if !has_v2 => return Err(Error::MissingField("pieces")),
+        None if has_v1 || !has_v2 => return Err(Error::MissingField("pieces")),
         None => Vec::new(),
     };
 
@@ -510,9 +507,6 @@ fn parse_file_tree_recursive(
     }
 
     for (key, value) in dict {
-        if key.is_empty() {
-            unreachable!("empty key handled before traversal");
-        }
         let inner = as_dict_named(value, "file tree node")?;
         path.push(key.clone());
         parse_file_tree_recursive(inner, path, entries)?;
@@ -715,6 +709,23 @@ fn as_list_named<'a>(value: &'a Value, field: &'static str) -> Result<&'a [Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_entries_share_one_value_budget() {
+        // Two top-level lists that each fit the per-document value budget
+        // but together exceed it must be rejected like a single parse would.
+        let half = bencode::MAX_VALUES / 2 + 16;
+        let list = bencode::encode(&Value::List(vec![Value::Int(0); half]));
+        let mut data = b"d1:a".to_vec();
+        data.extend_from_slice(&list);
+        data.extend_from_slice(b"1:b");
+        data.extend_from_slice(&list);
+        data.push(b'e');
+        assert!(matches!(
+            parse_top_dict(&data),
+            Err(Error::Bencode(bencode::Error::ValueLimitExceeded))
+        ));
+    }
 
     fn v2_file_tree(name: &[u8], length: u64, root: [u8; 32]) -> Value {
         Value::Dict(vec![(
