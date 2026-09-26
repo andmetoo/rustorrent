@@ -39,7 +39,7 @@ fn require_network() -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SearchPlugin {
     pub module: String,
     pub display_name: String,
@@ -50,7 +50,7 @@ pub struct SearchPlugin {
     pub broken_reason: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SearchResult {
     pub result_id: u64,
     pub plugin: String,
@@ -64,7 +64,7 @@ pub struct SearchResult {
     pub pub_date: i64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SearchCatalogEntry {
     pub module: String,
     pub name: String,
@@ -76,7 +76,7 @@ pub struct SearchCatalogEntry {
     pub private_site: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct SearchState {
     plugins: Vec<SearchPlugin>,
     results: Vec<SearchResult>,
@@ -95,13 +95,12 @@ struct SearchState {
     catalog_fetched_at: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SearchRuntime {
     root: PathBuf,
     python: Option<String>,
 }
-
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 struct ProcessOutput {
     success: bool,
     stdout: Vec<u8>,
@@ -226,10 +225,10 @@ struct ReaderTask {
 }
 
 impl ReaderTask {
-    fn spawn(reader: impl Read + Send + 'static, limit: usize) -> Self {
+    fn spawn(mut reader: Box<dyn Read + Send>, limit: usize) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
-            let _ = sender.send(read_limited(reader, limit));
+            let _ = sender.send(read_limited(&mut *reader, limit));
         });
         Self {
             receiver,
@@ -414,6 +413,9 @@ pub enum SearchDownload {
 static SEARCH_RUNTIME: OnceLock<SearchRuntime> = OnceLock::new();
 static SEARCH_STATE: OnceLock<Mutex<SearchState>> = OnceLock::new();
 
+const PYTHON_MISSING: &str =
+    "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins.";
+
 fn no_plugins_message() -> &'static str {
     "No search plugins are installed yet. Open Plugins or Community Catalog to add one."
 }
@@ -434,9 +436,7 @@ pub fn prepare(download_dir: &Path) -> Result<(), String> {
     let mut guard = lock_state(state);
     guard.python_available = runtime.python.is_some();
     if !guard.python_available {
-        guard.plugin_error =
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string();
+        guard.plugin_error = PYTHON_MISSING.to_string();
     } else if guard.plugins.is_empty() {
         guard.plugin_error = no_plugins_message().to_string();
     }
@@ -458,9 +458,7 @@ pub fn refresh_plugins() -> Result<(), String> {
     guard.python_available = runtime.python.is_some();
     guard.plugin_error = plugin_error;
     if !guard.python_available && guard.plugin_error.is_empty() {
-        guard.plugin_error =
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string();
+        guard.plugin_error = PYTHON_MISSING.to_string();
     } else if guard.python_available && guard.plugins.is_empty() && guard.plugin_error.is_empty() {
         guard.plugin_error = no_plugins_message().to_string();
     }
@@ -472,59 +470,49 @@ pub fn status_json() -> String {
         return "{\"busy\":false,\"python_available\":false,\"plugin_error\":\"search not initialized\",\"last_error\":\"\",\"query\":\"\",\"category\":\"all\",\"last_started_at\":0,\"last_finished_at\":0,\"plugins\":[],\"results\":[]}".to_string();
     };
     let state = lock_state(lock);
-    let mut out = format!(
-        "{{\"busy\":{},\"python_available\":{},\"plugin_error\":\"{}\",\"last_error\":\"{}\",\"query\":\"{}\",\"category\":\"{}\",\"last_started_at\":{},\"last_finished_at\":{},\"plugins\":[",
-        if state.busy { "true" } else { "false" },
-        if state.python_available { "true" } else { "false" },
-        escape_json(&state.plugin_error),
-        escape_json(&state.last_error),
-        escape_json(&state.last_query),
-        escape_json(&state.last_category),
-        state.last_started_at,
-        state.last_finished_at,
-    );
-    for (idx, plugin) in state.plugins.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
+    let mut out = Json(String::with_capacity(256 + state.results.len() * 256));
+    out.open("", '{');
+    out.raw("busy", &state.busy);
+    out.raw("python_available", &state.python_available);
+    out.str("plugin_error", &state.plugin_error);
+    out.str("last_error", &state.last_error);
+    out.str("query", &state.last_query);
+    out.str("category", &state.last_category);
+    out.raw("last_started_at", &state.last_started_at);
+    out.raw("last_finished_at", &state.last_finished_at);
+    out.open("plugins", '[');
+    for plugin in &state.plugins {
+        out.open("", '{');
+        out.str("module", &plugin.module);
+        out.str("display_name", &plugin.display_name);
+        out.str("site_url", &plugin.site_url);
+        out.str("version", &plugin.version);
+        out.raw("healthy", &plugin.healthy);
+        out.str("broken_reason", &plugin.broken_reason);
+        out.open("categories", '[');
+        for category in &plugin.categories {
+            out.str("", category);
         }
-        out.push_str(&format!(
-            "{{\"module\":\"{}\",\"display_name\":\"{}\",\"site_url\":\"{}\",\"version\":\"{}\",\"healthy\":{},\"broken_reason\":\"{}\",\"categories\":[",
-            escape_json(&plugin.module),
-            escape_json(&plugin.display_name),
-            escape_json(&plugin.site_url),
-            escape_json(&plugin.version),
-            if plugin.healthy { "true" } else { "false" },
-            escape_json(&plugin.broken_reason),
-        ));
-        for (cat_idx, category) in plugin.categories.iter().enumerate() {
-            if cat_idx > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!("\"{}\"", escape_json(category)));
-        }
-        out.push_str("]}");
+        out.0.push_str("]}");
     }
-    out.push_str("],\"results\":[");
-    for (idx, result) in state.results.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"index\":{},\"plugin\":\"{}\",\"site_url\":\"{}\",\"link\":\"{}\",\"name\":\"{}\",\"size\":{},\"seeds\":{},\"leech\":{},\"desc_link\":\"{}\",\"pub_date\":{}}}",
-            result.result_id,
-            escape_json(&result.plugin),
-            escape_json(&result.site_url),
-            escape_json(&result.link),
-            escape_json(&result.name),
-            result.size_bytes,
-            result.seeds,
-            result.leech,
-            escape_json(&result.desc_link),
-            result.pub_date,
-        ));
+    out.0.push(']');
+    out.open("results", '[');
+    for result in &state.results {
+        out.open("", '{');
+        out.raw("index", &result.result_id);
+        out.str("plugin", &result.plugin);
+        out.str("site_url", &result.site_url);
+        out.str("link", &result.link);
+        out.str("name", &result.name);
+        out.raw("size", &result.size_bytes);
+        out.raw("seeds", &result.seeds);
+        out.raw("leech", &result.leech);
+        out.str("desc_link", &result.desc_link);
+        out.raw("pub_date", &result.pub_date);
+        out.0.push('}');
     }
-    out.push_str("]}");
-    out
+    out.0.push_str("]}");
+    out.0
 }
 
 pub fn catalog_json(force_refresh: bool) -> String {
@@ -532,60 +520,86 @@ pub fn catalog_json(force_refresh: bool) -> String {
     let Some(lock) = SEARCH_STATE.get() else {
         return "{\"entries\":[],\"error\":\"search not initialized\"}".to_string();
     };
+    let mut state = lock_state(lock);
     if let Some(err) = fetch_error {
-        let mut state = lock_state(lock);
         state.catalog_error = err;
     }
-    let state = lock_state(lock);
-    let installed_plugins = state.plugins.clone();
-    let mut out = format!(
-        "{{\"error\":\"{}\",\"source_url\":\"{}\",\"fetched_at\":{},\"entries\":[",
-        escape_json(&state.catalog_error),
-        escape_json(CATALOG_URL),
-        state.catalog_fetched_at
-    );
-    append_catalog_entries_json(&mut out, &state.catalog, &installed_plugins);
-    out.push_str("]}");
-    out
+    let mut out = Json(String::with_capacity(256 + state.catalog.len() * 512));
+    out.open("", '{');
+    out.str("error", &state.catalog_error);
+    out.str("source_url", CATALOG_URL);
+    out.raw("fetched_at", &state.catalog_fetched_at);
+    out.open("entries", '[');
+    append_catalog_entries_json(&mut out, &state.catalog, &state.plugins);
+    out.0.push_str("]}");
+    out.0
 }
 
 fn append_catalog_entries_json(
-    out: &mut String,
+    out: &mut Json,
     entries: &[SearchCatalogEntry],
     installed_plugins: &[SearchPlugin],
 ) {
-    let mut first = true;
     for entry in entries.iter().filter(|entry| !entry.private_site) {
-        if !first {
-            out.push(',');
-        }
-        first = false;
         let installed = installed_plugins
             .iter()
             .find(|plugin| plugin.module == entry.module);
-        out.push_str(&format!(
-            "{{\"module\":\"{}\",\"name\":\"{}\",\"author\":\"{}\",\"version\":\"{}\",\"updated\":\"{}\",\"download_url\":\"{}\",\"comment\":\"{}\",\"private_site\":{},\"installed\":{},\"installed_version\":\"{}\",\"installed_name\":\"{}\",\"installed_healthy\":{}}}",
-            escape_json(&entry.module),
-            escape_json(&entry.name),
-            escape_json(&entry.author),
-            escape_json(&entry.version),
-            escape_json(&entry.updated),
-            escape_json(&entry.download_url),
-            escape_json(&entry.comment),
-            if entry.private_site { "true" } else { "false" },
-            if installed.is_some() { "true" } else { "false" },
-            escape_json(installed.map(|plugin| plugin.version.as_str()).unwrap_or("")),
-            escape_json(
-                installed
-                    .map(|plugin| plugin.display_name.as_str())
-                    .unwrap_or("")
-            ),
-            if installed.map(|plugin| plugin.healthy).unwrap_or(false) {
-                "true"
-            } else {
-                "false"
-            },
-        ));
+        out.open("", '{');
+        out.str("module", &entry.module);
+        out.str("name", &entry.name);
+        out.str("author", &entry.author);
+        out.str("version", &entry.version);
+        out.str("updated", &entry.updated);
+        out.str("download_url", &entry.download_url);
+        out.str("comment", &entry.comment);
+        out.raw("private_site", &entry.private_site);
+        out.raw("installed", &installed.is_some());
+        out.str(
+            "installed_version",
+            installed.map_or("", |plugin| plugin.version.as_str()),
+        );
+        out.str(
+            "installed_name",
+            installed.map_or("", |plugin| plugin.display_name.as_str()),
+        );
+        out.raw(
+            "installed_healthy",
+            &installed.is_some_and(|plugin| plugin.healthy),
+        );
+        out.0.push('}');
+    }
+}
+
+/// Minimal JSON writer. `key` inserts the separating comma unless the
+/// previous byte opened an object or array; an empty key writes an array
+/// element.
+struct Json(String);
+
+impl Json {
+    fn key(&mut self, key: &str) {
+        if !matches!(self.0.as_bytes().last(), None | Some(b'{' | b'[')) {
+            self.0.push(',');
+        }
+        if !key.is_empty() {
+            push_json_string(&mut self.0, key);
+            self.0.push(':');
+        }
+    }
+
+    fn str(&mut self, key: &str, value: &str) {
+        self.key(key);
+        push_json_string(&mut self.0, value);
+    }
+
+    fn raw(&mut self, key: &str, value: &dyn std::fmt::Display) {
+        use std::fmt::Write;
+        self.key(key);
+        let _ = write!(self.0, "{value}");
+    }
+
+    fn open(&mut self, key: &str, bracket: char) {
+        self.key(key);
+        self.0.push(bracket);
     }
 }
 
@@ -627,13 +641,8 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
     require_network()?;
     let runtime = runtime()?.clone();
     if runtime.python.is_none() {
-        set_last_error(
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins.",
-        );
-        return Err(
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string(),
-        );
+        set_last_error(PYTHON_MISSING);
+        return Err(PYTHON_MISSING.to_string());
     }
 
     let query = query.trim();
@@ -733,12 +742,7 @@ pub fn start_search(query: &str, category: &str, engines: &[String]) -> Result<(
                     guard.next_result_id = guard.next_result_id.saturating_add(1);
                 }
                 guard.results.extend(results);
-                guard.results.sort_by(|left, right| {
-                    right
-                        .seeds
-                        .cmp(&left.seeds)
-                        .then_with(|| left.name.cmp(&right.name))
-                });
+                sort_results(&mut guard.results);
             }
             // Always finalize the current generation, including when a worker could not be spawned.
             let state = SEARCH_STATE.get_or_init(|| Mutex::new(SearchState::default()));
@@ -828,30 +832,35 @@ fn update_catalog(force_refresh: bool) -> Result<(), String> {
 }
 
 fn ensure_runtime(root: &Path) -> Result<(), String> {
+    const FILES: [(&str, &str); 7] = [
+        ("__init__.py", ""),
+        ("engines/__init__.py", ""),
+        (
+            "helpers.py",
+            include_str!("../assets/search_runtime/helpers.py"),
+        ),
+        (
+            "nova2.py",
+            include_str!("../assets/search_runtime/nova2.py"),
+        ),
+        (
+            "nova2dl.py",
+            include_str!("../assets/search_runtime/nova2dl.py"),
+        ),
+        (
+            "novaprinter.py",
+            include_str!("../assets/search_runtime/novaprinter.py"),
+        ),
+        (
+            "socks.py",
+            include_str!("../assets/search_runtime/socks.py"),
+        ),
+    ];
     ensure_real_directory(root)?;
     ensure_real_directory(&root.join("engines"))?;
-    write_if_changed(&root.join("__init__.py"), "")?;
-    write_if_changed(&root.join("engines").join("__init__.py"), "")?;
-    write_if_changed(
-        &root.join("helpers.py"),
-        include_str!("../assets/search_runtime/helpers.py"),
-    )?;
-    write_if_changed(
-        &root.join("nova2.py"),
-        include_str!("../assets/search_runtime/nova2.py"),
-    )?;
-    write_if_changed(
-        &root.join("nova2dl.py"),
-        include_str!("../assets/search_runtime/nova2dl.py"),
-    )?;
-    write_if_changed(
-        &root.join("novaprinter.py"),
-        include_str!("../assets/search_runtime/novaprinter.py"),
-    )?;
-    write_if_changed(
-        &root.join("socks.py"),
-        include_str!("../assets/search_runtime/socks.py"),
-    )?;
+    for (name, content) in FILES {
+        write_if_changed(&root.join(name), content)?;
+    }
     Ok(())
 }
 
@@ -1104,11 +1113,7 @@ fn runtime() -> Result<&'static SearchRuntime, String> {
 fn load_plugins(runtime: &SearchRuntime) -> Result<(Vec<SearchPlugin>, String), String> {
     let mut plugins = installed_plugins(&runtime.root)?;
     if runtime.python.is_none() {
-        return Ok((
-            plugins,
-            "Python 3.9 or newer was not found. Install a supported python3 to use qBittorrent-style search plugins."
-                .to_string(),
-        ));
+        return Ok((plugins, PYTHON_MISSING.to_string()));
     }
 
     let output = run_python_script(
@@ -1116,6 +1121,7 @@ fn load_plugins(runtime: &SearchRuntime) -> Result<(Vec<SearchPlugin>, String), 
         "nova2.py",
         &["--capabilities".to_string()],
         CAPABILITIES_TIMEOUT,
+        None,
     )?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.stdout_truncated {
@@ -1206,7 +1212,7 @@ fn installed_plugins(root: &Path) -> Result<Vec<SearchPlugin>, String> {
             broken_reason: String::new(),
         });
     }
-    plugins.sort_by(|left, right| left.module.cmp(&right.module));
+    plugins.sort_unstable_by(|left, right| left.module.cmp(&right.module));
     Ok(plugins)
 }
 
@@ -1361,15 +1367,10 @@ fn run_search_process(
             .map(|token| token.to_string())
             .filter(|token| !token.is_empty()),
     );
-    let output = run_python_script(runtime, "nova2.py", &args, SEARCH_TIMEOUT)?;
+    let output = run_python_script(runtime, "nova2.py", &args, SEARCH_TIMEOUT, None)?;
     let plugins_by_url = current_plugins();
     let mut results = parse_search_results(&output.stdout, &plugins_by_url);
-    results.sort_by(|left, right| {
-        right
-            .seeds
-            .cmp(&left.seeds)
-            .then_with(|| left.name.cmp(&right.name))
-    });
+    sort_results(&mut results);
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stderr = if output.stderr_truncated {
@@ -1447,6 +1448,18 @@ fn parse_search_results(stdout: &[u8], plugins: &[SearchPlugin]) -> Vec<SearchRe
     results
 }
 
+/// Most seeds first, then by name. The result id makes the order total, so
+/// an unstable sort is deterministic across incremental merges.
+fn sort_results(results: &mut [SearchResult]) {
+    results.sort_unstable_by(|left, right| {
+        right
+            .seeds
+            .cmp(&left.seeds)
+            .then_with(|| left.name.cmp(&right.name))
+            .then(left.result_id.cmp(&right.result_id))
+    });
+}
+
 fn is_http_url(value: &str) -> bool {
     let value = value.trim();
     value.starts_with("http://") || value.starts_with("https://")
@@ -1457,19 +1470,17 @@ fn is_supported_result_link(value: &str) -> bool {
 }
 
 fn plugin_name_by_site_url(site_url: &str, plugins: &[SearchPlugin]) -> Option<String> {
-    let normalized = site_url.trim().trim_end_matches('/').to_ascii_lowercase();
-    plugins.iter().find_map(|plugin| {
-        let plugin_url = plugin
-            .site_url
-            .trim()
-            .trim_end_matches('/')
-            .to_ascii_lowercase();
-        if !plugin_url.is_empty() && plugin_url == normalized {
-            Some(plugin.module.clone())
-        } else {
-            None
-        }
-    })
+    fn normalize(url: &str) -> &str {
+        url.trim().trim_end_matches('/')
+    }
+    let wanted = normalize(site_url);
+    plugins
+        .iter()
+        .find(|plugin| {
+            let url = normalize(&plugin.site_url);
+            !url.is_empty() && url.eq_ignore_ascii_case(wanted)
+        })
+        .map(|plugin| plugin.module.clone())
 }
 
 fn parse_i64(value: &str) -> i64 {
@@ -1482,10 +1493,18 @@ fn download_through_plugin(
     url: &str,
 ) -> Result<Vec<u8>, String> {
     let tmp_dir = create_plugin_temp_dir()?;
-    let args = vec![plugin.to_string(), url.to_string()];
-    let output =
-        run_python_script_in_dir(runtime, "nova2dl.py", &args, DOWNLOAD_TIMEOUT, &tmp_dir)?;
+    let args = [plugin.to_string(), url.to_string()];
     let result = (|| -> Result<Vec<u8>, String> {
+        // The private directory is both the working directory and the
+        // interpreter's temporary directory, so `helpers.download_file`
+        // (tempfile.mkstemp) writes where the containment check expects.
+        let output = run_python_script(
+            runtime,
+            "nova2dl.py",
+            &args,
+            DOWNLOAD_TIMEOUT,
+            Some(&tmp_dir),
+        )?;
         if output.stdout_truncated || output.stderr_truncated {
             return Err("search plugin download output was too large".to_string());
         }
@@ -1496,10 +1515,8 @@ fn download_through_plugin(
             }
             return Err(stderr);
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let path_str = stdout
-            .split_whitespace()
-            .next()
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let path_str = plugin_output_path(&stdout, url)
             .ok_or_else(|| "search plugin did not return a torrent file path".to_string())?;
         let path = Path::new(path_str);
         let path = if path.is_absolute() {
@@ -1531,6 +1548,18 @@ fn download_through_plugin(
     result
 }
 
+/// Plugins print `<path> <url>`. Strip the known URL so a temporary path
+/// containing spaces (for example a Windows profile directory) survives;
+/// otherwise fall back to the first whitespace-separated token.
+fn plugin_output_path<'a>(stdout: &'a str, url: &str) -> Option<&'a str> {
+    let stdout = stdout.trim();
+    stdout
+        .strip_suffix(url)
+        .map(str::trim_end)
+        .filter(|path| !path.is_empty() && !path.contains('\n'))
+        .or_else(|| stdout.split_whitespace().next())
+}
+
 fn create_plugin_temp_dir() -> Result<PathBuf, String> {
     for attempt in 0..32u64 {
         let random = crate::system_entropy_u64();
@@ -1560,21 +1589,15 @@ fn create_private_temp_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir(path)
 }
 
+/// Run a runtime script. With `temp_dir`, that private directory becomes the
+/// working directory and the interpreter's temporary directory; otherwise
+/// the script runs in the runtime root.
 fn run_python_script(
     runtime: &SearchRuntime,
     script_name: &str,
     args: &[String],
     timeout: Duration,
-) -> Result<ProcessOutput, String> {
-    run_python_script_in_dir(runtime, script_name, args, timeout, &runtime.root.clone())
-}
-
-fn run_python_script_in_dir(
-    runtime: &SearchRuntime,
-    script_name: &str,
-    args: &[String],
-    timeout: Duration,
-    working_dir: &Path,
+    temp_dir: Option<&Path>,
 ) -> Result<ProcessOutput, String> {
     let python = runtime
         .python
@@ -1588,7 +1611,7 @@ fn run_python_script_in_dir(
         .arg("utf8")
         .arg(script_path)
         .args(args)
-        .current_dir(working_dir)
+        .current_dir(temp_dir.unwrap_or(&runtime.root))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1608,9 +1631,20 @@ fn run_python_script_in_dir(
         "RUSTORRENT_SEARCH_INSECURE_SSL",
         "qbt_socks_proxy",
         "sock_proxy",
+        // Windows: Winsock and the CRT need these; without SYSTEMROOT the
+        // interpreter cannot open sockets.
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
     ] {
         if let Ok(value) = std::env::var(name) {
             command.env(name, value);
+        }
+    }
+    if let Some(temp_dir) = temp_dir {
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            command.env(name, temp_dir);
         }
     }
     command.env("PYTHONIOENCODING", "utf-8");
@@ -1629,53 +1663,44 @@ fn run_command_with_timeout(
         .child
         .stdout
         .take()
-        .map(|handle| ReaderTask::spawn(handle, MAX_PROCESS_STDOUT_BYTES));
+        .map(|handle| ReaderTask::spawn(Box::new(handle), MAX_PROCESS_STDOUT_BYTES));
     let stderr_reader = process
         .child
         .stderr
         .take()
-        .map(|handle| ReaderTask::spawn(handle, MAX_PROCESS_STDERR_BYTES));
+        .map(|handle| ReaderTask::spawn(Box::new(handle), MAX_PROCESS_STDERR_BYTES));
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(1);
-    loop {
+    let outcome = loop {
         match process.try_wait() {
-            Ok(Some(status)) => {
-                let cleanup = process.terminate_and_reap();
-                let ((stdout, stdout_truncated), (stderr, stderr_truncated)) =
-                    collect_reader_tasks(stdout_reader, stderr_reader);
-                cleanup.map_err(|err| format!("cleanup {label}: {err}"))?;
-                return Ok(ProcessOutput {
-                    success: status.success(),
-                    stdout,
-                    stderr,
-                    stdout_truncated,
-                    stderr_truncated,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let cleanup = process.terminate_and_reap().err();
-                let _ = collect_reader_tasks(stdout_reader, stderr_reader);
-                let suffix = cleanup
-                    .map(|cleanup| format!("; cleanup failed: {cleanup}"))
-                    .unwrap_or_default();
-                return Err(format!("wait {label}: {err}{suffix}"));
-            }
-        }
-        if Instant::now() >= deadline {
-            let cleanup = process.terminate_and_reap().err();
-            let _ = collect_reader_tasks(stdout_reader, stderr_reader);
-            let suffix = cleanup
-                .map(|cleanup| format!("; cleanup failed: {cleanup}"))
-                .unwrap_or_default();
-            return Err(format!("{label} timed out{suffix}"));
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => {}
+            Ok(None) => break Err(format!("{label} timed out")),
+            Err(err) => break Err(format!("wait {label}: {err}")),
         }
         thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(50));
+    };
+    // Always kill the process group (descendants may hold the pipes) and
+    // collect the bounded readers, whatever the outcome.
+    let cleanup = process.terminate_and_reap();
+    let ((stdout, stdout_truncated), (stderr, stderr_truncated)) =
+        collect_reader_tasks(stdout_reader, stderr_reader);
+    match (outcome, cleanup) {
+        (Ok(status), Ok(())) => Ok(ProcessOutput {
+            success: status.success(),
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        }),
+        (Ok(_), Err(err)) => Err(format!("cleanup {label}: {err}")),
+        (Err(message), Ok(())) => Err(message),
+        (Err(message), Err(err)) => Err(format!("{message}; cleanup failed: {err}")),
     }
 }
 
-fn read_limited(mut reader: impl Read, limit: usize) -> (Vec<u8>, bool) {
+fn read_limited(reader: &mut dyn Read, limit: usize) -> (Vec<u8>, bool) {
     let mut output = Vec::with_capacity(limit.min(64 * 1024));
     let mut truncated = false;
     let mut chunk = [0u8; 8192];
@@ -1837,53 +1862,42 @@ fn clean_wiki_text(text: &str) -> String {
         .replace("'''", "")
         .replace("''", "")
         .replace("&nbsp;", " ");
-    out = strip_double_brackets(&out);
-    out = strip_external_links_to_labels(&out);
+    out = strip_links(&out, true);
+    out = strip_links(&out, false);
     out = out.replace("&#124;", "|");
     collapse_whitespace(&out)
 }
 
-fn strip_double_brackets(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Replace wiki links by their labels: `[[target|label]]` when `double`,
+/// otherwise `[url label]`. Links without a label are dropped. Text is
+/// copied as string slices, so multi-byte characters stay intact.
+fn strip_links(text: &str, double: bool) -> String {
+    let close = if double { "]]" } else { "]" };
     let bytes = text.as_bytes();
-    let mut idx = 0usize;
+    let mut out = String::with_capacity(text.len());
+    let (mut idx, mut copied) = (0usize, 0usize);
     while idx < bytes.len() {
-        if bytes[idx] == b'[' && bytes.get(idx + 1) == Some(&b'[') {
-            let start = idx + 2;
-            if let Some(end_rel) = text[start..].find("]]") {
+        if bytes[idx] == b'[' && (bytes.get(idx + 1) == Some(&b'[')) == double {
+            let start = idx + 1 + usize::from(double);
+            if let Some(end_rel) = text[start..].find(close) {
+                out.push_str(&text[copied..idx]);
                 let inner = &text[start..start + end_rel];
-                if let Some((_, label)) = inner.rsplit_once('|') {
+                let label = if double {
+                    inner.rsplit_once('|')
+                } else {
+                    inner.trim().split_once(' ')
+                };
+                if let Some((_, label)) = label {
                     out.push_str(label.trim());
                 }
-                idx = start + end_rel + 2;
+                idx = start + end_rel + close.len();
+                copied = idx;
                 continue;
             }
         }
-        out.push(bytes[idx] as char);
         idx += 1;
     }
-    out
-}
-
-fn strip_external_links_to_labels(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut idx = 0usize;
-    while idx < bytes.len() {
-        if bytes[idx] == b'[' && bytes.get(idx + 1) != Some(&b'[') {
-            let start = idx + 1;
-            if let Some(end_rel) = text[start..].find(']') {
-                let inner = text[start..start + end_rel].trim();
-                if let Some((_, label)) = inner.split_once(' ') {
-                    out.push_str(label.trim());
-                }
-                idx = start + end_rel + 1;
-                continue;
-            }
-        }
-        out.push(bytes[idx] as char);
-        idx += 1;
-    }
+    out.push_str(&text[copied..]);
     out
 }
 
@@ -1932,8 +1946,9 @@ fn lock_state(lock: &Mutex<SearchState>) -> std::sync::MutexGuard<'_, SearchStat
     }
 }
 
-fn escape_json(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Append `text` as a quoted JSON string.
+pub(crate) fn push_json_string(out: &mut String, text: &str) {
+    out.push('"');
     for ch in text.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
@@ -1941,11 +1956,14 @@ fn escape_json(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
-    out
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -2063,8 +2081,9 @@ mod tests {
                 private_site: true,
             },
         ];
-        let mut json = String::new();
+        let mut json = Json(String::from("["));
         append_catalog_entries_json(&mut json, &entries, &[]);
+        let json = json.0;
         assert!(json.contains("\"module\":\"publicmod\""));
         assert!(!json.contains("\"module\":\"privatemod\""));
     }
@@ -2203,7 +2222,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let (reader, writer) = UnixStream::pair().unwrap();
-        let task = ReaderTask::spawn(reader, 1024);
+        let task = ReaderTask::spawn(Box::new(reader), 1024);
         let started = Instant::now();
         let (bytes, truncated) = task.collect(Instant::now() + Duration::from_millis(50));
         assert!(bytes.is_empty());
@@ -2256,6 +2275,148 @@ mod tests {
                 .unwrap();
         assert_eq!(bytes, b"replacement");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn json_writer_separates_members_and_escapes_strings() {
+        let mut out = Json(String::new());
+        out.open("", '{');
+        out.raw("busy", &true);
+        out.str("q", "a\"b\\c\n\u{1}é");
+        out.open("list", '[');
+        out.str("", "x");
+        out.open("", '{');
+        out.raw("n", &-1i64);
+        out.0.push('}');
+        out.0.push_str("],\"empty\":[]}");
+        assert_eq!(
+            out.0,
+            r#"{"busy":true,"q":"a\"b\\c\n\u0001é","list":["x",{"n":-1}],"empty":[]}"#
+        );
+    }
+
+    #[test]
+    fn wiki_cleanup_keeps_multibyte_text_intact() {
+        assert_eq!(
+            clean_wiki_text("✔ qbt [[File:x.png|Ünïcode]] café [https://x.example/ label ü] ok"),
+            "✔ qbt Ünïcode café label ü ok"
+        );
+        assert_eq!(strip_links("a [[b]] c", true), "a  c");
+        assert_eq!(
+            strip_links("日本 [unterminated", false),
+            "日本 [unterminated"
+        );
+    }
+
+    #[test]
+    fn plugin_output_path_accepts_paths_with_spaces() {
+        let url = "https://example.com/a.torrent";
+        assert_eq!(
+            plugin_output_path(
+                "C:\\Users\\Jo Smith\\tmp\\x.torrent https://example.com/a.torrent\n",
+                url
+            ),
+            Some("C:\\Users\\Jo Smith\\tmp\\x.torrent")
+        );
+        assert_eq!(
+            plugin_output_path("/tmp/x.torrent https://other.example/b\n", url),
+            Some("/tmp/x.torrent")
+        );
+        assert_eq!(plugin_output_path("  \n", url), None);
+    }
+
+    #[test]
+    fn results_sort_is_total_and_deterministic() {
+        let result = |id, seeds, name: &str| SearchResult {
+            result_id: id,
+            seeds,
+            name: name.to_string(),
+            ..SearchResult::default()
+        };
+        let mut results = vec![
+            result(3, 5, "b"),
+            result(2, 5, "a"),
+            result(1, 5, "a"),
+            result(0, 9, "z"),
+        ];
+        sort_results(&mut results);
+        let ids = results.iter().map(|r| r.result_id).collect::<Vec<_>>();
+        assert_eq!(ids, [0, 1, 2, 3]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_runtime_searches_mixed_case_engines_with_option_like_keywords() {
+        let Some(python) = detect_python() else {
+            return;
+        };
+        let base = create_plugin_temp_dir().unwrap();
+        let root = base.join("nova3");
+        ensure_runtime(&root).unwrap();
+        fs::write(
+            root.join("engines/MyEngine.py"),
+            "from novaprinter import prettyPrinter\n\
+             class MyEngine:\n\
+             \x20   name = 'Mine'\n\
+             \x20   url = 'https://mine.example'\n\
+             \x20   supported_categories = {'all': '0', 'tv': '5'}\n\
+             \x20   def search(self, what, cat='all'):\n\
+             \x20       prettyPrinter({'link': 'magnet:?xt=urn:btih:' + what, 'name': 'N|x',\n\
+             \x20           'size': '1 KB', 'seeds': 3, 'leech': 1, 'engine_url': self.url})\n",
+        )
+        .unwrap();
+        let runtime = SearchRuntime {
+            root: root.clone(),
+            python: Some(python),
+        };
+        let output = run_python_script(
+            &runtime,
+            "nova2.py",
+            &["--capabilities".to_string()],
+            CAPABILITIES_TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("<MyEngine>"));
+
+        let (results, _) = run_search_process(
+            &runtime,
+            "hello --capabilities",
+            "tv",
+            &["MyEngine".to_string()],
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "N x");
+        assert_eq!(results[0].size_bytes, 1024);
+        assert!(results[0].link.ends_with("hello%20--capabilities"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_downloads_use_the_private_directory_for_temporary_files() {
+        let Some(python) = detect_python() else {
+            return;
+        };
+        let root = create_plugin_temp_dir().unwrap();
+        fs::write(
+            root.join("nova2dl.py"),
+            "import os, sys, tempfile\n\
+             fd, path = tempfile.mkstemp()\n\
+             os.write(fd, b'd4:infoe')\n\
+             os.close(fd)\n\
+             print(path, sys.argv[2])\n",
+        )
+        .unwrap();
+        let runtime = SearchRuntime {
+            root: root.clone(),
+            python: Some(python),
+        };
+        let bytes =
+            download_through_plugin(&runtime, "engine", "https://example.com/x.torrent").unwrap();
+        assert_eq!(bytes, b"d4:infoe");
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -6,13 +6,15 @@ use std::path::{Component, Path, PathBuf};
 use crate::storage;
 use crate::torrent::TorrentMeta;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub enum ClaimKind {
     File,
     Tree,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub struct StorageClaim {
     path: PathBuf,
     comparison_path: PathBuf,
@@ -56,25 +58,23 @@ pub fn claims_for_torrent(
     pending_completion_dir: Option<&Path>,
 ) -> Result<Vec<StorageClaim>, String> {
     let mut claims = Vec::new();
+    let prospective = pending_file_rename.map(|(index, target)| {
+        let mut prospective = file_renames.to_vec();
+        if let Some((_, current)) = prospective
+            .iter_mut()
+            .find(|(current_index, _)| *current_index == index)
+        {
+            *current = target.to_string();
+        } else {
+            prospective.push((index, target.to_string()));
+            prospective.sort_unstable_by_key(|(current_index, _)| *current_index);
+        }
+        prospective
+    });
 
     if meta.info.length.is_some() {
-        let mut rename_variants = vec![file_renames.to_vec()];
-        if let Some((index, target)) = pending_file_rename {
-            let mut prospective = file_renames.to_vec();
-            if let Some((_, current)) = prospective
-                .iter_mut()
-                .find(|(current_index, _)| *current_index == index)
-            {
-                *current = target.to_string();
-            } else {
-                prospective.push((index, target.to_string()));
-                prospective.sort_unstable_by_key(|(current_index, _)| *current_index);
-            }
-            rename_variants.push(prospective);
-        }
-
-        for renames in rename_variants {
-            let source = storage::data_paths_with_file_renames(meta, download_dir, &renames)
+        for renames in std::iter::once(file_renames).chain(prospective.as_deref()) {
+            let source = storage::data_paths_with_file_renames(meta, download_dir, renames)
                 .map_err(|err| format!("storage ownership path: {err}"))?
                 .into_iter()
                 .next()
@@ -111,18 +111,8 @@ pub fn claims_for_torrent(
         // bypass ownership checks and fail only after another claim is saved.
         storage::data_paths_with_file_renames(meta, download_dir, file_renames)
             .map_err(|err| format!("storage ownership paths: {err}"))?;
-        if let Some((index, target)) = pending_file_rename {
-            let mut prospective = file_renames.to_vec();
-            if let Some((_, current)) = prospective
-                .iter_mut()
-                .find(|(current_index, _)| *current_index == index)
-            {
-                *current = target.to_string();
-            } else {
-                prospective.push((index, target.to_string()));
-                prospective.sort_unstable_by_key(|(current_index, _)| *current_index);
-            }
-            storage::data_paths_with_file_renames(meta, download_dir, &prospective)
+        if let Some(prospective) = &prospective {
+            storage::data_paths_with_file_renames(meta, download_dir, prospective)
                 .map_err(|err| format!("pending rename ownership paths: {err}"))?;
         }
     }

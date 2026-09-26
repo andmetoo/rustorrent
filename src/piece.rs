@@ -13,7 +13,7 @@ pub const PRIORITY_LOW: u8 = 1;
 pub const PRIORITY_NORMAL: u8 = 2;
 pub const PRIORITY_HIGH: u8 = 3;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PieceHash {
     Sha1([u8; 20]),
     Sha256 {
@@ -56,42 +56,58 @@ impl PieceHash {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlockState {
     Missing,
     Requested,
     Complete,
 }
 
-#[derive(Debug, Clone)]
-pub struct Piece {
-    pub index: u32,
-    pub hash: PieceHash,
-    pub offset: u64,
-    pub length: u32,
+struct Piece {
+    hash: PieceHash,
+    offset: u64,
+    length: u32,
     blocks: Vec<BlockState>,
+    /// Number of `Missing` / `Complete` entries in `blocks`.
+    missing: u32,
+    done: u32,
     priority: u8,
     wanted: bool,
     verified: bool,
 }
 
-#[derive(Debug)]
+/// Aggregates over wanted pieces, maintained incrementally so progress
+/// queries are O(1) instead of a scan over every piece.
+#[derive(Default)]
+struct Totals {
+    wanted: usize,
+    wanted_bytes: u64,
+    verified: usize,
+    verified_bytes: u64,
+    remaining_blocks: usize,
+}
+
 pub struct PieceManager {
     pieces: Vec<Piece>,
     availability: Vec<u32>,
     reserved_by: Vec<Option<u64>>,
     reservation_time: Vec<Option<Instant>>,
     sequential: bool,
+    /// Bit set of pieces that are wanted, unverified and still have a
+    /// `Missing` block; bit 63 of word 0 is piece 0 (peer bitfield order), so
+    /// selection is a word-wise AND with the peer's bitfield.
+    candidates: Vec<u64>,
+    totals: Totals,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct BlockRequest {
     pub index: u32,
     pub begin: u32,
     pub length: u32,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct PieceBuffer {
     index: u32,
     length: u32,
@@ -101,25 +117,25 @@ pub struct PieceBuffer {
     _budget_reservation: Option<PieceBufferReservation>,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct PieceBufferBudget {
     limit: usize,
     used: AtomicUsize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PieceBufferBudgets {
     global: Arc<PieceBufferBudget>,
     torrent: Arc<PieceBufferBudget>,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 struct BudgetCounterPermit {
     budget: Arc<PieceBufferBudget>,
     bytes: usize,
 }
 
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct PieceBufferReservation {
     _torrent: BudgetCounterPermit,
     _global: BudgetCounterPermit,
@@ -138,14 +154,14 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::InvalidPieceLength => write!(f, "invalid piece length"),
-            Error::InvalidPieces => write!(f, "invalid pieces"),
-            Error::InvalidBitfield => write!(f, "invalid bitfield"),
-            Error::InvalidPiece => write!(f, "invalid piece index"),
-            Error::InvalidBlock => write!(f, "invalid block"),
-            Error::InvalidPriority => write!(f, "invalid priority"),
-        }
+        f.write_str(match self {
+            Error::InvalidPieceLength => "invalid piece length",
+            Error::InvalidPieces => "invalid pieces",
+            Error::InvalidBitfield => "invalid bitfield",
+            Error::InvalidPiece => "invalid piece index",
+            Error::InvalidBlock => "invalid block",
+            Error::InvalidPriority => "invalid priority",
+        })
     }
 }
 
@@ -227,13 +243,17 @@ impl PieceManager {
             return Err(Error::InvalidPieces);
         }
 
-        Ok(Self {
+        let mut manager = Self {
             pieces,
             availability: vec![0; piece_count],
             reserved_by: vec![None; piece_count],
             reservation_time: vec![None; piece_count],
             sequential: false,
-        })
+            candidates: Vec::new(),
+            totals: Totals::default(),
+        };
+        manager.recount();
+        Ok(manager)
     }
 
     fn build_v1_pieces(
@@ -265,10 +285,8 @@ impl PieceManager {
             return Err(Error::InvalidPieces);
         }
 
-        if let Some(v2_pieces) = v2_pieces {
-            if v2_pieces.len() != piece_count {
-                return Err(Error::InvalidPieces);
-            }
+        if v2_pieces.is_some_and(|v2_pieces| v2_pieces.len() != piece_count) {
+            return Err(Error::InvalidPieces);
         }
 
         let mut pieces = Vec::with_capacity(piece_count);
@@ -281,38 +299,26 @@ impl PieceManager {
             let offset = (index as u64)
                 .checked_mul(piece_length as u64)
                 .ok_or(Error::InvalidPieces)?;
-            let hash = if let Some(v2_pieces) = v2_pieces {
-                if v2_pieces[index].offset != offset {
-                    return Err(Error::InvalidPieces);
-                }
-                let (root, merkle_length, v2_data_length) = match &v2_pieces[index].hash {
-                    PieceHash::Sha256 {
-                        root,
-                        merkle_length,
-                        data_length,
-                    } => (*root, *merkle_length, *data_length),
-                    _ => return Err(Error::InvalidPieces),
-                };
-                PieceHash::Hybrid {
+            let hash = match v2_pieces.map(|v2_pieces| &v2_pieces[index]) {
+                Some(Piece {
+                    offset: v2_offset,
+                    hash:
+                        PieceHash::Sha256 {
+                            root,
+                            merkle_length,
+                            data_length,
+                        },
+                    ..
+                }) if *v2_offset == offset => PieceHash::Hybrid {
                     sha1: sha1_hash,
-                    sha256: root,
-                    merkle_length,
-                    v2_data_length,
-                }
-            } else {
-                PieceHash::Sha1(sha1_hash)
+                    sha256: *root,
+                    merkle_length: *merkle_length,
+                    v2_data_length: *data_length,
+                },
+                Some(_) => return Err(Error::InvalidPieces),
+                None => PieceHash::Sha1(sha1_hash),
             };
-            let blocks = block_count(length);
-            pieces.push(Piece {
-                index: index as u32,
-                hash,
-                offset,
-                length,
-                blocks: vec![BlockState::Missing; blocks],
-                priority: PRIORITY_NORMAL,
-                wanted: true,
-                verified: false,
-            });
+            pieces.push(Piece::new(hash, offset, length));
         }
 
         Ok(pieces)
@@ -330,25 +336,26 @@ impl PieceManager {
                 continue;
             }
             let root = entry.pieces_root.ok_or(Error::InvalidPieces)?;
-            let roots: Vec<[u8; 32]> = if entry.length <= piece_length_u64 {
-                vec![root]
+            let single = entry.length <= piece_length_u64;
+            let file_piece_count = entry.length.div_ceil(piece_length_u64);
+            let roots: &[[u8; 32]] = if single {
+                std::slice::from_ref(&root)
             } else {
                 let (_, hashes) = meta
                     .piece_layers
                     .iter()
                     .find(|(key, _)| key.as_slice() == root.as_slice())
                     .ok_or(Error::InvalidPieces)?;
-                if u64::try_from(hashes.len()).ok() != Some(entry.length.div_ceil(piece_length_u64))
-                {
+                if u64::try_from(hashes.len()).ok() != Some(file_piece_count) {
                     return Err(Error::InvalidPieces);
                 }
-                hashes.clone()
+                hashes
             };
+            if pieces.len().saturating_add(roots.len()) > u32::MAX as usize {
+                return Err(Error::InvalidPieces);
+            }
 
-            for (file_piece_index, root) in roots.into_iter().enumerate() {
-                if pieces.len() > u32::MAX as usize {
-                    return Err(Error::InvalidPieces);
-                }
+            for (file_piece_index, root) in roots.iter().enumerate() {
                 let within_file = (file_piece_index as u64)
                     .checked_mul(piece_length_u64)
                     .ok_or(Error::InvalidPieces)?;
@@ -357,7 +364,7 @@ impl PieceManager {
                     .checked_sub(within_file)
                     .ok_or(Error::InvalidPieces)?;
                 let length = remaining.min(piece_length_u64) as u32;
-                let merkle_length = if entry.length <= piece_length_u64 {
+                let merkle_length = if single {
                     v2_tree_length(length).ok_or(Error::InvalidPieces)?
                 } else {
                     piece_length
@@ -365,31 +372,69 @@ impl PieceManager {
                 let offset = file_offset
                     .checked_add(within_file)
                     .ok_or(Error::InvalidPieces)?;
-                pieces.push(Piece {
-                    index: pieces.len() as u32,
-                    hash: PieceHash::Sha256 {
-                        root,
+                pieces.push(Piece::new(
+                    PieceHash::Sha256 {
+                        root: *root,
                         merkle_length,
                         data_length: length,
                     },
                     offset,
                     length,
-                    blocks: vec![BlockState::Missing; block_count(length)],
-                    priority: PRIORITY_NORMAL,
-                    wanted: true,
-                    verified: false,
-                });
+                ));
             }
-            let file_piece_count = entry.length.div_ceil(piece_length_u64);
-            file_offset = file_offset
-                .checked_add(
-                    file_piece_count
-                        .checked_mul(piece_length_u64)
-                        .ok_or(Error::InvalidPieces)?,
-                )
+            file_offset = file_piece_count
+                .checked_mul(piece_length_u64)
+                .and_then(|span| file_offset.checked_add(span))
                 .ok_or(Error::InvalidPieces)?;
         }
         Ok(pieces)
+    }
+
+    /// Recompute every aggregate from scratch after a bulk change.
+    fn recount(&mut self) {
+        self.totals = Totals::default();
+        self.candidates.clear();
+        self.candidates.resize(self.pieces.len().div_ceil(64), 0);
+        for idx in 0..self.pieces.len() {
+            self.account(idx, true);
+        }
+    }
+
+    /// Add (`add`) or remove a piece's contribution to the aggregate counters
+    /// and keep its bit in the candidate set current. Every mutation of a
+    /// piece is bracketed by `account(idx, false)` / `account(idx, true)`.
+    fn account(&mut self, idx: usize, add: bool) {
+        let piece = &self.pieces[idx];
+        let (word, bit) = (idx / 64, 1u64 << (63 - idx % 64));
+        if add && piece.is_candidate() {
+            self.candidates[word] |= bit;
+        } else {
+            self.candidates[word] &= !bit;
+        }
+        if !piece.wanted {
+            return;
+        }
+        let verified = usize::from(piece.verified);
+        let verified_bytes = if piece.verified {
+            piece.length as u64
+        } else {
+            0
+        };
+        let remaining = piece.blocks.len() - piece.done as usize;
+        let totals = &mut self.totals;
+        if add {
+            totals.wanted += 1;
+            totals.wanted_bytes += piece.length as u64;
+            totals.verified += verified;
+            totals.verified_bytes += verified_bytes;
+            totals.remaining_blocks += remaining;
+        } else {
+            totals.wanted -= 1;
+            totals.wanted_bytes -= piece.length as u64;
+            totals.verified -= verified;
+            totals.verified_bytes -= verified_bytes;
+            totals.remaining_blocks -= remaining;
+        }
     }
 
     pub fn piece_count(&self) -> usize {
@@ -397,57 +442,29 @@ impl PieceManager {
     }
 
     pub fn completed_pieces(&self) -> usize {
-        self.pieces
-            .iter()
-            .filter(|piece| piece.wanted && piece.verified)
-            .count()
+        self.totals.verified
     }
 
     pub fn completed_bytes(&self) -> u64 {
-        self.pieces
-            .iter()
-            .filter(|piece| piece.wanted && piece.verified)
-            .map(|piece| piece.length as u64)
-            .sum()
+        self.totals.verified_bytes
     }
 
     pub fn remaining_blocks(&self) -> usize {
-        self.pieces
-            .iter()
-            .filter(|piece| piece.wanted)
-            .map(|piece| piece.remaining_blocks())
-            .sum()
+        self.totals.remaining_blocks
     }
 
     pub fn is_complete(&self) -> bool {
-        self.pieces
-            .iter()
-            .all(|piece| !piece.wanted || piece.verified)
+        self.totals.verified == self.totals.wanted
     }
 
     pub fn reset_verified(&mut self) {
         for piece in &mut self.pieces {
             piece.verified = false;
-            piece.blocks.fill(BlockState::Missing);
+            piece.fill(BlockState::Missing);
         }
         self.reserved_by.fill(None);
         self.reservation_time.fill(None);
-    }
-
-    #[allow(dead_code)]
-    pub fn next_missing_piece(&self) -> Option<u32> {
-        let mut best = None;
-        let mut best_priority = 0u8;
-        for (idx, piece) in self.pieces.iter().enumerate() {
-            if !piece.wanted || piece.verified || !piece.has_missing() {
-                continue;
-            }
-            if piece.priority > best_priority {
-                best_priority = piece.priority;
-                best = Some(idx as u32);
-            }
-        }
-        best
+        self.recount();
     }
 
     pub fn piece_length(&self, index: u32) -> Option<u32> {
@@ -465,33 +482,26 @@ impl PieceManager {
     pub fn is_piece_complete(&self, index: u32) -> bool {
         self.pieces
             .get(index as usize)
-            .map(|piece| piece.verified)
-            .unwrap_or(false)
+            .is_some_and(|piece| piece.verified)
     }
 
-    #[allow(dead_code)]
     pub fn is_piece_wanted(&self, index: u32) -> bool {
         self.pieces
             .get(index as usize)
-            .map(|piece| piece.wanted)
-            .unwrap_or(false)
+            .is_some_and(|piece| piece.wanted)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn piece_priority(&self, index: u32) -> Option<u8> {
         self.pieces.get(index as usize).map(|piece| piece.priority)
     }
 
     pub fn wanted_bytes(&self) -> u64 {
-        self.pieces
-            .iter()
-            .filter(|piece| piece.wanted)
-            .map(|piece| piece.length as u64)
-            .sum()
+        self.totals.wanted_bytes
     }
 
     pub fn wanted_pieces(&self) -> usize {
-        self.pieces.iter().filter(|piece| piece.wanted).count()
+        self.totals.wanted
     }
 
     pub fn set_sequential(&mut self, sequential: bool) {
@@ -505,18 +515,15 @@ impl PieceManager {
         if priorities.iter().any(|priority| *priority > PRIORITY_HIGH) {
             return Err(Error::InvalidPriority);
         }
-        for (idx, (piece, priority)) in self.pieces.iter_mut().zip(priorities.iter()).enumerate() {
+        for (idx, (piece, priority)) in self.pieces.iter_mut().zip(priorities).enumerate() {
             piece.priority = *priority;
             piece.wanted = *priority != PRIORITY_SKIP;
             if !piece.wanted {
-                if let Some(reserved) = self.reserved_by.get_mut(idx) {
-                    *reserved = None;
-                }
-                if let Some(reserved_at) = self.reservation_time.get_mut(idx) {
-                    *reserved_at = None;
-                }
+                self.reserved_by[idx] = None;
+                self.reservation_time[idx] = None;
             }
         }
+        self.recount();
         Ok(())
     }
 
@@ -525,32 +532,115 @@ impl PieceManager {
     }
 
     pub fn apply_peer_bitfield(&mut self, bitfield: &[u8]) -> Result<(), Error> {
+        self.validate_full_bitfield(bitfield)?;
+        self.adjust_availability(bitfield, true);
+        Ok(())
+    }
+
+    pub fn remove_peer_bitfield(&mut self, bitfield: &[u8]) -> Result<(), Error> {
         if bitfield.len() != self.bitfield_len() {
             return Err(Error::InvalidBitfield);
         }
-        let total_bits = bitfield.len() * 8;
-        let extra_bits = total_bits - self.pieces.len();
-        if extra_bits > 0 {
-            let mask = (1u8 << extra_bits) - 1;
-            if bitfield[bitfield.len() - 1] & mask != 0 {
-                return Err(Error::InvalidBitfield);
-            }
+        self.adjust_availability(bitfield, false);
+        Ok(())
+    }
+
+    fn validate_full_bitfield(&self, bitfield: &[u8]) -> Result<(), Error> {
+        if bitfield.len() != self.bitfield_len() {
+            return Err(Error::InvalidBitfield);
         }
-        for idx in 0..self.pieces.len() {
-            if bitfield_has(bitfield, idx) {
-                self.availability[idx] = self.availability[idx].saturating_add(1);
-            }
+        let extra_bits = bitfield.len() * 8 - self.pieces.len();
+        let mask = ((1u16 << extra_bits) - 1) as u8;
+        if bitfield.last().is_some_and(|last| last & mask != 0) {
+            return Err(Error::InvalidBitfield);
         }
         Ok(())
     }
 
-    pub fn apply_have(&mut self, index: u32) -> Result<(), Error> {
-        let idx = index as usize;
-        if idx >= self.pieces.len() {
-            return Err(Error::InvalidPiece);
+    fn adjust_availability(&mut self, bitfield: &[u8], add: bool) {
+        for (byte_index, byte) in bitfield.iter().enumerate() {
+            let mut bits = *byte;
+            while bits != 0 {
+                let offset = bits.leading_zeros() as usize;
+                bits &= !(0x80 >> offset);
+                let idx = byte_index * 8 + offset;
+                if let Some(value) = self.availability.get_mut(idx) {
+                    *value = if add {
+                        value.saturating_add(1)
+                    } else {
+                        value.saturating_sub(1)
+                    };
+                }
+            }
         }
-        self.availability[idx] = self.availability[idx].saturating_add(1);
+    }
+
+    pub fn apply_have(&mut self, index: u32) -> Result<(), Error> {
+        let value = self
+            .availability
+            .get_mut(index as usize)
+            .ok_or(Error::InvalidPiece)?;
+        *value = value.saturating_add(1);
         Ok(())
+    }
+
+    /// Word `word` of `candidates & peer bitfield`, MSB = lowest piece index.
+    fn peer_candidates(&self, bitfield: &[u8], word: usize) -> u64 {
+        let start = word * 8;
+        let bytes = &bitfield[start..bitfield.len().min(start + 8)];
+        let mut peer = [0u8; 8];
+        peer[..bytes.len()].copy_from_slice(bytes);
+        self.candidates[word] & u64::from_be_bytes(peer)
+    }
+
+    /// Pick the best candidate the peer has, preferring higher priority and
+    /// then rarer pieces (lowest index on ties). `stale_before` switches to
+    /// stealing: only pieces reserved by another peer before that instant.
+    fn pick(
+        &self,
+        peer_id: u64,
+        bitfield: &[u8],
+        allow_reserved: bool,
+        stale_before: Option<Instant>,
+    ) -> Option<usize> {
+        if bitfield.len() != self.bitfield_len() {
+            return None;
+        }
+        let mut best: Option<(usize, u8, u32)> = None;
+        for word in 0..self.candidates.len() {
+            let mut bits = self.peer_candidates(bitfield, word);
+            while bits != 0 {
+                let offset = bits.leading_zeros() as usize;
+                bits &= !(1u64 << (63 - offset));
+                let idx = word * 64 + offset;
+                match stale_before {
+                    Some(cutoff) => {
+                        if self.reserved_by[idx].is_none_or(|owner| owner == peer_id)
+                            || self.reservation_time[idx].is_none_or(|at| at > cutoff)
+                        {
+                            continue;
+                        }
+                    }
+                    None if !allow_reserved && self.reserved_by[idx].is_some() => continue,
+                    None if self.sequential => return Some(idx),
+                    None => {}
+                }
+                let priority = self.pieces[idx].priority;
+                let rarity = self.availability[idx];
+                if best.is_none_or(|(_, best_priority, best_rarity)| {
+                    priority > best_priority || (priority == best_priority && rarity < best_rarity)
+                }) {
+                    best = Some((idx, priority, rarity));
+                }
+            }
+        }
+        best.map(|(idx, _, _)| idx)
+    }
+
+    fn reserve(&mut self, idx: usize, peer_id: u64, now: Instant) -> u32 {
+        self.reserved_by[idx] = Some(peer_id);
+        self.reservation_time[idx] = Some(now);
+        idx as u32
     }
 
     pub fn reserve_piece_for_peer(
@@ -559,88 +649,22 @@ impl PieceManager {
         bitfield: &[u8],
         allow_reserved: bool,
     ) -> Option<u32> {
-        if bitfield.len() != self.bitfield_len() {
-            return None;
+        let idx = self.pick(peer_id, bitfield, allow_reserved, None)?;
+        if allow_reserved {
+            return Some(idx as u32);
         }
-
-        if self.sequential {
-            // Sequential: pick lowest-index incomplete piece the peer has
-            for (idx, piece) in self.pieces.iter().enumerate() {
-                if piece.verified || !piece.has_missing() {
-                    continue;
-                }
-                if !piece.wanted {
-                    continue;
-                }
-                if !bitfield_has(bitfield, idx) {
-                    continue;
-                }
-                if !allow_reserved && self.reserved_by[idx].is_some() {
-                    continue;
-                }
-                if !allow_reserved {
-                    self.reserved_by[idx] = Some(peer_id);
-                    self.reservation_time[idx] = Some(Instant::now());
-                }
-                return Some(idx as u32);
-            }
-            return None;
-        }
-
-        let mut best_piece = None;
-        let mut best_priority = 0u8;
-        let mut best_rarity = u32::MAX;
-        for (idx, piece) in self.pieces.iter().enumerate() {
-            if piece.verified || !piece.has_missing() {
-                continue;
-            }
-            if !piece.wanted {
-                continue;
-            }
-            if !bitfield_has(bitfield, idx) {
-                continue;
-            }
-            if !allow_reserved && self.reserved_by[idx].is_some() {
-                continue;
-            }
-            let rarity = self.availability[idx];
-            let priority = piece.priority;
-            if best_piece.is_none()
-                || priority > best_priority
-                || (priority == best_priority && rarity < best_rarity)
-            {
-                best_priority = priority;
-                best_rarity = rarity;
-                best_piece = Some(idx);
-            }
-        }
-
-        let idx = best_piece?;
-        if !allow_reserved {
-            self.reserved_by[idx] = Some(peer_id);
-            self.reservation_time[idx] = Some(Instant::now());
-        }
-        Some(idx as u32)
+        Some(self.reserve(idx, peer_id, Instant::now()))
     }
 
     pub fn has_needed_piece(&self, bitfield: &[u8]) -> bool {
-        if bitfield.len() != self.bitfield_len() {
-            return false;
-        }
-
-        self.pieces.iter().enumerate().any(|(idx, piece)| {
-            piece.wanted && !piece.verified && piece.has_missing() && bitfield_has(bitfield, idx)
-        })
+        bitfield.len() == self.bitfield_len()
+            && (0..self.candidates.len()).any(|word| self.peer_candidates(bitfield, word) != 0)
     }
 
     pub fn release_piece(&mut self, peer_id: u64, index: u32) {
         let idx = index as usize;
-        if idx >= self.reserved_by.len() {
-            return;
-        }
-        if self.reserved_by[idx] == Some(peer_id) {
-            self.reserved_by[idx] = None;
-            self.reservation_time[idx] = None;
+        if self.reserved_by.get(idx) == Some(&Some(peer_id)) {
+            self.clear_reservation(index);
         }
     }
 
@@ -661,52 +685,11 @@ impl PieceManager {
         bitfield: &[u8],
         stale_threshold: Duration,
     ) -> Option<u32> {
-        if bitfield.len() != self.bitfield_len() {
-            return None;
-        }
-
         let now = Instant::now();
-        let mut best_piece = None;
-        let mut best_priority = 0u8;
-        let mut best_rarity = u32::MAX;
-
-        for (idx, piece) in self.pieces.iter().enumerate() {
-            if piece.verified || !piece.has_missing() || !piece.wanted {
-                continue;
-            }
-            if !bitfield_has(bitfield, idx) {
-                continue;
-            }
-            // Only consider pieces reserved by a *different* peer
-            match self.reserved_by[idx] {
-                Some(owner) if owner != peer_id => {}
-                _ => continue,
-            }
-            // Check if the reservation is stale
-            let reserved_at = match self.reservation_time[idx] {
-                Some(t) => t,
-                None => continue,
-            };
-            if now.duration_since(reserved_at) < stale_threshold {
-                continue;
-            }
-
-            let rarity = self.availability[idx];
-            let priority = piece.priority;
-            if best_piece.is_none()
-                || priority > best_priority
-                || (priority == best_priority && rarity < best_rarity)
-            {
-                best_priority = priority;
-                best_rarity = rarity;
-                best_piece = Some(idx);
-            }
-        }
-
-        let idx = best_piece?;
-        self.reserved_by[idx] = Some(peer_id);
-        self.reservation_time[idx] = Some(now);
-        Some(idx as u32)
+        // A threshold beyond the monotonic clock's range cannot be stale yet.
+        let cutoff = now.checked_sub(stale_threshold)?;
+        let idx = self.pick(peer_id, bitfield, true, Some(cutoff))?;
+        Some(self.reserve(idx, peer_id, now))
     }
 
     pub fn next_request_for_piece(
@@ -714,33 +697,48 @@ impl PieceManager {
         index: u32,
         allow_duplicate: bool,
     ) -> Option<BlockRequest> {
-        let piece = self.pieces.get_mut(index as usize)?;
+        let idx = index as usize;
+        let piece = self.pieces.get(idx)?;
         if !piece.wanted {
             return None;
         }
         let block_index = piece.next_requestable_block(allow_duplicate)?;
-        let begin = block_index as u32 * BLOCK_LEN;
-        let length = piece.block_length(block_index);
-        if piece.blocks[block_index] == BlockState::Missing {
-            piece.blocks[block_index] = BlockState::Requested;
-        }
+        self.set_block(idx, block_index, BlockState::Requested);
+        let piece = &self.pieces[idx];
         Some(BlockRequest {
-            index: piece.index,
-            begin,
-            length,
+            index,
+            begin: block_index as u32 * BLOCK_LEN,
+            length: piece.block_length(block_index),
         })
     }
 
-    pub fn remove_peer_bitfield(&mut self, bitfield: &[u8]) -> Result<(), Error> {
-        if bitfield.len() != self.bitfield_len() {
-            return Err(Error::InvalidBitfield);
+    /// Apply a block state transition while keeping the aggregates current.
+    /// `Requested` only replaces `Missing`; `Missing` never replaces
+    /// `Complete`.
+    fn set_block(&mut self, idx: usize, block_index: usize, state: BlockState) {
+        let current = self.pieces[idx].blocks[block_index];
+        let allowed = match state {
+            BlockState::Requested => current == BlockState::Missing,
+            BlockState::Missing => current == BlockState::Requested,
+            BlockState::Complete => current != BlockState::Complete,
+        };
+        if !allowed {
+            return;
         }
-        for idx in 0..self.pieces.len() {
-            if bitfield_has(bitfield, idx) {
-                self.availability[idx] = self.availability[idx].saturating_sub(1);
-            }
+        self.account(idx, false);
+        let piece = &mut self.pieces[idx];
+        match current {
+            BlockState::Missing => piece.missing -= 1,
+            BlockState::Complete => piece.done -= 1,
+            BlockState::Requested => {}
         }
-        Ok(())
+        match state {
+            BlockState::Missing => piece.missing += 1,
+            BlockState::Complete => piece.done += 1,
+            BlockState::Requested => {}
+        }
+        piece.blocks[block_index] = state;
+        self.account(idx, true);
     }
 
     #[cfg(test)]
@@ -752,7 +750,7 @@ impl PieceManager {
         let mut best_piece = None;
         let mut best_rarity = u32::MAX;
         for (idx, piece) in self.pieces.iter().enumerate() {
-            if piece.verified || !piece.has_missing() {
+            if piece.verified || piece.missing == 0 {
                 continue;
             }
             if !bitfield_has(bitfield, idx) {
@@ -766,16 +764,23 @@ impl PieceManager {
         }
 
         let idx = best_piece?;
-        let piece = &mut self.pieces[idx];
-        let block_index = piece.next_missing_block()?;
-        let begin = block_index as u32 * BLOCK_LEN;
-        let length = piece.block_length(block_index);
-        piece.blocks[block_index] = BlockState::Requested;
+        let block_index = self.pieces[idx].next_requestable_block(false)?;
+        self.set_block(idx, block_index, BlockState::Requested);
         Some(BlockRequest {
-            index: piece.index,
-            begin,
-            length,
+            index: idx as u32,
+            begin: block_index as u32 * BLOCK_LEN,
+            length: self.pieces[idx].block_length(block_index),
         })
+    }
+
+    fn block_index(&self, index: u32, begin: u32) -> Result<(usize, usize), Error> {
+        let idx = index as usize;
+        let piece = self.pieces.get(idx).ok_or(Error::InvalidPiece)?;
+        let block_index = (begin / BLOCK_LEN) as usize;
+        if !begin.is_multiple_of(BLOCK_LEN) || block_index >= piece.blocks.len() {
+            return Err(Error::InvalidBlock);
+        }
+        Ok((idx, block_index))
     }
 
     pub fn mark_block_complete(
@@ -784,64 +789,48 @@ impl PieceManager {
         begin: u32,
         length: u32,
     ) -> Result<bool, Error> {
-        let piece = self
-            .pieces
-            .get_mut(index as usize)
-            .ok_or(Error::InvalidPiece)?;
-        if !begin.is_multiple_of(BLOCK_LEN) {
-            return Err(Error::InvalidBlock);
-        }
-        let block_index = (begin / BLOCK_LEN) as usize;
-        if block_index >= piece.blocks.len() {
-            return Err(Error::InvalidBlock);
-        }
+        let (idx, block_index) = self.block_index(index, begin)?;
+        let piece = &self.pieces[idx];
         if piece.block_length(block_index) != length {
             return Err(Error::InvalidBlock);
         }
         if piece.blocks[block_index] == BlockState::Complete {
             return Ok(false);
         }
-        piece.blocks[block_index] = BlockState::Complete;
+        self.set_block(idx, block_index, BlockState::Complete);
         Ok(true)
     }
 
     pub fn mark_piece_complete(&mut self, index: u32) -> Result<bool, Error> {
-        let idx = index as usize;
-        let piece = self.pieces.get_mut(idx).ok_or(Error::InvalidPiece)?;
-        let was_new = !piece.verified;
-        piece.verified = true;
-        piece.blocks.fill(BlockState::Complete);
-        self.reserved_by[idx] = None;
-        self.reservation_time[idx] = None;
-        Ok(was_new)
+        self.set_piece_state(index, true)
     }
 
     pub fn mark_block_missing(&mut self, index: u32, begin: u32) -> Result<(), Error> {
-        let piece = self
-            .pieces
-            .get_mut(index as usize)
-            .ok_or(Error::InvalidPiece)?;
-        if !begin.is_multiple_of(BLOCK_LEN) {
-            return Err(Error::InvalidBlock);
-        }
-        let block_index = (begin / BLOCK_LEN) as usize;
-        if block_index >= piece.blocks.len() {
-            return Err(Error::InvalidBlock);
-        }
-        if piece.blocks[block_index] != BlockState::Complete {
-            piece.blocks[block_index] = BlockState::Missing;
-        }
+        let (idx, block_index) = self.block_index(index, begin)?;
+        self.set_block(idx, block_index, BlockState::Missing);
         Ok(())
     }
 
     pub fn reset_piece(&mut self, index: u32) -> Result<(), Error> {
+        self.set_piece_state(index, false).map(|_| ())
+    }
+
+    /// Mark a piece verified (all blocks complete) or reset it to missing.
+    /// Either way its reservation ends. Returns whether `verified` changed.
+    fn set_piece_state(&mut self, index: u32, verified: bool) -> Result<bool, Error> {
         let idx = index as usize;
-        let piece = self.pieces.get_mut(idx).ok_or(Error::InvalidPiece)?;
-        piece.verified = false;
-        piece.blocks.fill(BlockState::Missing);
-        self.reserved_by[idx] = None;
-        self.reservation_time[idx] = None;
-        Ok(())
+        let changed = self.pieces.get(idx).ok_or(Error::InvalidPiece)?.verified != verified;
+        self.account(idx, false);
+        let piece = &mut self.pieces[idx];
+        piece.verified = verified;
+        piece.fill(if verified {
+            BlockState::Complete
+        } else {
+            BlockState::Missing
+        });
+        self.account(idx, true);
+        self.clear_reservation(index);
+        Ok(changed)
     }
 }
 
@@ -954,6 +943,7 @@ fn v2_tree_length(data_length: u32) -> Option<u32> {
     blocks.checked_next_power_of_two()?.checked_mul(BLOCK_LEN)
 }
 
+#[cfg(test)]
 fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
     let byte = bitfield[index / 8];
     let offset = index % 8;
@@ -962,37 +952,47 @@ fn bitfield_has(bitfield: &[u8], index: usize) -> bool {
 }
 
 impl Piece {
-    fn has_missing(&self) -> bool {
-        self.blocks.contains(&BlockState::Missing)
+    fn new(hash: PieceHash, offset: u64, length: u32) -> Self {
+        let blocks = block_count(length);
+        Self {
+            hash,
+            offset,
+            length,
+            blocks: vec![BlockState::Missing; blocks],
+            missing: blocks as u32,
+            done: 0,
+            priority: PRIORITY_NORMAL,
+            wanted: true,
+            verified: false,
+        }
     }
 
-    fn remaining_blocks(&self) -> usize {
-        self.blocks
-            .iter()
-            .filter(|state| **state != BlockState::Complete)
-            .count()
+    fn is_candidate(&self) -> bool {
+        self.wanted && !self.verified && self.missing > 0
     }
 
-    #[allow(dead_code)]
-    fn next_missing_block(&self) -> Option<usize> {
-        self.blocks
-            .iter()
-            .position(|state| *state == BlockState::Missing)
+    fn fill(&mut self, state: BlockState) {
+        self.blocks.fill(state);
+        let count = self.blocks.len() as u32;
+        self.missing = if state == BlockState::Missing {
+            count
+        } else {
+            0
+        };
+        self.done = if state == BlockState::Complete {
+            count
+        } else {
+            0
+        };
     }
 
     fn next_requestable_block(&self, allow_duplicate: bool) -> Option<usize> {
-        if let Some(idx) = self
-            .blocks
-            .iter()
-            .position(|state| *state == BlockState::Missing)
-        {
-            return Some(idx);
+        let find = |wanted| self.blocks.iter().position(|state| *state == wanted);
+        if self.missing > 0 {
+            return find(BlockState::Missing);
         }
         if allow_duplicate {
-            return self
-                .blocks
-                .iter()
-                .position(|state| *state == BlockState::Requested);
+            return find(BlockState::Requested);
         }
         None
     }
@@ -1369,5 +1369,227 @@ mod tests {
         let mut nonzero_padding = first_piece;
         *nonzero_padding.last_mut().unwrap() = 1;
         assert!(!manager.piece_hash(0).unwrap().verify(&nonzero_padding));
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// The straightforward O(pieces) picker the incremental candidate set
+    /// replaced; used as an oracle.
+    fn reference_pick(
+        manager: &PieceManager,
+        peer_id: u64,
+        bitfield: &[u8],
+        allow_reserved: bool,
+    ) -> Option<usize> {
+        let mut best: Option<(usize, u8, u32)> = None;
+        for (idx, piece) in manager.pieces.iter().enumerate() {
+            let has_missing = piece.blocks.contains(&BlockState::Missing);
+            if piece.verified || !has_missing || !piece.wanted || !bitfield_has(bitfield, idx) {
+                continue;
+            }
+            if !allow_reserved && manager.reserved_by[idx].is_some() {
+                continue;
+            }
+            let _ = peer_id;
+            if manager.sequential {
+                return Some(idx);
+            }
+            let (priority, rarity) = (piece.priority, manager.availability[idx]);
+            if best.is_none_or(|(_, bp, br)| priority > bp || (priority == bp && rarity < br)) {
+                best = Some((idx, priority, rarity));
+            }
+        }
+        best.map(|(idx, _, _)| idx)
+    }
+
+    fn check_totals(manager: &PieceManager) {
+        let wanted = manager.pieces.iter().filter(|piece| piece.wanted);
+        assert_eq!(manager.wanted_pieces(), wanted.clone().count());
+        assert_eq!(
+            manager.wanted_bytes(),
+            wanted.clone().map(|piece| piece.length as u64).sum::<u64>()
+        );
+        let verified = wanted.clone().filter(|piece| piece.verified);
+        assert_eq!(manager.completed_pieces(), verified.clone().count());
+        assert_eq!(
+            manager.completed_bytes(),
+            verified.map(|piece| piece.length as u64).sum::<u64>()
+        );
+        assert_eq!(
+            manager.remaining_blocks(),
+            wanted
+                .map(|piece| {
+                    piece
+                        .blocks
+                        .iter()
+                        .filter(|state| **state != BlockState::Complete)
+                        .count()
+                })
+                .sum::<usize>()
+        );
+        for (idx, piece) in manager.pieces.iter().enumerate() {
+            assert_eq!(
+                piece.missing as usize,
+                piece
+                    .blocks
+                    .iter()
+                    .filter(|state| **state == BlockState::Missing)
+                    .count()
+            );
+            let bit = manager.candidates[idx / 64] >> (63 - idx % 64) & 1 == 1;
+            assert_eq!(bit, piece.is_candidate(), "candidate bit for {idx}");
+        }
+    }
+
+    #[test]
+    fn incremental_picker_matches_reference_under_random_operations() {
+        // 150 pieces of 3 blocks each, last piece shorter: exercises partial
+        // trailing bitfield bytes and a partial final candidate word.
+        let meta = dummy_meta(150, 48 * 1024, 149 * 48 * 1024 + 20_000);
+        let mut manager = PieceManager::new(&meta).unwrap();
+        let mut rng = Lcg(7);
+        let len = manager.bitfield_len();
+        let random_bitfield = |rng: &mut Lcg| {
+            let mut bitfield = (0..len).map(|_| rng.next() as u8).collect::<Vec<_>>();
+            *bitfield.last_mut().unwrap() &= 0xFC; // 150 pieces: 2 spare bits
+            bitfield
+        };
+        for step in 0..4_000 {
+            let piece = rng.below(150) as u32;
+            match rng.below(12) {
+                0 => {
+                    let bitfield = random_bitfield(&mut rng);
+                    manager.apply_peer_bitfield(&bitfield).unwrap();
+                }
+                1 => manager.apply_have(piece).unwrap(),
+                2 => {
+                    let _ = manager.next_request_for_piece(piece, rng.below(2) == 0);
+                }
+                3 => {
+                    let begin = rng.below(3) as u32 * BLOCK_LEN;
+                    let length =
+                        manager.pieces[piece as usize].block_length(begin as usize / 16_384);
+                    let _ = manager.mark_block_complete(piece, begin, length);
+                }
+                4 => {
+                    let _ = manager.mark_block_missing(piece, rng.below(3) as u32 * BLOCK_LEN);
+                }
+                5 => {
+                    manager.mark_piece_complete(piece).unwrap();
+                }
+                6 => manager.reset_piece(piece).unwrap(),
+                7 if step % 50 == 0 => {
+                    let priorities = (0..150).map(|_| rng.below(4) as u8).collect::<Vec<_>>();
+                    manager.set_piece_priorities(&priorities).unwrap();
+                }
+                8 => manager.set_sequential(rng.below(4) == 0),
+                9 => manager.release_piece(rng.below(3), piece),
+                10 if step % 400 == 0 => manager.reset_verified(),
+                _ => {
+                    let bitfield = random_bitfield(&mut rng);
+                    let allow_reserved = rng.below(3) == 0;
+                    let peer = rng.below(3);
+                    let expected = reference_pick(&manager, peer, &bitfield, allow_reserved);
+                    assert_eq!(
+                        manager.has_needed_piece(&bitfield),
+                        reference_pick(&manager, peer, &bitfield, true).is_some()
+                    );
+                    let chosen = manager.reserve_piece_for_peer(peer, &bitfield, allow_reserved);
+                    assert_eq!(chosen.map(|idx| idx as usize), expected, "step {step}");
+                }
+            }
+            check_totals(&manager);
+        }
+    }
+
+    #[test]
+    fn steal_only_takes_stale_reservations_from_other_peers() {
+        let meta = dummy_meta(3, 16 * 1024, 48 * 1024);
+        let mut manager = PieceManager::new(&meta).unwrap();
+        let all = [0b1110_0000];
+        assert_eq!(manager.reserve_piece_for_peer(1, &all, false), Some(0));
+        assert_eq!(manager.reserve_piece_for_peer(2, &all, false), Some(1));
+        assert_eq!(
+            manager.steal_stale_piece(1, &all, Duration::from_secs(3600)),
+            None
+        );
+        assert_eq!(manager.steal_stale_piece(1, &all, Duration::ZERO), Some(1));
+        assert_eq!(manager.reserved_by[1], Some(1));
+        assert_eq!(
+            manager.steal_stale_piece(1, &all, Duration::from_secs(u64::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn bitfield_word_extraction_handles_short_tails() {
+        let meta = dummy_meta(70, 16 * 1024, 70 * 16 * 1024);
+        let mut manager = PieceManager::new(&meta).unwrap();
+        for index in 0..69 {
+            manager.mark_piece_complete(index).unwrap();
+        }
+        let mut bitfield = vec![0u8; manager.bitfield_len()];
+        assert!(!manager.has_needed_piece(&bitfield));
+        bitfield[8] = 0b0000_0100; // piece 69
+        assert!(manager.has_needed_piece(&bitfield));
+        assert_eq!(
+            manager.reserve_piece_for_peer(1, &bitfield, false),
+            Some(69)
+        );
+        assert!(!manager.has_needed_piece(&bitfield[..8]));
+    }
+
+    /// `cargo test --release piece_picker_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn piece_picker_benchmark() {
+        let pieces = 50_000usize;
+        let meta = dummy_meta(pieces, 1 << 20, pieces as u64 * (1 << 20));
+        let mut manager = PieceManager::new(&meta).unwrap();
+        let full = vec![0xFFu8; manager.bitfield_len()];
+        let mut sparse = vec![0u8; manager.bitfield_len()];
+        for (index, byte) in sparse.iter_mut().enumerate() {
+            if index % 97 == 0 {
+                *byte = 0x10;
+            }
+        }
+        for _ in 0..20 {
+            manager.apply_peer_bitfield(&full).unwrap();
+        }
+        // 90% of the torrent is already verified.
+        for index in 0..(pieces as u32 * 9 / 10) {
+            manager.mark_piece_complete(index).unwrap();
+        }
+        let started = Instant::now();
+        let mut picked = 0usize;
+        for round in 0..2_000u64 {
+            let bitfield = if round % 2 == 0 { &full } else { &sparse };
+            if let Some(index) = manager.reserve_piece_for_peer(round, bitfield, false) {
+                picked += 1;
+                manager.release_piece(round, index);
+            }
+            let _ = manager.has_needed_piece(bitfield);
+            let _ = manager.completed_pieces();
+            let _ = manager.is_complete();
+            let _ = manager.remaining_blocks();
+        }
+        println!(
+            "2000 picks over {pieces} pieces: {:?} ({picked} picked)",
+            started.elapsed()
+        );
     }
 }

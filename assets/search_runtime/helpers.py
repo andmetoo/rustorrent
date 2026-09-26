@@ -1,4 +1,4 @@
-# VERSION: 1.55
+# VERSION: 1.56
 
 # Author:
 #  Christophe DUMEZ (chris@qbittorrent.org)
@@ -27,6 +27,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import codecs
 import datetime
 import gzip
 import html
@@ -208,6 +209,22 @@ def enable_socks_proxy(enable: bool) -> None:
         socket.socket = _original_socket  # type: ignore[misc]
 
 
+def _response_charset(content_type: str) -> str:
+    """ Charset from a Content-Type header; UTF-8 when absent or unknown.
+
+    Servers send values such as `charset="UTF-8"; foo=bar` or unknown names;
+    passing those to bytes.decode() would raise and abort the whole plugin.
+    """
+    parts = content_type.split('charset=', 1)
+    if len(parts) == 2:
+        candidate = parts[1].split(';', 1)[0].strip().strip('"\'')
+        try:
+            return codecs.lookup(candidate).name
+        except LookupError:
+            pass
+    return 'utf-8'
+
+
 # This is only provided for backward compatibility, new code should not use it
 htmlentitydecode = html.unescape
 
@@ -219,11 +236,7 @@ def retrieve_url(url: str, custom_headers: Optional[Mapping[str, str]] = None, r
     try:
         with _urlopen_with_context_fallback(request, ssl_context) as response:
             data = _read_limited(response, MAX_PAGE_BYTES)
-            charset = 'utf-8'
-            try:
-                charset = response.getheader('Content-Type', '').split('charset=', 1)[1]
-            except IndexError:
-                pass
+            charset = _response_charset(response.getheader('Content-Type', '') or '')
     except (urllib.error.URLError, OSError, ValueError) as errno:
         reason = getattr(errno, "reason", errno)
         if isinstance(reason, ssl.SSLError):
