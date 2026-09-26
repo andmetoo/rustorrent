@@ -1099,6 +1099,14 @@ fn torrent_stop_requested(stop_flag: &AtomicBool) -> bool {
     shutdown_requested() || stop_flag.load(Ordering::SeqCst)
 }
 
+/// `Instant::now() - duration`, clamped to now. The monotonic clock starts
+/// near zero at boot on Linux and macOS, so plain subtraction panics for a
+/// process started (for example by a service manager) shortly after boot.
+fn instant_ago(duration: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(duration).unwrap_or(now)
+}
+
 fn sleep_with_shutdown(duration: Duration) {
     if duration.is_zero() {
         return;
@@ -1272,6 +1280,15 @@ mod teardown_liveness_tests {
 
         release_tx.send(()).unwrap();
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn instant_ago_never_underflows_the_monotonic_clock() {
+        // Far larger than any uptime: plain subtraction would panic.
+        let ago = instant_ago(Duration::from_secs(u64::MAX / 4));
+        assert!(ago <= Instant::now());
+        let recent = instant_ago(Duration::from_millis(1));
+        assert!(recent <= Instant::now());
     }
 
     #[test]
@@ -2239,61 +2256,81 @@ impl Drop for PidFileGuard {
 impl UploadManager {
     fn new(max_unchoked: usize) -> Self {
         let now = Instant::now();
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos() as u64)
-            .unwrap_or(0);
         Self {
             inner: Mutex::new(UploadState {
                 peers: HashMap::new(),
                 unchoked: HashSet::new(),
                 last_schedule: now,
-                last_optimistic: now - OPTIMISTIC_UNCHOKE_INTERVAL,
+                last_optimistic: instant_ago(OPTIMISTIC_UNCHOKE_INTERVAL),
                 optimistic_peer: None,
-                rng: seed ^ 0x9e37_79b9_7f4a_7c15,
+                rng: system_entropy_u64() | 1,
             }),
             max_unchoked: max_unchoked.max(1),
         }
     }
 
     fn register(&self, peer_id: u64) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.peers.insert(
-                peer_id,
-                PeerUploadInfo {
-                    interested: false,
-                    uploaded_total: 0,
-                    last_uploaded_total: 0,
-                    rate: 0,
-                    downloaded_total: 0,
-                    last_downloaded_total: 0,
-                    download_rate: 0,
-                },
-            );
-        }
+        lock_or_recover(&self.inner).peers.insert(
+            peer_id,
+            PeerUploadInfo {
+                interested: false,
+                uploaded_total: 0,
+                last_uploaded_total: 0,
+                rate: 0,
+                downloaded_total: 0,
+                last_downloaded_total: 0,
+                download_rate: 0,
+            },
+        );
     }
 
     fn unregister(&self, peer_id: u64) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.peers.remove(&peer_id);
+        let mut state = lock_or_recover(&self.inner);
+        state.peers.remove(&peer_id);
+        state.unchoked.remove(&peer_id);
+        if state.optimistic_peer == Some(peer_id) {
+            state.optimistic_peer = None;
+        }
+    }
+
+    /// Interest changes adjust slots immediately, but leave the transfer-rate
+    /// measurements alone: re-ranking here would compare rates measured over
+    /// a few milliseconds and effectively unchoke peers at random.
+    fn set_interested(&self, peer_id: u64, interested: bool) {
+        let mut state = lock_or_recover(&self.inner);
+        let Some(info) = state.peers.get_mut(&peer_id) else {
+            return;
+        };
+        if info.interested == interested {
+            return;
+        }
+        info.interested = interested;
+        if !interested {
             state.unchoked.remove(&peer_id);
             if state.optimistic_peer == Some(peer_id) {
                 state.optimistic_peer = None;
             }
         }
-    }
-
-    fn set_interested(&self, peer_id: u64, interested: bool) {
-        if let Ok(mut state) = self.inner.lock() {
-            if let Some(info) = state.peers.get_mut(&peer_id) {
-                let was_interested = info.interested;
-                info.interested = interested;
-                // Immediately reschedule when interest changes so slots
-                // are allocated/freed without waiting for the 10-second timer
-                if interested != was_interested {
-                    let now = Instant::now();
-                    reschedule_uploads(&mut state, self.max_unchoked, now);
+        // Fill free regular slots with the best-ranked interested peers.
+        loop {
+            let optimistic = state
+                .optimistic_peer
+                .filter(|peer| state.unchoked.contains(peer));
+            let regular = state.unchoked.len() - usize::from(optimistic.is_some());
+            if regular >= self.max_unchoked {
+                break;
+            }
+            let candidate = state
+                .peers
+                .iter()
+                .filter(|(peer, info)| info.interested && !state.unchoked.contains(*peer))
+                .max_by_key(|(peer, info)| (info.download_rate.max(info.rate), **peer))
+                .map(|(peer, _)| *peer);
+            match candidate {
+                Some(peer) => {
+                    state.unchoked.insert(peer);
                 }
+                None => break,
             }
         }
     }
@@ -2302,10 +2339,8 @@ impl UploadManager {
         if bytes == 0 {
             return;
         }
-        if let Ok(mut state) = self.inner.lock() {
-            if let Some(info) = state.peers.get_mut(&peer_id) {
-                info.uploaded_total = info.uploaded_total.saturating_add(bytes);
-            }
+        if let Some(info) = lock_or_recover(&self.inner).peers.get_mut(&peer_id) {
+            info.uploaded_total = info.uploaded_total.saturating_add(bytes);
         }
     }
 
@@ -2313,18 +2348,13 @@ impl UploadManager {
         if bytes == 0 {
             return;
         }
-        if let Ok(mut state) = self.inner.lock() {
-            if let Some(info) = state.peers.get_mut(&peer_id) {
-                info.downloaded_total = info.downloaded_total.saturating_add(bytes);
-            }
+        if let Some(info) = lock_or_recover(&self.inner).peers.get_mut(&peer_id) {
+            info.downloaded_total = info.downloaded_total.saturating_add(bytes);
         }
     }
 
     fn should_unchoke(&self, peer_id: u64) -> bool {
-        let mut state = match self.inner.lock() {
-            Ok(state) => state,
-            Err(_) => return false,
-        };
+        let mut state = lock_or_recover(&self.inner);
         let now = Instant::now();
         if now.duration_since(state.last_schedule) >= UNCHOKE_INTERVAL {
             reschedule_uploads(&mut state, self.max_unchoked, now);
@@ -2335,7 +2365,6 @@ impl UploadManager {
 
 fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant) {
     state.last_schedule = now;
-    let prev_unchoked = state.unchoked.clone();
     let mut any_downloading = false;
     for info in state.peers.values_mut() {
         info.rate = info.uploaded_total.saturating_sub(info.last_uploaded_total);
@@ -2348,8 +2377,8 @@ fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant
             any_downloading = true;
         }
     }
-    // BEP 3: when leeching, sort by download_rate (what peer gives us).
-    // When seeding (no downloads), sort by upload_rate (reward fastest served).
+    // BEP 3: when leeching, rank by what the peer gives us (download rate);
+    // when seeding, rank by upload rate so the fastest downloaders are served.
     let mut candidates: Vec<(u64, u64)> = Vec::new();
     for (peer_id, info) in state.peers.iter() {
         if info.interested {
@@ -2358,9 +2387,9 @@ fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant
             } else {
                 info.rate
             };
-            // Hysteresis: give previously-unchoked peers a 10% bonus to
-            // prevent rapid choke/unchoke oscillation between similar peers.
-            let effective_rate = if prev_unchoked.contains(peer_id) {
+            // Hysteresis: previously unchoked peers get a 10% bonus to avoid
+            // oscillating between peers with similar rates.
+            let effective_rate = if state.unchoked.contains(peer_id) {
                 base_rate.saturating_add(base_rate / 10)
             } else {
                 base_rate
@@ -2368,22 +2397,21 @@ fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant
             candidates.push((*peer_id, effective_rate));
         }
     }
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+    candidates.sort_unstable_by_key(|&(peer_id, rate)| (std::cmp::Reverse(rate), peer_id));
     state.unchoked.clear();
-    for (peer_id, _) in candidates.iter().take(max_unchoked) {
-        state.unchoked.insert(*peer_id);
-    }
+    state.unchoked.extend(
+        candidates
+            .iter()
+            .take(max_unchoked)
+            .map(|(peer_id, _)| *peer_id),
+    );
 
-    let remaining = if candidates.len() > max_unchoked {
-        &candidates[max_unchoked..]
-    } else {
-        &[]
-    };
+    let remaining = candidates.get(max_unchoked..).unwrap_or(&[]);
     if now.duration_since(state.last_optimistic) >= OPTIMISTIC_UNCHOKE_INTERVAL {
         state.optimistic_peer = if remaining.is_empty() {
             None
         } else {
-            let idx = (next_rng(state) as usize) % remaining.len();
+            let idx = (next_rng(state) % remaining.len() as u64) as usize;
             Some(remaining[idx].0)
         };
         state.last_optimistic = now;
@@ -2393,8 +2421,7 @@ fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant
         if state
             .peers
             .get(&peer_id)
-            .map(|info| info.interested)
-            .unwrap_or(false)
+            .is_some_and(|info| info.interested)
         {
             state.unchoked.insert(peer_id);
         } else {
@@ -4686,7 +4713,8 @@ fn run_torrent_once(
         // transition, including the run immediately before a completion move.
         let mut completed_sent = initial_complete;
         let mut interval = 1800u64; // Default to 30 minutes
-        let mut last_announce = Instant::now() - Duration::from_secs(interval + 1); // Force first announce
+                                    // The `started` event forces the first announce.
+        let mut last_announce = instant_ago(Duration::from_secs(interval + 1));
         let mut rate_last_at = Instant::now();
         let mut last_downloaded = downloaded.load(Ordering::SeqCst);
         let mut last_progress_at = Instant::now();
@@ -6447,7 +6475,7 @@ fn fetch_metadata_from_peer(
     let mut last_progress_log = 0usize;
     let mut requested_any = false;
     let mut last_progress = Instant::now();
-    let mut last_request = Instant::now() - METADATA_REQUEST_RETRY;
+    let mut last_request = instant_ago(METADATA_REQUEST_RETRY);
     let mut last_receive = Instant::now();
 
     while start.elapsed() < METADATA_FETCH_TIMEOUT && Instant::now() < deadline {
@@ -6466,7 +6494,7 @@ fn fetch_metadata_from_peer(
                                     ut_metadata_id = Some(id);
                                     if fallback_used {
                                         requested.clear();
-                                        last_request = Instant::now() - METADATA_REQUEST_RETRY;
+                                        last_request = instant_ago(METADATA_REQUEST_RETRY);
                                     }
                                     log_info!("metadata: peer {addr} ut_metadata id={id}");
                                 }
@@ -8298,7 +8326,7 @@ fn start_resume_worker(
     thread::Builder::new()
         .name(format!("resume-{}", hex(&info_hash[..4])))
         .spawn(move || {
-            let mut last_save = Instant::now() - RESUME_SAVE_INTERVAL;
+            let mut last_save = instant_ago(RESUME_SAVE_INTERVAL);
             let mut last_complete: Option<bool> = None;
             loop {
                 let stopping = torrent_stop_requested(&stop_flag);
@@ -13775,22 +13803,21 @@ fn allocate_reserved_piece_buffer(
     }
 }
 
+/// Lock the shared UI state. Kept out of line so the many `update_ui`
+/// instantiations only contain the closure body.
+#[inline(never)]
+fn lock_ui_state(state: &Option<Arc<Mutex<ui::UiState>>>) -> Option<MutexGuard<'_, ui::UiState>> {
+    state.as_ref().map(|state| lock_or_recover(state))
+}
+
 fn update_ui<F>(state: &Option<Arc<Mutex<ui::UiState>>>, update: F)
 where
     F: FnOnce(&mut ui::UiState),
 {
-    if let Some(state) = state {
-        let mut guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                guard.last_error = "ui state lock poisoned; recovered".to_string();
-                guard
-            }
-        };
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| update(&mut guard))).is_err() {
-            guard.last_error = "ui update panicked".to_string();
-        }
+    // The release build aborts on panic, so there is no unwinding to catch;
+    // updates must not panic.
+    if let Some(mut guard) = lock_ui_state(state) {
+        update(&mut guard);
     }
 }
 
@@ -14002,27 +14029,37 @@ fn update_active_peer_ui(
     });
 }
 
-fn update_torrent_entry<F>(state: &mut ui::UiState, torrent_id: u64, update: F)
-where
-    F: FnOnce(&mut ui::UiTorrent),
-{
+/// The list entry for `torrent_id`, created on first use. Removed torrents
+/// stay removed.
+#[inline(never)]
+fn torrent_entry_mut(state: &mut ui::UiState, torrent_id: u64) -> Option<&mut ui::UiTorrent> {
     if state.deleted_torrents.contains(&torrent_id) {
-        return;
+        return None;
     }
-    if let Some(pos) = state
+    let pos = match state
         .torrents
         .iter()
         .position(|torrent| torrent.id == torrent_id)
     {
-        update(&mut state.torrents[pos]);
-        return;
-    }
-    let mut entry = ui::UiTorrent {
-        id: torrent_id,
-        ..ui::UiTorrent::default()
+        Some(pos) => pos,
+        None => {
+            state.torrents.push(ui::UiTorrent {
+                id: torrent_id,
+                ..ui::UiTorrent::default()
+            });
+            state.torrents.len() - 1
+        }
     };
-    update(&mut entry);
-    state.torrents.push(entry);
+    state.torrents.get_mut(pos)
+}
+
+fn update_torrent_entry<F>(state: &mut ui::UiState, torrent_id: u64, update: F)
+where
+    F: FnOnce(&mut ui::UiTorrent),
+{
+    if let Some(torrent) = torrent_entry_mut(state, torrent_id) {
+        update(torrent);
+    }
 }
 
 const SPEED_HISTORY_POINTS: usize = 90;
@@ -15930,6 +15967,35 @@ mod core_helpers_tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interest_changes_fill_slots_without_resetting_rate_measurements() {
+        let manager = UploadManager::new(2);
+        for peer in 1..=3 {
+            manager.register(peer);
+        }
+        manager.set_interested(1, true);
+        manager.set_interested(2, true);
+        assert!(manager.should_unchoke(1));
+        assert!(manager.should_unchoke(2));
+        // Slots are full: a third interested peer waits for the next round
+        // (or the optimistic slot) instead of displacing a regular slot.
+        manager.record_upload(1, 5_000);
+        manager.set_interested(3, true);
+        assert!(!manager.should_unchoke(3));
+        {
+            let state = lock_or_recover(&manager.inner);
+            // The measurement window was not restarted by the interest change.
+            assert_eq!(state.peers[&1].uploaded_total, 5_000);
+            assert_eq!(state.peers[&1].last_uploaded_total, 0);
+        }
+        // A peer losing interest frees its slot for the waiting peer.
+        manager.set_interested(2, false);
+        assert!(!manager.should_unchoke(2));
+        assert!(manager.should_unchoke(3));
+        manager.unregister(3);
+        assert!(!manager.should_unchoke(3));
     }
 
     #[test]
