@@ -114,15 +114,6 @@ mod udp_tracker {
 
     impl std::error::Error for Error {}
 
-    #[allow(dead_code)]
-    #[derive(Debug, Clone)]
-    pub struct ScrapeResult {
-        pub seeders: u32,
-        pub leechers: u32,
-        #[allow(dead_code)]
-        pub completed: u32,
-    }
-
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn announce(
         _url: &str,
@@ -151,11 +142,6 @@ mod udp_tracker {
         _numwant: u32,
         _deadline: Instant,
     ) -> Result<TrackerResponse, Error> {
-        Err(Error)
-    }
-
-    #[allow(dead_code)]
-    pub fn scrape(_url: &str, _info_hash: [u8; 20]) -> Result<ScrapeResult, Error> {
         Err(Error)
     }
 }
@@ -199,7 +185,8 @@ mod utp {
     }
 
     impl UtpListener {
-        pub fn try_accept(&self) -> Option<UtpStream> {
+        pub fn accept_timeout(&self, timeout: Duration) -> Option<UtpStream> {
+            std::thread::sleep(timeout);
             None
         }
     }
@@ -1619,7 +1606,7 @@ fn ensure_session_storage_claim_available(
 }
 
 fn sort_renames(renames: &mut [(usize, String)]) {
-    renames.sort_unstable_by_key(|(index, _)| *index);
+    util::sort_by_key(renames, |(index, _)| *index);
 }
 
 fn normalized_file_renames(renames: &[(usize, String)]) -> Result<Vec<(usize, String)>, String> {
@@ -2462,7 +2449,9 @@ fn reschedule_uploads(state: &mut UploadState, max_unchoked: usize, now: Instant
             candidates.push((*peer_id, effective_rate));
         }
     }
-    candidates.sort_unstable_by_key(|&(peer_id, rate)| (std::cmp::Reverse(rate), peer_id));
+    util::sort_by_key(&mut candidates, |&(peer_id, rate)| {
+        (std::cmp::Reverse(rate), peer_id)
+    });
     state.unchoked.clear();
     state.unchoked.extend(
         candidates
@@ -11134,7 +11123,7 @@ impl<'a> PeerConn<'a> {
             {
                 let mut pieces = lock_or_recover(&ctx.pieces);
                 let mut active: Vec<u32> = self.active_pieces.keys().copied().collect();
-                active.sort_unstable();
+                util::sort(&mut active);
                 'pieces: for index in active {
                     while self.pending.len() < self.pipeline_depth {
                         let Some(request) = pieces.next_request_for_piece(index, endgame) else {
@@ -12157,7 +12146,7 @@ fn list_info_hashes(registry: &SessionRegistry) -> Result<Vec<[u8; 20]>, String>
             info_hashes.push(info_hash);
         }
     }
-    info_hashes.sort_unstable();
+    util::sort(&mut info_hashes);
     info_hashes.dedup();
     Ok(info_hashes)
 }
@@ -12681,7 +12670,7 @@ fn start_utp_listener(
             if shutdown_requested() {
                 break;
             }
-            if let Some(stream) = listener.try_accept() {
+            if let Some(stream) = listener.accept_timeout(Duration::from_millis(250)) {
                 if let Some(slot_guard) = inbound.try_acquire_handler_slot() {
                     let registry = Arc::clone(&registry);
                     let inbound = inbound.clone();
@@ -12698,8 +12687,6 @@ fn start_utp_listener(
                 } else {
                     log_debug!("dropping inbound uTP peer: handler capacity reached");
                 }
-            } else {
-                sleep_with_shutdown(Duration::from_millis(20));
             }
         }),
     )
@@ -20991,7 +20978,7 @@ fn create_torrent(
     let mut files_data = Vec::new();
     if multi_file {
         collect_files(&source_path, &[], &mut files_data)?;
-        files_data.sort_unstable_by(|a, b| a.path_segments.cmp(&b.path_segments));
+        util::sort_by(&mut files_data, |a, b| a.path_segments < b.path_segments);
     } else {
         files_data.push(CreateFile {
             source_path: source_path.clone(),
@@ -21164,7 +21151,7 @@ fn collect_files(dir: &Path, prefix: &[Vec<u8>], out: &mut Vec<CreateFile>) -> R
     let mut entries: Vec<_> = entries
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("read_dir {}: {err}", dir.display()))?;
-    entries.sort_unstable_by_key(|e| e.file_name());
+    util::sort_by_key(&mut entries, |e| e.file_name());
     for entry in entries {
         let ft = entry.file_type().map_err(|e| e.to_string())?;
         if ft.is_symlink() {

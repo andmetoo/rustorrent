@@ -121,13 +121,7 @@ impl UtpConnector {
 }
 
 impl UtpListener {
-    pub fn try_accept(&self) -> Option<UtpStream> {
-        self.accept_rx.try_recv().ok()
-    }
-
-    /// Waits up to `timeout` for an inbound connection, so callers need not
-    /// poll `try_accept` with sleeps.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Waits up to `timeout` for an inbound connection.
     pub fn accept_timeout(&self, timeout: Duration) -> Option<UtpStream> {
         self.accept_rx.recv_timeout(timeout).ok()
     }

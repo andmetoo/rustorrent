@@ -131,19 +131,9 @@ fn mixed_utp_tcp_swarm_has_low_error_rate_and_bounded_memory() {
     thread::sleep(Duration::from_millis(100));
     let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
     let mut utp_a = connector_a.connect(addr_b).unwrap();
-    let mut utp_b = {
-        let accept_deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Some(stream) = listener_b.try_accept() {
-                break stream;
-            }
-            assert!(
-                Instant::now() < accept_deadline,
-                "timed out waiting for uTP accept"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    };
+    let mut utp_b = listener_b
+        .accept_timeout(Duration::from_secs(3))
+        .expect("timed out waiting for uTP accept");
     utp_a.set_read_timeout(Some(Duration::from_secs(1)));
     utp_a.set_write_timeout(Some(Duration::from_secs(1)));
     utp_b.set_read_timeout(Some(Duration::from_secs(1)));
