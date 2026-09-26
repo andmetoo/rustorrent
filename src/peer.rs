@@ -363,6 +363,11 @@ impl MessageReader {
         if self.start == self.buf.len() {
             self.buf.clear();
             self.start = 0;
+            // Do not keep a multi-megabyte buffer per peer after one large
+            // frame (such as a big bitfield) has been processed.
+            if self.buf.capacity() > 4 * MAX_READ {
+                self.buf = Vec::with_capacity(MAX_READ);
+            }
         } else if self.start >= 64 * 1024 {
             self.buf.drain(..self.start);
             self.start = 0;
