@@ -458,9 +458,12 @@ function openDialog(d){
   returnFocus=document.activeElement;modal=d;
   if(d.showModal)d.showModal();else{d.classList.add('fb');d.setAttribute('role','dialog');d.setAttribute('aria-modal','true');d.setAttribute('open','')}
 }
+// Settle state synchronously: the native close event fires a task later, and
+// keys pressed in between must already reach the page.
 function closeDialog(d){
   if(!d.hasAttribute('open'))return;
-  if(d.close)d.close();else{d.removeAttribute('open');dialogClosed(d)}
+  if(d.close)d.close();else d.removeAttribute('open');
+  dialogClosed(d);
 }
 function dialogClosed(d){
   if(modal===d)modal=null;
@@ -469,7 +472,7 @@ function dialogClosed(d){
   returnFocus=null;
 }
 for(const d of [addDlg,rmDlg]){
-  d.addEventListener('close',()=>dialogClosed(d));
+  d.addEventListener('close',()=>{if(modal===d)dialogClosed(d)});
   d.addEventListener('cancel',e=>{e.preventDefault();closeDialog(d)});
   d.addEventListener('click',e=>{if(e.target===d)closeDialog(d)});
 }
