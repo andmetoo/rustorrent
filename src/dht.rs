@@ -2224,26 +2224,28 @@ fn handle_query(
             }
             let mut info_hash_arr = [0u8; 20];
             info_hash_arr.copy_from_slice(info_hash);
-            let token = token_secrets.make(addr);
-            let mut r = vec![(b"token".to_vec(), Value::Bytes(token.to_vec()))];
-            if let Some(peers) = peer_store.get(&info_hash_arr) {
-                let mut values = Vec::new();
-                for peer in peers
-                    .iter()
-                    .filter(|peer| peer.last_seen.elapsed() <= PEER_STORE_TTL)
-                    .filter(|peer| peer.addr.is_ipv4() == addr.is_ipv4())
-                    .filter(|peer| dht_address_scope_allowed(*addr, peer.addr))
-                    .take(50)
-                {
-                    values.push(Value::Bytes(encode_peer(peer.addr)));
-                }
-                if values.is_empty() {
-                    r.extend(closest_node_fields(rt, &info_hash_arr, *addr, args));
-                } else {
-                    r.push((b"values".to_vec(), Value::List(values)));
-                }
+            let mut values = b"l".to_vec();
+            for peer in peer_store
+                .get(&info_hash_arr)
+                .unwrap_or_default()
+                .iter()
+                .filter(|peer| peer.last_seen.elapsed() <= PEER_STORE_TTL)
+                .filter(|peer| peer.addr.is_ipv4() == addr.is_ipv4())
+                .filter(|peer| dht_address_scope_allowed(*addr, peer.addr))
+                .take(50)
+            {
+                put_bstr(&mut values, &encode_peer(peer.addr));
+            }
+            values.push(b'e');
+            // Fields in bencode key order: nodes, nodes6, token, values.
+            let mut r = if values.len() == 2 {
+                closest_node_fields(rt, &info_hash_arr, *addr, args)
             } else {
-                r.extend(closest_node_fields(rt, &info_hash_arr, *addr, args));
+                Vec::new()
+            };
+            r.push(("token", bstr(&token_secrets.make(addr))));
+            if values.len() > 2 {
+                r.push(("values", values));
             }
             let resp = build_response(node_id, &tx, r, *addr);
             let _ = socket.send_to(&resp, addr);
@@ -2300,47 +2302,59 @@ fn requested_node_families(args: &[(Vec<u8>, Value)], requester: SocketAddr) -> 
     (requester.is_ipv4(), requester.is_ipv6())
 }
 
+/// Response fields as (key, bencoded value) pairs.
+type ResponseFields = Vec<(&'static str, Vec<u8>)>;
+
 fn closest_node_fields(
     rt: &RoutingTable,
     target: &[u8; 20],
     requester: SocketAddr,
     args: &[(Vec<u8>, Value)],
-) -> Vec<(Vec<u8>, Value)> {
+) -> ResponseFields {
     let (wants_v4, wants_v6) = requested_node_families(args, requester);
-    let mut fields = Vec::with_capacity(usize::from(wants_v4) + usize::from(wants_v6));
+    let mut fields = Vec::with_capacity(3);
     if wants_v4 {
-        fields.push((
-            b"nodes".to_vec(),
-            Value::Bytes(rt.encode_closest_nodes(target, requester)),
-        ));
+        fields.push(("nodes", bstr(&rt.encode_closest_nodes(target, requester))));
     }
     if wants_v6 {
-        fields.push((
-            b"nodes6".to_vec(),
-            Value::Bytes(rt.encode_closest_nodes6(target, requester)),
-        ));
+        fields.push(("nodes6", bstr(&rt.encode_closest_nodes6(target, requester))));
     }
     fields
 }
 
+fn put_bstr(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(bytes.len().to_string().as_bytes());
+    out.push(b':');
+    out.extend_from_slice(bytes);
+}
+
+fn bstr(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 4);
+    put_bstr(&mut out, bytes);
+    out
+}
+
+/// Encodes a KRPC response directly as bencode. `fields` follow our "id" in
+/// sorted key order; the BEP 42 "ip" field reports the requester's address.
 fn build_response(
     node_id: &[u8; 20],
     tx: &[u8],
-    extra: Vec<(Vec<u8>, Value)>,
+    fields: ResponseFields,
     observed_addr: SocketAddr,
 ) -> Vec<u8> {
-    let mut r = vec![(b"id".to_vec(), Value::Bytes(node_id.to_vec()))];
-    r.extend(extra);
-    let dict = Value::Dict(vec![
-        (
-            b"ip".to_vec(),
-            Value::Bytes(encode_peer(normalize_dht_addr(observed_addr))),
-        ),
-        (b"t".to_vec(), Value::Bytes(tx.to_vec())),
-        (b"y".to_vec(), Value::Bytes(b"r".to_vec())),
-        (b"r".to_vec(), Value::Dict(r)),
-    ]);
-    bencode::encode(&dict)
+    let mut out = Vec::with_capacity(512);
+    out.extend_from_slice(b"d2:ip");
+    put_bstr(&mut out, &encode_peer(normalize_dht_addr(observed_addr)));
+    out.extend_from_slice(b"1:rd2:id20:");
+    out.extend_from_slice(node_id);
+    for (key, value) in fields {
+        put_bstr(&mut out, key.as_bytes());
+        out.extend_from_slice(&value);
+    }
+    out.extend_from_slice(b"e1:t");
+    put_bstr(&mut out, tx);
+    out.extend_from_slice(b"1:y1:re");
+    out
 }
 
 /// Encodes a KRPC query directly as bencode. `args` (after our "id") must
@@ -2351,18 +2365,13 @@ fn build_query(
     tx: &[u8],
     args: &[(&str, QueryArg<'_>)],
 ) -> Vec<u8> {
-    fn put(out: &mut Vec<u8>, bytes: &[u8]) {
-        out.extend_from_slice(bytes.len().to_string().as_bytes());
-        out.push(b':');
-        out.extend_from_slice(bytes);
-    }
     let mut out = Vec::with_capacity(160);
     out.extend_from_slice(b"d1:ad2:id20:");
     out.extend_from_slice(node_id);
     for (key, value) in args {
-        put(&mut out, key.as_bytes());
+        put_bstr(&mut out, key.as_bytes());
         match value {
-            QueryArg::Bytes(bytes) => put(&mut out, bytes),
+            QueryArg::Bytes(bytes) => put_bstr(&mut out, bytes),
             QueryArg::Int(value) => {
                 out.push(b'i');
                 out.extend_from_slice(value.to_string().as_bytes());
@@ -2371,9 +2380,9 @@ fn build_query(
         }
     }
     out.extend_from_slice(b"e1:q");
-    put(&mut out, method.as_bytes());
+    put_bstr(&mut out, method.as_bytes());
     out.extend_from_slice(b"1:t");
-    put(&mut out, tx);
+    put_bstr(&mut out, tx);
     out.extend_from_slice(b"1:y1:qe");
     out
 }
@@ -4343,6 +4352,74 @@ mod tests {
             dict_get(&response, b"ip"),
             Some(&Value::Bytes(encode_peer(requester)))
         );
+    }
+
+    #[test]
+    fn get_peers_and_find_node_responses_are_canonical_bencode() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let requester = UdpSocket::bind("127.0.0.1:0").unwrap();
+        requester
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let requester_addr = requester.local_addr().unwrap();
+        let secrets = TokenSecrets::new().unwrap();
+        let mut rt = RoutingTable::new([0u8; 20]);
+        rt.insert(node(7, [127, 0, 0, 9], 6881));
+        let mut peer_store = PeerStore::new();
+        let info_hash = [5u8; 20];
+        let stored: SocketAddr = "127.0.0.2:51413".parse().unwrap();
+        assert!(peer_store.admit(info_hash, stored));
+
+        let query = |q: &[u8], key: &[u8], value: [u8; 20]| {
+            vec![
+                (
+                    b"a".to_vec(),
+                    Value::Dict(vec![
+                        (b"id".to_vec(), Value::Bytes([1u8; 20].to_vec())),
+                        (key.to_vec(), Value::Bytes(value.to_vec())),
+                    ]),
+                ),
+                (b"q".to_vec(), Value::Bytes(q.to_vec())),
+                (b"t".to_vec(), Value::Bytes(b"tx".to_vec())),
+                (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+            ]
+        };
+        let mut packet = [0u8; 1500];
+        for (request, expect_values) in [
+            (query(b"get_peers", b"info_hash", info_hash), true),
+            (query(b"get_peers", b"info_hash", [6u8; 20]), false),
+            (query(b"find_node", b"target", [6u8; 20]), false),
+        ] {
+            handle_query(
+                &request,
+                &requester_addr,
+                &socket,
+                &[9u8; 20],
+                &secrets,
+                &mut rt,
+                &mut peer_store,
+                &HashMap::new(),
+            );
+            let (len, _) = requester.recv_from(&mut packet).unwrap();
+            let Value::Dict(response) = bencode::parse(&packet[..len]).unwrap() else {
+                panic!("response was not a dictionary");
+            };
+            let Some(Value::Dict(r)) = dict_get(&response, b"r") else {
+                panic!("response had no body");
+            };
+            assert_eq!(dict_get(r, b"id"), Some(&Value::Bytes([9u8; 20].to_vec())));
+            if expect_values {
+                assert_eq!(
+                    dict_get(r, b"values"),
+                    Some(&Value::List(vec![Value::Bytes(encode_peer(stored))]))
+                );
+                assert!(dict_get(r, b"nodes").is_none());
+            } else {
+                assert!(
+                    matches!(dict_get(r, b"nodes"), Some(Value::Bytes(nodes)) if nodes.len() == 26)
+                );
+            }
+        }
     }
 
     #[test]
