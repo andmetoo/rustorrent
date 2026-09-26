@@ -2569,16 +2569,21 @@ fn finish_lookup(
     socket: &UdpSocket,
     node_id: &[u8; 20],
 ) {
-    let Some(mut peers) = lookup.peers else {
+    let Some(peers) = lookup.peers else {
         if lookup.authenticated_responses > 0 {
             rt.mark_bucket_refreshed(lookup.bucket_idx, Instant::now());
         }
         return;
     };
-    peers
-        .tokens
-        .sort_unstable_by_key(|(node, _)| xor_distance(&node.id, &lookup.target));
-    for (node, token) in peers.tokens.iter().take(K) {
+    // Candidates are kept sorted by distance, so this announces to the
+    // closest responders that issued tokens.
+    let closest = lookup.candidates.iter().filter_map(|candidate| {
+        peers
+            .tokens
+            .iter()
+            .find(|(node, _)| node.addr == candidate.addr)
+    });
+    for (node, token) in closest.take(K) {
         let query =
             build_announce_peer_query(node_id, lookup.target, peers.port, token, &next_tx_id());
         let _ = socket.send_to(&query, node.addr);
@@ -2620,12 +2625,11 @@ fn advance_refresh_lookup(
     node_id: &[u8; 20],
     refresh_lookups: &mut HashMap<u64, RefreshLookup>,
 ) {
+    // Candidates are kept sorted by distance to the target: lookups start
+    // from `RoutingTable::closest` and responses re-sort after merging.
     let Some(lookup) = refresh_lookups.get_mut(&lookup_id) else {
         return;
     };
-    lookup
-        .candidates
-        .sort_unstable_by_key(|candidate| xor_distance(&candidate.id, &lookup.target));
 
     while lookup.outstanding < REFRESH_LOOKUP_ALPHA
         && lookup.queried.len() < MAX_REFRESH_LOOKUP_QUERIES
