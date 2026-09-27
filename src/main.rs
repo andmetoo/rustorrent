@@ -350,6 +350,8 @@ const MAX_INBOUND_HANDLER_SLOTS: usize = 1024;
 const METADATA_PIECE_LEN: usize = 16 * 1024;
 const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+const MAGNET_RETRY_MIN: Duration = Duration::from_secs(5);
+const MAGNET_RETRY_MAX: Duration = Duration::from_secs(60);
 const METADATA_REQUEST_RETRY: Duration = Duration::from_secs(3);
 const METADATA_PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAGNET_CACHE_URLS: [&str; 2] = [
@@ -5317,13 +5319,50 @@ fn resolve_torrent_data(
             data.clone()
         }
         TorrentSource::Magnet(link) => {
-            fetch_torrent_from_magnet(link, port, dht, connect_cfg, metadata_peer_limit, cancel)?
+            fetch_magnet_until_found(link, port, dht, connect_cfg, metadata_peer_limit, cancel)?
         }
     };
     if data.len() > MAX_TORRENT_BYTES {
         return Err("torrent file too large".to_string());
     }
     Ok(data)
+}
+
+/// Magnet metadata can take minutes to appear while the DHT warms up and
+/// peers come online, so keep searching in rounds (with growing pauses) until
+/// it arrives or the transfer is stopped, instead of failing after one round.
+fn fetch_magnet_until_found(
+    link: &str,
+    port: u16,
+    dht: &dht::Dht,
+    connect_cfg: &ConnectionConfig,
+    metadata_peer_limit: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    let meta = parse_magnet(link)?;
+    let mut pause = MAGNET_RETRY_MIN;
+    loop {
+        let result =
+            fetch_torrent_from_magnet(link, port, dht, connect_cfg, metadata_peer_limit, cancel);
+        // A v2-only magnet needs an HTTP source, which retrying cannot change.
+        if result.is_ok() || meta.info_hash_v2.is_some() || torrent_stop_requested(cancel) {
+            return result;
+        }
+        if let Err(err) = result {
+            log_info!(
+                "magnet: metadata not found yet ({err}); searching again in {}s",
+                pause.as_secs()
+            );
+        }
+        let resume_at = Instant::now() + pause;
+        while Instant::now() < resume_at {
+            if torrent_stop_requested(cancel) {
+                return Err("metadata fetch cancelled".to_string());
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        pause = (pause * 2).min(MAGNET_RETRY_MAX);
+    }
 }
 
 #[derive(Debug)]
@@ -14952,6 +14991,46 @@ mod core_helpers_tests {
         .unwrap_err();
         assert!(error.contains("cancelled"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn magnet_search_keeps_retrying_until_stopped() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(1500));
+                cancel.store(true, Ordering::SeqCst);
+            })
+        };
+        let cfg = ConnectionConfig {
+            encryption: EncryptionMode::Prefer,
+            utp: None,
+            ip_filter: None,
+            proxy: None,
+        };
+        // No trackers, peers or DHT: every round fails at once, and the search
+        // must keep going rather than turning into a torrent error.
+        let error = fetch_magnet_until_found(
+            "magnet:?xt=urn:btih:4b07d0071f9ceb21af6b8ba05b3a3c6f507e3fb2&dn=Test",
+            0,
+            &dht::disabled(),
+            &cfg,
+            8,
+            &cancel,
+        )
+        .unwrap_err();
+        stopper.join().unwrap();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(fetch_magnet_until_found(
+            "magnet:?xt=bogus",
+            0,
+            &dht::disabled(),
+            &cfg,
+            8,
+            &cancel
+        )
+        .is_err());
     }
 
     #[test]

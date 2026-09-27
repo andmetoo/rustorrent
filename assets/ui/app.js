@@ -600,15 +600,15 @@ function enabledPlugins(){
 async function loadSearch(){
   clearTimeout(sTimer);
   try{S=await getJSON('/search/status');renderSearch()}catch(e){txt($('sStatus'),'Search is unavailable: '+e.message)}
-  if(S&&S.busy&&view==='search')sTimer=setTimeout(loadSearch,900);
+  if(S&&(S.busy||S.loading)&&view==='search')sTimer=setTimeout(loadSearch,900);
   if($('plugins').open&&!catalog)loadCatalog();
 }
 async function pluginsChanged(){await loadSearch();if(catalog)loadCatalog()}
 function renderSearch(){
   const plugins=(S.plugins||[]).filter(p=>p.module!=='__init__'),ready=plugins.filter(p=>p.healthy).length,on=enabledPlugins(),res=S.results||[];
   if(S.last_started_at&&S.last_started_at!==sStarted){sStarted=S.last_started_at;added.clear()}
-  $('sWarn').hidden=ready>0;
-  txt($('sStatus'),S.busy?'Searching…':S.last_error||S.plugin_error||(res.length?`${plural(res.length,'result')} from ${plural(on.length,'plugin')}.`
+  $('sWarn').hidden=ready>0||!!S.loading;
+  txt($('sStatus'),S.loading?'Loading search plugins…':S.busy?'Searching…':S.last_error||S.plugin_error||(res.length?`${plural(res.length,'result')} from ${plural(on.length,'plugin')}.`
     :ready?`Ready to search with ${on.length===ready?'all ':''}${plural(on.length,'plugin')}.`:'Install a plugin to start searching.'));
   $('sGo').disabled=!!S.busy;txt($('sGo'),S.busy?'Searching…':'Search');
   if(document.activeElement!==$('sq')&&!$('sq').value&&S.query)$('sq').value=S.query;

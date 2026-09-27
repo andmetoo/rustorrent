@@ -93,6 +93,9 @@ struct SearchState {
     last_finished_at: u64,
     catalog_error: String,
     catalog_fetched_at: u64,
+    /// Set once the installed plugins have been scanned; until then the
+    /// list is not known to be empty.
+    plugins_scanned: bool,
 }
 
 #[derive(Clone)]
@@ -422,6 +425,9 @@ fn no_plugins_message() -> &'static str {
 
 pub fn prepare(download_dir: &Path) -> Result<(), String> {
     crate::ensure_private_state_directory(download_dir)?;
+    // Python runs inside the runtime folder, so its paths must be absolute.
+    let download_dir =
+        std::path::absolute(download_dir).map_err(|err| format!("search runtime path: {err}"))?;
     let root = download_dir
         .join(".rustorrent")
         .join("search")
@@ -437,7 +443,7 @@ pub fn prepare(download_dir: &Path) -> Result<(), String> {
     guard.python_available = runtime.python.is_some();
     if !guard.python_available {
         guard.plugin_error = PYTHON_MISSING.to_string();
-    } else if guard.plugins.is_empty() {
+    } else if guard.plugins.is_empty() && guard.plugins_scanned {
         guard.plugin_error = no_plugins_message().to_string();
     }
     Ok(())
@@ -452,8 +458,16 @@ pub fn init(download_dir: &Path) -> Result<(), String> {
 pub fn refresh_plugins() -> Result<(), String> {
     let runtime = runtime()?;
     let state = SEARCH_STATE.get_or_init(|| Mutex::new(SearchState::default()));
-    let (plugins, plugin_error) = load_plugins(runtime)?;
+    let loaded = load_plugins(runtime);
     let mut guard = lock_state(state);
+    guard.plugins_scanned = true;
+    let (plugins, plugin_error) = match loaded {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            guard.plugin_error = err.clone();
+            return Err(err);
+        }
+    };
     guard.plugins = plugins;
     guard.python_available = runtime.python.is_some();
     guard.plugin_error = plugin_error;
@@ -474,6 +488,10 @@ pub fn status_json() -> String {
     out.open("", '{');
     out.raw("busy", &state.busy);
     out.raw("python_available", &state.python_available);
+    out.raw(
+        "loading",
+        &(state.python_available && !state.plugins_scanned),
+    );
     out.str("plugin_error", &state.plugin_error);
     out.str("last_error", &state.last_error);
     out.str("query", &state.last_query);
