@@ -1165,6 +1165,10 @@ fn print_search_results(results: &[Json]) {
 
 fn print_plugins(status: &Json) {
     let plugins = status.arr("plugins");
+    if status.b("loading") {
+        println!("Search plugins are still loading; try again in a moment.");
+        return;
+    }
     if plugins.is_empty() {
         println!("No search plugins installed.");
     }

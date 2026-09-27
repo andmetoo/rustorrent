@@ -781,6 +781,8 @@ impl Tui {
             format!(" \x1b[31m{}\x1b[0m", s.s("last_error"))
         } else if !s.s("query").is_empty() {
             format!(" {} results for “{}”", s.arr("results").len(), s.s("query"))
+        } else if s.b("loading") {
+            " Loading search plugins…".to_string()
         } else if !s.b("python_available") {
             " Search plugins need Python 3.9 or newer.".to_string()
         } else {

@@ -4,14 +4,14 @@
 
 # Rustorrent
 
-**A fast, private BitTorrent client in a single 1.6 MB binary.**<br>
+**A fast, private BitTorrent client in a download under 1 MB.**<br>
 Web, terminal and command-line interfaces, and no runtime dependencies.
 
 [![CI](https://github.com/josusanmartin/rustorrent/actions/workflows/ci.yml/badge.svg)](https://github.com/josusanmartin/rustorrent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2563eb.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-e57324.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-64748b.svg)
-![Binary size](https://img.shields.io/badge/binary-1.6%20MB-16a34a.svg)
+![Download size](https://img.shields.io/badge/download-under%201%20MB-16a34a.svg)
 ![Dependencies](https://img.shields.io/badge/crates-3-7c3aed.svg)
 
 [Features](#features) · [Quick start](#quick-start) · [Interfaces](#three-ways-to-drive-it) · [Recipes](#recipes) · [Options](#all-options) · [Build](#building-from-source) · [Development](#development)
@@ -32,7 +32,8 @@ Web, terminal and command-line interfaces, and no runtime dependencies.
 <td width="33%" valign="top">
 
 ### 🪶 Tiny and self-contained
-One executable of about 1.6 MB, with no installer, runtime or database.
+The whole app downloads in under 1 MB (789 KB for Apple silicon, 816 KB for Linux) as one
+executable, with no installer, runtime or database.
 Bencode, SHA-1/SHA-256, HTTP, DHT, uTP, encryption and the web interface are all written in this
 repository.
 
@@ -418,7 +419,8 @@ Optional features: `udp_tracker`, `dht`, `lpd`, `utp`, `mse`, `natpmp`, `upnp`, 
 
 The release profile optimises for size: `opt-level = "z"`, LTO, one codegen unit, abort on panic
 and stripped symbols, with integer-overflow checks kept on. `build.rs` gzips the web interface
-and the search runtime at build time.
+and the search runtime at build time. The result is a 1.6 MB executable that compresses to under
+1 MB: Beta 2 ships as a 789 KB Apple silicon DMG and an 816 KB Linux archive.
 
 **macOS app:** `./macos/package_app.sh --universal --dmg` builds an ad-hoc signed universal
 `Rustorrent.app` with a native window and a disk image.
