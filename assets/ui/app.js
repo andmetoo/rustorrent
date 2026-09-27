@@ -119,12 +119,12 @@ $('app').outerHTML=`<div class="app" id="app">
  <section class="view" id="v-search" aria-labelledby="title" hidden><div class="pad">
   <form class="sform" data-f="search"><input id="sq" class="in" type="search" aria-label="Search query" placeholder="Search with your plugins" autocomplete="off"><select id="scat" class="in" aria-label="Category">${['All categories','Anime','Books','Games','Movies','Music','Pictures','Software','TV'].map((c,i)=>`<option value="${i?c.toLowerCase():'all'}">${c}</option>`).join('')}</select><button class="btn primary" id="sGo">Search</button></form>
   <p class="muted gap" id="sStatus">Loading search plugins…</p>
-  <div class="note" id="sWarn" hidden><b>No search plugins installed.</b> Rustorrent doesn't ship with search providers. Install a public plugin to start searching.<br><button class="btn" data-a="plugins">Manage plugins</button></div>
+  <div class="note" id="sWarn" hidden><b>No search plugins installed.</b> Install the recommended plugins, the ones qBittorrent ships and its project maintains, or pick your own.<br><button class="btn primary" data-a="precommend">Install recommended plugins</button> <button class="btn" data-a="plugins">Choose plugins</button></div>
   <div id="sResults"></div>
   <details class="card gap" id="plugins"><summary>Plugins</summary>
    <p class="muted">Search plugins run third-party Python code on this computer. Install only plugins you trust.</p>
    <div class="list" id="pList"></div>
-   <form class="inline" data-f="purl"><input id="pUrl" class="in" type="url" aria-label="Plugin URL" placeholder="https://…/plugin.py"><button class="btn">Install</button><label class="btn">Upload .py<input id="pFile" class="vh" type="file" accept=".py"></label><button class="btn" type="button" data-a="pupdate">Update all</button></form>
+   <form class="inline" data-f="purl"><input id="pUrl" class="in" type="url" aria-label="Plugin URL" placeholder="https://…/plugin.py"><button class="btn">Install</button><label class="btn">Upload .py<input id="pFile" class="vh" type="file" accept=".py"></label><button class="btn" type="button" data-a="pupdate">Update all</button><button class="btn" type="button" data-a="precommend" id="pRec" hidden>Install recommended</button></form>
    <div class="sect"><h3>Community catalog <button class="ib" data-a="pcat" aria-label="Refresh catalog" title="Refresh catalog">${ic('recheck')}</button></h3>
    <input id="cFilter" class="in wide" type="search" aria-label="Filter catalog" placeholder="Filter plugins"><p class="muted gap" id="cMeta"></p><div class="list scroll" id="cList"></div></div>
   </details>
@@ -608,7 +608,7 @@ async function pluginsChanged(){await loadSearch();if(catalog)loadCatalog()}
 function renderSearch(){
   const plugins=(S.plugins||[]).filter(p=>p.module!=='__init__'),ready=plugins.filter(p=>p.healthy).length,on=enabledPlugins(),res=S.results||[];
   if(S.last_started_at&&S.last_started_at!==sStarted){sStarted=S.last_started_at;added.clear()}
-  $('sWarn').hidden=ready>0||!!S.loading;
+  $('sWarn').hidden=ready>0||!!S.loading;$('pRec').hidden=!S.recommended_missing;$('sStatus').hidden=!$('sWarn').hidden;
   txt($('sStatus'),S.loading?'Loading search plugins…':S.busy?'Searching…':S.last_error||S.plugin_error||(res.length?`${plural(res.length,'result')} from ${plural(on.length,'plugin')}.`
     :ready?`Ready to search with ${on.length===ready?'all ':''}${plural(on.length,'plugin')}.`:'Install a plugin to start searching.'));
   $('sGo').disabled=!!S.busy;txt($('sGo'),S.busy?'Searching…':'Search');
@@ -668,17 +668,23 @@ const rssAct=(url,body,title)=>act(url,body,title).then(d=>{loadRss();return d})
 
 /* reachability: whether other peers can connect to us, and what to do if not */
 const sharedIp=ip=>/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(ip||'');
+const OUT=' You can still download and upload: Rustorrent connects out to more peers and uses hole punching to reach others behind routers.';
 function reach(){
   const fw=G.firewall_status,n=G.inbound_public_peers||0,port=G.incoming_port,maps=[G.natpmp_status,G.upnp_status],rip=G.router_external_ip,tip=G.tracker_external_ip;
   if(fw==='block-all')return['err','Firewall blocks incoming connections','“Block all incoming connections” is on in System Settings › Network › Firewall, so peers cannot reach you. Turn it off to seed.','Blocked by firewall'];
   if(fw==='blocked'||fw==='unlisted')return['err','The macOS firewall is blocking Rustorrent','Peers cannot connect to you, so seeding waits. Allow Rustorrent to accept incoming connections.','Blocked by firewall',1];
   if(n)return['ok','Reachable',`${plural(n,'peer')} connected to you from the internet this session.`,'Reachable'];
-  if(sharedIp(rip)||rip&&tip&&!tip.includes(':')&&tip!==rip)return['warn','Behind a shared internet address',`Your router's internet address${rip?` (${rip})`:''} is not your public one${tip?` (${tip})`:''}. Your provider or a second router sits in front of it, so peers cannot connect in. Uploads still reach peers that Rustorrent connects to.`,'Not reachable'];
+  const ups=G.upstream_status||'',cgnat=/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(rip||'')||!sharedIp(rip)&&rip&&tip&&!tip.includes(':')&&tip!==rip;
+  if(cgnat)return['warn','Behind your provider\'s shared address',`Your internet provider shares one public address between customers (carrier-grade NAT), so peers cannot connect in and no router setting can change that.${OUT} For more peers, ask your provider for a public IPv4 address.`,'Outgoing only'];
+  if(sharedIp(rip)){
+    if(ups.startsWith('mapped '))return['warn','Port open on both routers',`Your router sits behind another router or modem, and Rustorrent opened ${ups.match(/port \d+/)[0]} on both. Waiting for the first peer to connect in.`,'Waiting for peers'];
+    return['warn','Behind a second router',`Your router's internet address (${rip}) is private, so another router or your provider's modem sits in front of it${ups?' and did not accept a request to open the port':''}. On that device (usually at ${rip.replace(/\.\d+$/,'.1')}): turn on bridge mode, or forward port ${port} (TCP and UDP) to ${rip}, or make ${rip} its DMZ host.${OUT}`,'Outgoing only'];
+  }
   const m=maps.find(m=>m&&m.startsWith('mapped '));
   if(m)return['warn','Port open on your router',`Your router forwards ${m.match(/port \d+/)[0]} to Rustorrent over ${m.includes('upnp')?'UPnP':'NAT-PMP'}. Waiting for the first peer to connect in.`,'Waiting for peers'];
   if(maps.some(m=>m==='pending'))return['warn','Checking your router…','','Checking…'];
-  if(maps.every(m=>m&&m.startsWith('disabled')))return['warn','Automatic port forwarding is off',`Rustorrent is not asking your router to open a port. Forward port ${port} (TCP and UDP) to this computer so peers can connect in.`,'Not reachable'];
-  return['warn','Incoming port not open',`Your router did not accept a UPnP or NAT-PMP request. Turn one of them on in the router settings, or forward port ${port} (TCP and UDP) to this computer. Until then only peers that Rustorrent connects to can download from you.`,'Not reachable'];
+  if(maps.every(m=>m&&m.startsWith('disabled')))return['warn','Automatic port forwarding is off',`Rustorrent is not asking your router to open a port. Forward port ${port} (TCP and UDP) to this computer so peers can connect in.${OUT}`,'Outgoing only'];
+  return['warn','Incoming port not open',`Your router did not accept a UPnP or NAT-PMP request. Turn one of them on in the router settings, or forward port ${port} (TCP and UDP) to this computer.${OUT}`,'Outgoing only'];
 }
 function renderReach(){
   const [k,title,detail,short,fix]=reach(),net=$('net');
@@ -717,6 +723,7 @@ const CLICK={
   sadd:el=>{el.disabled=true;post('/search/add-result',q({index:el.dataset.index,dir:G.download_dir||'',prealloc:G.preallocate?1:0}))
     .then(()=>{added.add(el.dataset.index);txt(el,'Added');el.classList.remove('primary');toast('Torrent added',el.dataset.name)},e=>{el.disabled=false;toast('Could not add result',e.message,true)})},
   punins:el=>{if(confirm(`Remove search plugin ${el.dataset.module}?`))act('/search/remove-plugin',{module:el.dataset.module},'Plugin removed').then(pluginsChanged)},
+  precommend:el=>{if(!trust('the recommended plugins (EZTV, LimeTorrents, The Pirate Bay, SolidTorrents, TorLock, TorrentProject and Torrents.csv, maintained by the qBittorrent project)'))return;for(const b of document.querySelectorAll('[data-a=precommend]')){b.disabled=true;b.dataset.label=b.textContent;txt(b,'Installing…')}act('/search/install-recommended',null,'Recommended plugins installed').then(pluginsChanged).finally(()=>{for(const b of document.querySelectorAll('[data-a=precommend]')){b.disabled=false;txt(b,b.dataset.label)}})},
   pinstall:el=>{if(!el.dataset.url||!trust('this plugin'))return;el.disabled=true;txt(el,'Installing…');act('/search/install-url',{url:el.dataset.url},'Plugin installed').then(pluginsChanged)},
   pupdate:async()=>{
     const urls=(catalog||[]).filter(x=>x.installed&&x.download_url).map(x=>x.download_url);

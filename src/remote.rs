@@ -31,6 +31,7 @@ Controls a running rustorrent (started with --ui, --tui or --daemon).
   get <result#> [--dir <d>]         Add a search result
   plugins                           List search plugins
   plugin install <url|file.py> | plugin remove <module>
+  plugin recommended                Install the recommended search plugins
   rss                               List feeds and rules
   rss add-feed <url> [secs] | rss remove-feed <url>
   rss add-rule <name> <pattern> [feed-url] | rss remove-rule <name>
@@ -846,13 +847,20 @@ pub fn main(mut args: Vec<String>) -> Result<(), String> {
                     client.upload(&format!("/search/install-plugin?{query}"), &data)?;
                 }
             }
+            "recommended" => {
+                client.post("/search/install-recommended", &[])?;
+                print_plugins(&client.get("/search/status")?);
+            }
             "remove" | "rm" => {
                 client.post(
                     "/search/remove-plugin",
                     &[("module", need(&args, 1, "plugin module")?)],
                 )?;
             }
-            _ => return Err("usage: plugin install <url|file.py> | plugin remove <module>".into()),
+            _ => return Err(
+                "usage: plugin install <url|file.py> | plugin remove <module> | plugin recommended"
+                    .into(),
+            ),
         },
         "rss" => match args.first().map(String::as_str).unwrap_or("list") {
             "list" | "ls" => print_rss(&client.get("/rss/status")?),
@@ -1135,11 +1143,14 @@ pub fn session_lines(s: &Json) -> Vec<String> {
 /// Connectivity card.
 pub fn reachability(s: &Json) -> String {
     let inbound = s.u("inbound_public_peers");
+    let port = s.u("incoming_port");
     let (router, tracker) = (s.s("router_external_ip"), s.s("tracker_external_ip"));
-    let shared = router.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+    let router_ip = router.parse::<std::net::Ipv4Addr>().ok();
+    let second_router = router_ip.is_some_and(|ip| ip.is_private());
+    let cgnat = router_ip.is_some_and(|ip| {
         let [a, b, ..] = ip.octets();
-        ip.is_private() || (a == 100 && (64..128).contains(&b))
-    }) || (!router.is_empty()
+        a == 100 && (64..128).contains(&b)
+    }) || (router_ip.is_some_and(|ip| !ip.is_private())
         && !tracker.is_empty()
         && !tracker.contains(':')
         && tracker != router);
@@ -1148,24 +1159,29 @@ pub fn reachability(s: &Json) -> String {
         .any(|status| status.starts_with("mapped "));
     match s.s("firewall_status") {
         "block-all" | "blocked" | "unlisted" => {
-            "no: the macOS firewall blocks incoming connections (allow Rustorrent in Settings)"
+            "outgoing only: the macOS firewall blocks incoming connections (allow Rustorrent in Settings)"
                 .into()
         }
         _ if inbound > 0 => format!(
             "yes: {inbound} peer{} connected in",
             if inbound == 1 { "" } else { "s" }
         ),
-        _ if shared => {
-            "no: behind a shared internet address (provider NAT or a second router)".into()
+        _ if cgnat => "outgoing only: your provider shares one public address between customers \
+                       (carrier-grade NAT); ask it for a public IPv4 address"
+            .into(),
+        _ if second_router && s.s("upstream_status").starts_with("mapped ") => {
+            "not confirmed yet: the port is forwarded on both routers".into()
         }
-        _ if mapped => "not confirmed yet: the router forwards the port".into(),
-        _ if s.s("upnp_status").starts_with("disabled") => format!(
-            "no: automatic port forwarding is off; forward port {} to this computer",
-            s.u("incoming_port")
+        _ if second_router => format!(
+            "outgoing only: a second router or modem sits in front of yours; on it, turn on bridge mode, \
+             or forward port {port} to {router}, or make {router} its DMZ host"
         ),
+        _ if mapped => "not confirmed yet: the router forwards the port".into(),
+        _ if s.s("upnp_status").starts_with("disabled") => {
+            format!("outgoing only: automatic port forwarding is off; forward port {port} to this computer")
+        }
         _ => format!(
-            "no: the router did not open the port; enable UPnP or NAT-PMP, or forward port {}",
-            s.u("incoming_port")
+            "outgoing only: the router did not open the port; enable UPnP or NAT-PMP, or forward port {port}"
         ),
     }
 }
@@ -1210,7 +1226,7 @@ fn print_plugins(status: &Json) {
         return;
     }
     if plugins.is_empty() {
-        println!("No search plugins installed.");
+        println!("No search plugins installed. `rustorrent remote plugin recommended` adds the recommended set.");
     }
     for p in plugins {
         println!(
@@ -1337,10 +1353,18 @@ mod tests {
         assert!(
             r(r#"{"firewall_status":"unlisted","inbound_public_peers":3}"#).contains("firewall")
         );
-        assert!(r(r#"{"router_external_ip":"100.72.1.2"}"#).contains("shared"));
+        assert!(r(r#"{"router_external_ip":"100.72.1.2"}"#).contains("carrier-grade"));
+        assert!(
+            r(r#"{"router_external_ip":"192.168.100.18","incoming_port":20000}"#)
+                .contains("forward port 20000 to 192.168.100.18")
+        );
+        assert!(r(
+            r#"{"router_external_ip":"192.168.100.18","upstream_status":"mapped upstream on port 20000"}"#
+        )
+        .contains("both routers"));
         assert!(
             r(r#"{"router_external_ip":"198.51.100.2","tracker_external_ip":"203.0.113.9"}"#)
-                .contains("shared")
+                .contains("carrier-grade")
         );
         assert!(r(r#"{"upnp_status":"mapped upnp on port 20000"}"#).starts_with("not confirmed"));
         assert!(r(r#"{"incoming_port":20000}"#).contains("forward port 20000"));

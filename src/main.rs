@@ -3,6 +3,7 @@ mod bencode;
 mod dht;
 mod firewall;
 mod geoip;
+mod holepunch;
 mod http;
 mod ip_filter;
 #[cfg(feature = "lpd")]
@@ -48,6 +49,10 @@ mod dht {
     pub struct Dht;
 
     pub fn start(_port: u16, _download_dir: &Path) -> Dht {
+        Dht
+    }
+
+    pub fn start_shared(_shared: crate::utp::SharedUdp, _download_dir: &Path) -> Dht {
         Dht
     }
 
@@ -160,6 +165,14 @@ mod natpmp {
     pub fn map_port(_port: u16, _lifetime: u32) -> Result<crate::PortMapping, String> {
         Err("natpmp disabled".to_string())
     }
+
+    pub fn map_port_via(
+        _gateway: std::net::Ipv4Addr,
+        _port: u16,
+        _lifetime: u32,
+    ) -> Result<crate::PortMapping, String> {
+        Err("natpmp disabled".to_string())
+    }
 }
 
 #[cfg(not(feature = "upnp"))]
@@ -167,14 +180,24 @@ mod upnp {
     pub fn map_port(_port: u16) -> Result<crate::PortMapping, String> {
         Err("upnp disabled".to_string())
     }
+
+    pub fn map_port_upstream(
+        _gateway: std::net::Ipv4Addr,
+        _client: std::net::Ipv4Addr,
+        _port: u16,
+    ) -> Result<crate::PortMapping, String> {
+        Err("upnp disabled".to_string())
+    }
 }
 
-/// The port trackers and the DHT should tell other peers to connect to.
+/// The port trackers and the DHT should tell other peers to connect to: the
+/// outermost router's mapping wins, since that is where peers arrive.
 pub(crate) fn announce_port(listen_port: u16) -> u16 {
-    match MAPPED_EXTERNAL_PORT.load(Ordering::Relaxed) {
-        0 => listen_port,
-        port => port,
-    }
+    [&UPSTREAM_EXTERNAL_PORT, &MAPPED_EXTERNAL_PORT]
+        .iter()
+        .map(|port| port.load(Ordering::Relaxed))
+        .find(|port| *port != 0)
+        .unwrap_or(listen_port)
 }
 
 #[cfg(not(feature = "utp"))]
@@ -191,8 +214,14 @@ mod utp {
     #[derive(Clone)]
     pub struct UtpStream;
 
-    pub fn start(_port: u16) -> (UtpConnector, UtpListener) {
-        (UtpConnector, UtpListener)
+    #[allow(dead_code)]
+    pub struct SharedUdp {
+        pub socket: std::net::UdpSocket,
+        pub rx: std::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    }
+
+    pub fn start_shared(_port: u16) -> (UtpConnector, UtpListener, Option<SharedUdp>) {
+        (UtpConnector, UtpListener, None)
     }
 
     impl UtpConnector {
@@ -405,9 +434,16 @@ static PEER_DISCONNECTED: AtomicU64 = AtomicU64::new(0);
 /// External port a router mapped for us when it differs from the listen port;
 /// 0 means peers reach us on the listen port itself.
 static MAPPED_EXTERNAL_PORT: AtomicU16 = AtomicU16::new(0);
+/// External port on the router in front of ours (double NAT), or 0.
+static UPSTREAM_EXTERNAL_PORT: AtomicU16 = AtomicU16::new(0);
+static UPSTREAM_MAPPING_STARTED: AtomicBool = AtomicBool::new(false);
 /// Peers with public addresses that connected to us: proof that the incoming
 /// port is reachable from the internet.
 static INBOUND_PUBLIC_PEERS: AtomicU64 = AtomicU64::new(0);
+static STARTED_AT: OnceLock<Instant> = OnceLock::new();
+/// Without a peer connecting in after this long, outgoing connections are the
+/// only way to reach peers, so more of them are opened.
+const OUTGOING_ONLY_AFTER: Duration = Duration::from_secs(5 * 60);
 static SEED_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
 static MAX_SEED_TIME_SECS: AtomicU64 = AtomicU64::new(0);
 static SUPER_SEED: AtomicBool = AtomicBool::new(false);
@@ -594,7 +630,6 @@ impl PeerProfile {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn from_code(code: usize) -> Self {
         match code {
             0 => Self::Conservative,
@@ -671,6 +706,23 @@ impl PeerRuntimeSettings {
 
     fn max_peers_torrent(&self) -> usize {
         self.max_peers_torrent.load(Ordering::SeqCst)
+    }
+
+    /// (global, per torrent) limits in force. While no peer can connect in,
+    /// the Balanced and Aggressive profiles open more outgoing connections,
+    /// closer to qBittorrent's defaults; limits set by hand are kept.
+    fn effective_limits(&self, outgoing_only: bool) -> (usize, usize) {
+        let (global, torrent) = (self.max_peers_global(), self.max_peers_torrent());
+        let profile = PeerProfile::from_code(self.profile.load(Ordering::SeqCst));
+        let tuning = profile.tuning();
+        if !outgoing_only
+            || profile == PeerProfile::Conservative
+            || global != tuning.max_peers_global
+            || torrent != tuning.max_peers_torrent
+        {
+            return (global, torrent);
+        }
+        (global + global / 2, torrent * 2)
     }
 
     fn apply_profile(&self, profile: PeerProfile) -> PeerProfileTuning {
@@ -828,6 +880,9 @@ struct TorrentContext {
     metadata: Arc<Vec<u8>>,
     peer_queue: Arc<Mutex<PeerQueue>>,
     allow_pex: bool,
+    /// BEP 55 needs uTP, direct connections and a public torrent.
+    allow_holepunch: bool,
+    holepunch: holepunch::Holepunch,
     piece_buffer_budgets: piece::PieceBufferBudgets,
     ui_state: Option<Arc<Mutex<ui::UiState>>>,
     global_peer_slots: Arc<PeerSlots>,
@@ -2920,6 +2975,7 @@ fn run() -> Result<(), String> {
         args.max_peers_torrent,
     ));
     let peer_slots = Arc::new(PeerSlots::new(peer_settings.max_peers_global()));
+    STARTED_AT.get_or_init(Instant::now);
     let global_piece_buffer_budget =
         Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES));
     let session_store = Arc::new(SessionStore::load(&args.download_dir)?);
@@ -3066,8 +3122,10 @@ fn run() -> Result<(), String> {
         None
     };
     let mut utp_listener_handle = None;
+    let mut shared_udp = None;
     let utp_connector = if args.enable_utp && direct_discovery {
-        let (connector, listener) = utp::start(args.port);
+        let (connector, listener, shared) = utp::start_shared(args.port);
+        shared_udp = shared;
         match start_utp_listener(listener, registry.clone(), inbound.clone()) {
             Ok(handle) => utp_listener_handle = Some(handle),
             Err(err) => {
@@ -3079,11 +3137,16 @@ fn run() -> Result<(), String> {
         None
     };
     let dht = if direct_discovery {
-        // uTP and DHT are different protocols over UDP. Until they share a
-        // demultiplexing socket, reserve the configured/mapped UDP port for
-        // uTP and let DHT advertise its own ephemeral source port.
-        let dht_port = if args.enable_utp { 0 } else { args.port };
-        dht::start(dht_port, &args.download_dir)
+        // DHT and uTP share the forwarded UDP port: the uTP loop passes DHT
+        // datagrams on. If uTP could not open it, DHT tries on its own and
+        // keeps the port free for uTP only when uTP is actually running.
+        match shared_udp {
+            Some(shared) => dht::start_shared(shared, &args.download_dir),
+            None => dht::start(
+                if args.enable_utp { 0 } else { args.port },
+                &args.download_dir,
+            ),
+        }
     } else {
         dht::disabled()
     };
@@ -4631,6 +4694,10 @@ fn run_torrent_once(
         metadata: Arc::clone(&metadata),
         peer_queue: Arc::clone(&peer_queue),
         allow_pex: !meta.info.private,
+        allow_holepunch: !meta.info.private
+            && connect_cfg.utp.is_some()
+            && connect_cfg.proxy.is_none(),
+        holepunch: holepunch::Holepunch::default(),
         piece_buffer_budgets: piece_buffer_budgets.clone(),
         ui_state: ui_state.clone(),
         global_peer_slots: Arc::clone(peer_slots),
@@ -4745,13 +4812,14 @@ fn run_torrent_once(
                 apply_late_lifecycle_request(&context, session_store, action);
             }
             reap_finished_workers(&mut handles, "peer");
-            let desired_workers = peer_settings.max_peers_torrent();
+            let (global_limit, desired_workers) = peer_settings.effective_limits(outgoing_only());
+            context.global_peer_slots.set_max(global_limit);
             let startup_burst = downloaded.load(Ordering::SeqCst) < STARTUP_BURST_BYTES;
             let live_target = if startup_burst {
                 desired_workers
                     .saturating_mul(STARTUP_BURST_MULTIPLIER)
                     .max(STARTUP_BURST_MIN_WORKERS)
-                    .min(peer_settings.max_peers_global())
+                    .min(global_limit)
             } else {
                 desired_workers
             };
@@ -4773,6 +4841,10 @@ fn run_torrent_once(
                         break;
                     }
                 }
+            }
+
+            for addr in context.holepunch.take_connects() {
+                spawn_holepunch_connect(&context, &connect_cfg, addr);
             }
 
             let (is_complete, completed_pieces, completed_bytes) = {
@@ -6405,10 +6477,25 @@ fn expected_metadata_piece_len(total: usize, piece: usize) -> Option<usize> {
 }
 
 fn build_ext_handshake(metadata_size: Option<usize>, allow_pex: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
+    build_ext_handshake_with(metadata_size, allow_pex, false)
+}
+
+fn build_ext_handshake_with(
+    metadata_size: Option<usize>,
+    allow_pex: bool,
+    holepunch: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
     out.push(b'd');
     out.extend_from_slice(b"1:m");
     out.push(b'd');
+    // Keys sort bytewise: ut_holepunch < ut_metadata < ut_pex.
+    if holepunch {
+        out.extend_from_slice(b"12:ut_holepunch");
+        out.push(b'i');
+        out.extend_from_slice(holepunch::EXT_ID.to_string().as_bytes());
+        out.push(b'e');
+    }
     out.extend_from_slice(b"11:ut_metadatai1e");
     if allow_pex {
         out.extend_from_slice(b"6:ut_pexi2e");
@@ -6517,6 +6604,25 @@ fn request_metadata_pieces<W: Write>(
         sent += 1;
     }
     Ok(sent)
+}
+
+/// The peer's ut_holepunch ID and listening port from its extended handshake.
+fn parse_holepunch_caps(payload: &[u8]) -> (Option<u8>, Option<u16>) {
+    let Ok((dict, _)) = parse_bencode_dict(payload) else {
+        return (None, None);
+    };
+    let ext_id = match dict_get(&dict, b"m") {
+        Some(Value::Dict(items)) => items.iter().find_map(|(key, value)| match value {
+            Value::Int(id) if key == b"ut_holepunch" => u8::try_from(*id).ok(),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let port = match dict_get(&dict, b"p") {
+        Some(Value::Int(port)) => u16::try_from(*port).ok(),
+        _ => None,
+    };
+    (ext_id.filter(|&id| id != 0), port.filter(|&port| port != 0))
 }
 
 fn parse_extended_handshake(payload: &[u8]) -> Result<ExtendedHandshakeCaps, String> {
@@ -6807,6 +6913,25 @@ impl PeerQueue {
 
     fn finish(&mut self, addr: SocketAddr) {
         self.inflight.remove(&addr);
+    }
+
+    /// Claims `addr` for a connection opened outside the queue; false when it
+    /// is filtered or a connection to it is already under way.
+    fn start_direct(&mut self, addr: SocketAddr) -> bool {
+        let addr = normalize_peer_addr(addr);
+        if self.inflight.contains(&addr)
+            || self.is_local_self_peer(addr)
+            || self.is_filtered(addr)
+            || self.is_banned(addr)
+        {
+            return false;
+        }
+        if self.queued.remove(&addr) {
+            self.queue.retain(|queued| *queued != addr);
+        }
+        self.deferred.retain(|deferred| deferred.addr != addr);
+        self.inflight.insert(addr);
+        true
     }
 
     fn note_failure(&mut self, addr: SocketAddr) -> Option<Duration> {
@@ -8203,6 +8328,45 @@ fn apply_piece_to_files(
     }
 }
 
+/// A relay told both sides to connect now: open the connection straight away,
+/// outside the worker queue, so both uTP SYNs cross while the NATs are open.
+fn spawn_holepunch_connect(
+    ctx: &Arc<TorrentContext>,
+    connect_cfg: &ConnectionConfig,
+    addr: SocketAddr,
+) {
+    if !lock_or_recover(&ctx.peer_queue).start_direct(addr) {
+        return;
+    }
+    let (Some(torrent_slot), Some(global_slot)) = (
+        ctx.torrent_peer_slots.try_acquire(),
+        ctx.global_peer_slots.try_acquire(),
+    ) else {
+        lock_or_recover(&ctx.peer_queue).finish(addr);
+        return;
+    };
+    let ctx_for_worker = Arc::clone(ctx);
+    let cfg = connect_cfg.clone();
+    let spawned = spawn_worker(
+        format!("holepunch-{}", ctx.id),
+        PEER_THREAD_STACK,
+        Box::new(move || {
+            let _slots = (torrent_slot, global_slot);
+            let ctx = ctx_for_worker;
+            let peer_tag = ctx.peer_tags.fetch_add(1, Ordering::SeqCst);
+            let result = download_from_peer_concurrent(addr, &ctx, peer_tag, &cfg, None);
+            record_peer_result(&mut lock_or_recover(&ctx.peer_queue), addr, &result);
+            if let Err(err) = &result {
+                log_debug!("holepunch peer {addr} error: {err}");
+                let _ = err;
+            }
+        }),
+    );
+    if spawned.is_err() {
+        lock_or_recover(&ctx.peer_queue).finish(addr);
+    }
+}
+
 fn peer_worker_loop(ctx: &TorrentContext, connect_cfg: &ConnectionConfig) {
     loop {
         if torrent_stop_requested(&ctx.stop_requested) {
@@ -8245,6 +8409,13 @@ fn peer_worker_loop(ctx: &TorrentContext, connect_cfg: &ConnectionConfig) {
         ctx.torrent_peer_slots.release();
 
         record_peer_result(&mut lock_or_recover(&ctx.peer_queue), addr, &result);
+        if let Err(err) = &result {
+            // Could not reach it directly: ask the peer that told us about
+            // it to introduce us (BEP 55).
+            if ctx.allow_holepunch && is_unreachable_peer_error(err) {
+                ctx.holepunch.request(addr, Instant::now());
+            }
+        }
         // Connection failures are routine in a swarm; they are logged for
         // diagnostics but never surfaced as a transfer error.
         if let Err(err) = &result {
@@ -10801,7 +10972,13 @@ fn download_from_peer_concurrent(
     PEER_CONNECTED.fetch_add(1, Ordering::SeqCst);
     let geo_cc = add_active_peer_session(&ctx.ui_state, ctx.id, &ctx.active_peers, addr);
 
+    if ctx.allow_holepunch {
+        ctx.holepunch.register(addr);
+    }
     let result = conn.run(&mut stream);
+    if ctx.allow_holepunch {
+        ctx.holepunch.unregister(addr);
+    }
     conn.teardown();
     remove_active_peer_session(&ctx.ui_state, ctx.id, &ctx.active_peers, geo_cc.as_deref());
     result
@@ -10867,7 +11044,11 @@ impl<'a> PeerConn<'a> {
             send_message(stream, &peer::Message::Bitfield(local_bitfield), "bitfield")?;
         }
         if extensions {
-            let payload = build_ext_handshake(Some(ctx.metadata.len()), ctx.allow_pex);
+            let payload = build_ext_handshake_with(
+                Some(ctx.metadata.len()),
+                ctx.allow_pex,
+                ctx.allow_holepunch,
+            );
             send_message(
                 stream,
                 &peer::Message::Extended { ext_id: 0, payload },
@@ -10907,6 +11088,7 @@ impl<'a> PeerConn<'a> {
             if let PeerStep::Close = self.fill_requests(stream)? {
                 return Ok(());
             }
+            self.send_holepunch(stream)?;
 
             let mut source = ReadAheadStream {
                 stream: &mut *stream,
@@ -10936,6 +11118,27 @@ impl<'a> PeerConn<'a> {
                 }
             }
         }
+    }
+
+    /// Sends ut_holepunch messages other connections queued for this peer.
+    fn send_holepunch(&mut self, stream: &mut PeerStream) -> Result<(), String> {
+        if !self.ctx.allow_holepunch {
+            return Ok(());
+        }
+        let Some((ext_id, messages)) = self.ctx.holepunch.take_outbox(self.addr) else {
+            return Ok(());
+        };
+        for msg in messages {
+            let payload = holepunch::encode(msg);
+            send_message(
+                stream,
+                &peer::Message::Extended { ext_id, payload },
+                "holepunch",
+            )?;
+        }
+        self.last_sent = Instant::now();
+        let _ = stream.flush();
+        Ok(())
     }
 
     fn teardown(&mut self) {
@@ -11403,6 +11606,10 @@ impl<'a> PeerConn<'a> {
                             self.peer_ut_pex = ut_pex;
                         }
                     }
+                    if ctx.allow_holepunch {
+                        let (ext_id, listen_port) = parse_holepunch_caps(&payload);
+                        ctx.holepunch.set_caps(self.addr, ext_id, listen_port);
+                    }
                 } else if ext_id == 1 {
                     if let Some(response_id) = self.peer_metadata_id {
                         serve_metadata_request(
@@ -11413,8 +11620,15 @@ impl<'a> PeerConn<'a> {
                             &mut self.metadata_bytes_served,
                         )?;
                     }
+                } else if ctx.allow_holepunch && ext_id == holepunch::EXT_ID {
+                    if let Some(msg) = holepunch::decode(&payload) {
+                        ctx.holepunch.on_message(self.addr, msg, Instant::now());
+                    }
                 } else if ctx.allow_pex && ext_id == 2 {
                     if let Ok(peers) = parse_ut_pex(&payload) {
+                        if ctx.allow_holepunch {
+                            ctx.holepunch.note_pex(self.addr, &peers);
+                        }
                         if !peers.is_empty() {
                             lock_or_recover(&ctx.peer_queue)
                                 .enqueue_with_source(peers, PeerSource::Pex);
@@ -12611,6 +12825,20 @@ fn is_retryable_peer_error(err: &str) -> bool {
         || err == "connect failed"
 }
 
+/// No peer has connected in from the internet since start-up, long enough to
+/// rule out a slow first peer.
+fn outgoing_only() -> bool {
+    INBOUND_PUBLIC_PEERS.load(Ordering::Relaxed) == 0
+        && STARTED_AT
+            .get()
+            .is_some_and(|started| started.elapsed() >= OUTGOING_ONLY_AFTER)
+}
+
+/// Failed before a BitTorrent handshake started: nothing answered.
+fn is_unreachable_peer_error(err: &str) -> bool {
+    !err.contains("handshake") && !err.contains("self peer") && !err.contains("blocked")
+}
+
 fn record_peer_result(queue: &mut PeerQueue, addr: SocketAddr, result: &Result<(), String>) {
     queue.finish(addr);
     match result {
@@ -13593,6 +13821,44 @@ fn saved_listen_port(download_dir: &Path) -> u16 {
     port
 }
 
+/// Our router's own internet address is private, so another router or the
+/// provider's modem sits in front of it. Ask that device to forward the port
+/// to our router, which already forwards it to us.
+fn start_upstream_mapping(
+    ui_state: &Option<Arc<Mutex<ui::UiState>>>,
+    port: u16,
+    router_ip: std::net::Ipv4Addr,
+) {
+    if UPSTREAM_MAPPING_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let ui_state = ui_state.clone();
+    spawn_detached("upstream-mapping", move || {
+        run_port_mapping_with_retries(
+            &ui_state,
+            "upstream",
+            port,
+            &[Duration::from_secs(30), Duration::from_secs(120)],
+            || map_upstream_port(port, router_ip),
+        );
+    });
+}
+
+fn map_upstream_port(port: u16, router_ip: std::net::Ipv4Addr) -> Result<PortMapping, String> {
+    let gateway = upstream_gateway_guess(router_ip);
+    natpmp::map_port_via(gateway, port, 3600).or_else(|natpmp_error| {
+        upnp::map_port_upstream(gateway, router_ip, port).map_err(|upnp_error| {
+            format!("{gateway} refused NAT-PMP ({natpmp_error}) and UPnP ({upnp_error})")
+        })
+    })
+}
+
+/// Modems and provider routers almost always sit at .1 of their network.
+fn upstream_gateway_guess(router_ip: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let [a, b, c, _] = router_ip.octets();
+    std::net::Ipv4Addr::new(a, b, c, 1)
+}
+
 fn port_mapping_status_message(
     protocol: &str,
     port: u16,
@@ -13616,15 +13882,22 @@ fn record_port_mapping_result(
 ) {
     let message = port_mapping_status_message(protocol, port, &result);
     if let Ok(mapping) = result {
-        // Peers must be told the router's port, which can differ from ours.
-        let external = if mapping.external_port == port {
-            0
+        if protocol == "upstream" {
+            UPSTREAM_EXTERNAL_PORT.store(mapping.external_port, Ordering::Relaxed);
         } else {
-            mapping.external_port
-        };
-        MAPPED_EXTERNAL_PORT.store(external, Ordering::Relaxed);
-        if let Some(ip) = mapping.external_ip {
-            update_ui(ui_state, |state| state.router_external_ip = ip.to_string());
+            // Peers must be told the router's port, which can differ from ours.
+            let external = if mapping.external_port == port {
+                0
+            } else {
+                mapping.external_port
+            };
+            MAPPED_EXTERNAL_PORT.store(external, Ordering::Relaxed);
+            if let Some(ip) = mapping.external_ip {
+                update_ui(ui_state, |state| state.router_external_ip = ip.to_string());
+                if ip.is_private() {
+                    start_upstream_mapping(ui_state, port, ip);
+                }
+            }
         }
     }
     if result.is_ok() {
@@ -13643,6 +13916,7 @@ fn set_port_mapping_status(
     update_ui(ui_state, |state| match protocol {
         "nat-pmp" => state.natpmp_status = message,
         "upnp" => state.upnp_status = message,
+        "upstream" => state.upstream_status = message,
         _ => {}
     });
 }
@@ -14209,6 +14483,34 @@ magnet:?xt=urn:btih:00112233445566778899AABBCCDDEEFF00112233\
     }
 
     #[test]
+    fn extended_handshake_advertises_holepunch_in_sorted_order() {
+        let payload = build_ext_handshake_with(Some(4096), true, true);
+        assert!(payload.starts_with(b"d1:md12:ut_holepunchi3e11:ut_metadatai1e6:ut_pexi2ee"));
+        assert_eq!(parse_holepunch_caps(&payload), (Some(3), None));
+        assert!(!build_ext_handshake(None, true)
+            .windows(12)
+            .any(|w| w == b"ut_holepunch"));
+        let libtorrent = b"d1:md12:ut_holepunchi4e6:ut_pexi1ee1:pi51413ee";
+        assert_eq!(parse_holepunch_caps(libtorrent), (Some(4), Some(51413)));
+        assert_eq!(
+            parse_holepunch_caps(b"d1:md12:ut_holepunchi0eee"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn holepunch_connect_claims_a_queued_peer() {
+        let mut queue = PeerQueue::new(None);
+        let addr: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        queue.enqueue_with_source([addr], PeerSource::Pex);
+        assert!(queue.start_direct(addr));
+        assert!(!queue.start_direct(addr), "already connecting");
+        assert_eq!(queue.pop(), None, "no second connection from the queue");
+        queue.finish(addr);
+        assert!(queue.start_direct(addr));
+    }
+
+    #[test]
     fn extended_handshake_roundtrip() {
         let payload = build_ext_handshake(Some(4096), true);
         let (ut_metadata, ut_pex, metadata_size) = parse_extended_handshake(&payload).unwrap();
@@ -14759,6 +15061,8 @@ mod core_helpers_tests {
             metadata: Arc::new(torrent::info_bytes(&torrent_bytes).unwrap().to_vec()),
             peer_queue: Arc::new(Mutex::new(PeerQueue::new(None))),
             allow_pex: true,
+            allow_holepunch: true,
+            holepunch: holepunch::Holepunch::default(),
             piece_buffer_budgets: piece::PieceBufferBudgets::new(
                 Arc::new(piece::PieceBufferBudget::new(MAX_GLOBAL_PIECE_BUFFER_BYTES)),
                 Arc::new(piece::PieceBufferBudget::new(
@@ -15713,6 +16017,14 @@ mod core_helpers_tests {
         assert_eq!(context.upload_requests_served.load(Ordering::SeqCst), 1);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upstream_mapping_targets_the_outer_network_gateway() {
+        assert_eq!(
+            upstream_gateway_guess("192.168.100.18".parse().unwrap()),
+            "192.168.100.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
     }
 
     #[test]
@@ -18152,6 +18464,17 @@ mod core_helpers_tests {
             40
         );
         assert_eq!(request_queue_depth_for_rate(0.0), 64);
+    }
+
+    #[test]
+    fn outgoing_only_raises_profile_limits_but_not_manual_ones() {
+        let settings = PeerRuntimeSettings::new(PeerProfile::Balanced, 200, 80, 200, 30);
+        assert_eq!(settings.effective_limits(false), (200, 30));
+        assert_eq!(settings.effective_limits(true), (300, 60));
+        settings.apply_profile(PeerProfile::Conservative);
+        assert_eq!(settings.effective_limits(true), (80, 12));
+        let manual = PeerRuntimeSettings::new(PeerProfile::Balanced, 200, 80, 4, 2);
+        assert_eq!(manual.effective_limits(true), (4, 2));
     }
 
     #[test]
