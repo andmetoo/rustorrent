@@ -72,4 +72,5 @@ For local diagnostics, the packaged launcher accepts `--self-test`,
 `--smoke-test <temporary-directory>`, and `--test-window <temporary-directory>`.
 The last two isolate the download folder and browser profile from normal use.
 
-`AppIcon.ico` is a multi-resolution conversion of the existing `macos/AppIcon.icns`.
+`AppIcon.ico` is built from `macos/AppIcon.svg` by `create_icon.ps1` (needs
+Google Chrome or Microsoft Edge). Run it after editing the SVG.
